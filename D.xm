@@ -21,6 +21,7 @@
 + (id)sectionWithHeader:(NSString *)header;
 + (id)sectionWithFooter:(NSString *)footer;
 + (id)sectionWithHeader:(NSString *)header Footer:(NSString *)footer;
+@property (nonatomic, copy) NSAttributedString *attributedFooterTitle;
 - (void)addCell:(id)arg1;
 @end
 
@@ -673,6 +674,15 @@ static unsigned long long DDLingtongFenValue(void) {
     id<UITableViewDelegate> _originalDelegate;
 }
 
+- (NSAttributedString *)dd_centeredFooterString:(NSString *)text {
+    NSMutableParagraphStyle *ps = [[NSMutableParagraphStyle alloc] init];
+    ps.alignment = NSTextAlignmentCenter;
+    ps.lineBreakMode = NSLineBreakByWordWrapping;
+    NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithString:text];
+    [attr addAttribute:NSParagraphStyleAttributeName value:ps range:NSMakeRange(0, text.length)];
+    return attr;
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"小丑助手设置";
@@ -733,8 +743,8 @@ static unsigned long long DDLingtongFenValue(void) {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     Class cellCls = objc_getClass("WCTableViewCellManager");
 
-    WCTableViewSectionManager *chatSection = [objc_getClass("WCTableViewSectionManager") sectionWithHeader:@"聊天设置"
-                                                                                                    Footer:@"聊天文字修改 / 聊天图片修改 / 聊天转账修改 为独立开关：长按消息弹窗菜单小丑按钮，文字消息改内容与引用标题、图片消息替换为相册所选图、转账消息改金额"];
+    WCTableViewSectionManager *chatSection = [objc_getClass("WCTableViewSectionManager") sectionWithHeader:@"聊天设置"];
+    chatSection.attributedFooterTitle = [self dd_centeredFooterString:@"聊天文字修改 / 聊天图片修改 / 聊天转账修改 为独立开关：长按消息弹窗菜单小丑按钮，文字消息改内容与引用标题、图片消息替换为相册所选图、转账消息改金额"];
     [chatSection addCell:[cellCls switchCellForSel:@selector(textSwitchChanged:) target:self title:@"聊天文字修改" on:cfg.textEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(transferSwitchChanged:) target:self title:@"聊天转账修改" on:cfg.transferEnabled]];
@@ -751,8 +761,8 @@ static unsigned long long DDLingtongFenValue(void) {
     [chatSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清除修改缓存" rightView:clearRight]];
     [_tableViewManager addSection:chatSection];
 
-    WCTableViewSectionManager *profileSection = [objc_getClass("WCTableViewSectionManager") sectionWithHeader:@"资料设置"
-                                                                                                        Footer:@"零钱余额修改开启后可自定义余额与零钱通金额。步数和好友数量修改后需重启微信生效"];
+    WCTableViewSectionManager *profileSection = [objc_getClass("WCTableViewSectionManager") sectionWithHeader:@"资料设置"];
+    profileSection.attributedFooterTitle = [self dd_centeredFooterString:@"零钱余额修改开启后可自定义余额与零钱通金额。步数和好友数量修改后需重启微信生效"];
     [profileSection addCell:[cellCls switchCellForSel:@selector(balanceSwitchChanged:) target:self title:@"零钱余额修改" on:cfg.balanceEnabled]];
     if (cfg.balanceEnabled) {
         self.balanceField = [[UITextField alloc] init];
