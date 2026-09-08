@@ -5,6 +5,26 @@
 
 #pragma mark - 微信类声明
 
+// 微信原生带输入框 alert（头文件证据：WeChat/WCUIAlertView.h）
+@interface WCUIAlertView : NSObject
+- (id)initWithTitle:(id)a0 message:(id)a1;
+- (void)showTextFieldWithMaxLen:(unsigned int)a0;
+- (UITextField *)getTextField;
+- (id)getTextFieldText;
+- (void)setTextFieldPlaceHolder:(id)a0;
+- (void)setTextFieldDefaultText:(id)a0;
+- (void)addBtnTitle:(id)a0 handler:(void (^)(void))a1;
+- (void)addCancelBtnTitle:(id)a0 handler:(void (^)(void))a1;
+- (void)show;
+@end
+
+// 微信原生 toast（头文件证据：WeChat/WeToast.h）
+@interface WeToast : NSObject
++ (id)toast;
+- (void)showDoneToastWithText:(id)a0;
+- (void)showErrorToastWithText:(id)a0;
+@end
+
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
@@ -75,6 +95,7 @@
 @interface TextMessageCellView : CommonMessageCellView @end
 @interface AppMessageCellView : CommonMessageCellView @end
 @interface WCPayTransferMessageCellView : CommonMessageCellView @end
+@interface ImageMessageCellView : CommonMessageCellView @end
 
 @interface MMMenuItem : UIMenuItem
 - (instancetype)initWithTitle:(NSString *)title icon:(UIImage *)icon target:(id)target action:(SEL)action;
@@ -159,9 +180,7 @@ static BOOL JokerIsReferMessage(CMessageWrap *msg) {
 
 static BOOL JokerIsTransferMessage(CMessageWrap *msg) {
     if (!msg) return NO;
-    if ([msg respondsToSelector:@selector(parseWCPayInfoItemIfNeed)]) {
-        [msg parseWCPayInfoItemIfNeed];
-    }
+    [msg parseWCPayInfoItemIfNeed];
     WCPayInfoItem *payInfo = msg.m_oWCPayInfoItem;
     if (!payInfo) return NO;
     return (payInfo.m_uiPaySubType == 3 || payInfo.m_uiPaySubType == 4 || payInfo.m_nsTransferID.length > 0);
@@ -262,6 +281,29 @@ static void DDJokerClearAllMessageCache(void) {
     [[NSFileManager defaultManager] removeItemAtPath:folder error:nil];
 }
 
+static void JokerReloadAllMsgContent(void) {
+    UIWindow *win = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.isKeyWindow) { win = w; break; }
+    }
+    if (!win) win = [[UIApplication sharedApplication].windows firstObject];
+    if (!win) return;
+    UIViewController *top = win.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    UINavigationController *nav = nil;
+    if ([top isKindOfClass:[UINavigationController class]]) nav = (UINavigationController *)top;
+    else if (top.navigationController) nav = top.navigationController;
+    NSArray *vcs = nav.viewControllers ?: @[];
+    for (UIViewController *vc in vcs) {
+        if ([vc isKindOfClass:[BaseMsgContentViewController class]]) {
+            UITableView *tv = [(BaseMsgContentViewController *)vc getMsgTableView];
+            if (tv && [tv isKindOfClass:[UITableView class]]) {
+                [tv reloadData];
+            }
+        }
+    }
+}
+
 static NSString *JokerGetDisplayText(CMessageWrap *msg) {
     if (JokerIsTextMessage(msg)) return [msg GetDisplayContent];
     if (JokerIsReferMessage(msg)) return msg.m_nsTitle ?: @"";
@@ -281,8 +323,8 @@ static UITableView *JokerFindTableView(UIView *view) {
 static void JokerReloadCellAfterReplace(id vc, CMessageWrap *msg, CommonMessageCellView *cell) {
     if (!cell) return;
     UITableView *tv = JokerFindTableView((UIView *)cell);
-    if (![tv isKindOfClass:[UITableView class]] && [vc respondsToSelector:@selector(getMsgTableView)]) {
-        tv = [vc getMsgTableView];
+    if (![tv isKindOfClass:[UITableView class]] && [vc isKindOfClass:[BaseMsgContentViewController class]]) {
+        tv = [(BaseMsgContentViewController *)vc getMsgTableView];
     }
     if (![tv isKindOfClass:[UITableView class]]) return;
     NSIndexPath *ip = [tv indexPathForCell:(UITableViewCell *)cell];
@@ -292,8 +334,8 @@ static void JokerReloadCellAfterReplace(id vc, CMessageWrap *msg, CommonMessageC
         }];
         return;
     }
-    if ([vc respondsToSelector:@selector(reloadNodeWithMessageWrap:)]) {
-        [vc reloadNodeWithMessageWrap:msg];
+    if ([vc isKindOfClass:[BaseMsgContentViewController class]]) {
+        [(BaseMsgContentViewController *)vc reloadNodeWithMessageWrap:msg];
     }
 }
 
@@ -306,41 +348,34 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
     NSString *current = JokerGetDisplayText(msg) ?: @"";
     BOOL isTransfer = JokerIsTransferMessage(msg);
 
-    Class alertCls = NSClassFromString(@"WCUIAlertView");
-    if (!alertCls) return;
-    id alert = [[alertCls alloc] initWithTitle:@"小丑" message:current];
-    if (![alert respondsToSelector:@selector(showTextFieldWithMaxLen:)]) return;
-    [alert showTextFieldWithMaxLen:(isTransfer ? 20 : 2000)];
-    if ([alert respondsToSelector:@selector(setTextFieldDefaultText:)]) [alert setTextFieldDefaultText:current];
-    if ([alert respondsToSelector:@selector(setTextFieldPlaceHolder:)]) {
-        [alert setTextFieldPlaceHolder:(isTransfer ? @"例如：888.88" : nil)];
+    // 微信原生带输入框 alert：WCUIAlertView（声明见文件顶部）
+    WCUIAlertView *alert = [[WCUIAlertView alloc] initWithTitle:@"小丑" message:nil];
+    if (!alert) return;
+    [alert showTextFieldWithMaxLen:1000];
+    [alert setTextFieldDefaultText:current];
+    if (isTransfer) {
+        [alert setTextFieldPlaceHolder:@"例如：888.88"];
+        UITextField *tf = [alert getTextField];
+        if (tf) tf.keyboardType = UIKeyboardTypeDecimalPad;
     }
-    if (isTransfer && [alert respondsToSelector:@selector(getTextField)]) {
-        id tf = [alert getTextField];
-        if ([tf respondsToSelector:@selector(setKeyboardType:)]) [tf setKeyboardType:UIKeyboardTypeDecimalPad];
-    }
-    __weak typeof(cell) weakCell = cell;
-    if ([alert respondsToSelector:@selector(addCancelBtnTitle:handler:)]) {
-        [alert addCancelBtnTitle:@"取消" handler:nil];
-    }
-    if ([alert respondsToSelector:@selector(addBtnTitle:handler:)]) {
-        [alert addBtnTitle:@"确定" handler:^{
-            typeof(weakCell) strongCell = weakCell;
-            NSString *newText = ([alert respondsToSelector:@selector(getTextFieldText)] ? [alert getTextFieldText] : @"");
-            newText = [newText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if (newText.length && ![newText isEqualToString:current]) {
-                if (isTransfer) {
-                    newText = JokerNormalizeAmount(newText);
-                    if (!newText) return;
-                    DDJokerSetCachedAmount(msg, newText);
-                } else {
-                    DDJokerSetCachedText(msg, newText);
-                }
-                JokerReloadCellAfterReplace(vc, msg, strongCell);
+    [alert addCancelBtnTitle:@"取消" handler:^{}];
+    __weak WCUIAlertView *weakAlert = alert;
+    [alert addBtnTitle:@"确定" handler:^{
+        WCUIAlertView *strongAlert = weakAlert;
+        if (!strongAlert) return;
+        NSString *newText = [[strongAlert getTextFieldText] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (newText.length && ![newText isEqualToString:current]) {
+            if (isTransfer) {
+                newText = JokerNormalizeAmount(newText);
+                if (!newText) return;
+                DDJokerSetCachedAmount(msg, newText);
+            } else {
+                DDJokerSetCachedText(msg, newText);
             }
-        }];
-    }
-    if ([alert respondsToSelector:@selector(show)]) [alert show];
+            JokerReloadCellAfterReplace(vc, msg, cell);
+        }
+    }];
+    [alert show];
 }
 
 static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *original) {
@@ -348,11 +383,10 @@ static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *origin
     if (!JokerEnabledForMessage(msg)) return original;
     if (!JokerIsSupportedMessage(msg)) return original;
 
-    Class menuItemClass = NSClassFromString(@"MMMenuItem");
-    if (!menuItemClass) return original;
+    if (![MMMenuItem class]) return original;
 
     UIImage *icon = [[UIImage systemImageNamed:@"face.smiling.fill"] imageWithTintColor:[UIColor whiteColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
-    MMMenuItem *newItem = [[menuItemClass alloc] initWithTitle:@"小丑" icon:icon target:cell action:@selector(joker_handleMenuItem:)];
+    MMMenuItem *newItem = [[MMMenuItem alloc] initWithTitle:@"小丑" icon:icon target:cell action:@selector(joker_handleMenuItem:)];
     NSMutableArray *newItems = [NSMutableArray arrayWithArray:original];
     [newItems insertObject:newItem atIndex:0];
     return newItems;
@@ -361,7 +395,7 @@ static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *origin
 %hook TextMessageCellView
 - (void)setViewModel:(id)vm {
     if ([DDGlobalConfig shared].textEnabled) {
-        CMessageWrap *msg = (CMessageWrap *)[vm valueForKey:@"messageWrap"];
+        CMessageWrap *msg = [(CommonMessageViewModel *)vm messageWrap];
         NSString *cached = DDJokerCachedText(msg);
         if (cached) msg.m_nsContent = cached;
     }
@@ -385,7 +419,7 @@ static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *origin
 %hook AppMessageCellView
 - (void)setViewModel:(id)vm {
     if ([DDGlobalConfig shared].textEnabled) {
-        CMessageWrap *msg = (CMessageWrap *)[vm valueForKey:@"messageWrap"];
+        CMessageWrap *msg = [(CommonMessageViewModel *)vm messageWrap];
         if ([msg isReferMsgType]) {
             NSString *cached = DDJokerCachedText(msg);
             if (cached) msg.m_nsTitle = cached;
@@ -411,7 +445,7 @@ static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *origin
 %hook WCPayTransferMessageCellView
 - (void)setViewModel:(id)vm {
     if ([DDGlobalConfig shared].transferEnabled) {
-        CMessageWrap *msg = (CMessageWrap *)[vm valueForKey:@"messageWrap"];
+        CMessageWrap *msg = [(CommonMessageViewModel *)vm messageWrap];
         if (JokerIsTransferMessage(msg)) {
             NSString *cached = DDJokerCachedAmount(msg);
             if (cached) JokerApplyAmountToPayInfo(msg, cached);
@@ -458,11 +492,11 @@ static UIImage *DDImageReplacementForMessage(CMessageWrap *msg) {
 
 static void DDImageApplyReplacementToCell(id cell) {
     if (![DDGlobalConfig shared].imageEnabled) return;
-    CMessageWrap *msg = (CMessageWrap *)[[(id)cell valueForKey:@"viewModel"] valueForKey:@"messageWrap"];
+    CMessageWrap *msg = ((CommonMessageCellView *)cell).viewModel.messageWrap;
     UIImage *rep = DDImageReplacementForMessage(msg);
     if (rep) {
-        id iv = [(id)cell valueForKey:@"m_imageView"];
-        if ([iv respondsToSelector:@selector(setImage:)]) [iv setImage:rep];
+        UIImageView *iv = (UIImageView *)[(ImageMessageCellView *)cell valueForKey:@"m_imageView"];
+        [iv setImage:rep];
     }
 }
 
@@ -475,12 +509,11 @@ static void DDImageApplyReplacementToCell(id cell) {
     NSArray *original = %orig;
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     if (!cfg.imageEnabled) return original;
-    CMessageWrap *msg = (CMessageWrap *)[[(id)self valueForKey:@"viewModel"] valueForKey:@"messageWrap"];
+    CMessageWrap *msg = self.viewModel.messageWrap;
     if (![msg IsImgMsg]) return original;
-    Class menuItemClass = NSClassFromString(@"MMMenuItem");
-    if (!menuItemClass) return original;
+    if (![MMMenuItem class]) return original;
     UIImage *icon = [[UIImage systemImageNamed:@"face.smiling.fill"] imageWithTintColor:[UIColor whiteColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
-    MMMenuItem *newItem = [[menuItemClass alloc] initWithTitle:@"小丑" icon:icon target:self action:@selector(dk_changeChatImage)];
+    MMMenuItem *newItem = [[MMMenuItem alloc] initWithTitle:@"小丑" icon:icon target:self action:@selector(dk_changeChatImage)];
     NSMutableArray *newItems = [NSMutableArray arrayWithArray:original];
     [newItems insertObject:newItem atIndex:0];
     return newItems;
@@ -489,14 +522,14 @@ static void DDImageApplyReplacementToCell(id cell) {
     if (action == @selector(dk_changeChatImage)) {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (!cfg.imageEnabled) return NO;
-        CMessageWrap *msg = (CMessageWrap *)[[(id)self valueForKey:@"viewModel"] valueForKey:@"messageWrap"];
+        CMessageWrap *msg = self.viewModel.messageWrap;
         return [msg IsImgMsg];
     }
     return %orig;
 }
 %new
 - (void)dk_changeChatImage {
-    CMessageWrap *msg = (CMessageWrap *)[[(id)self valueForKey:@"viewModel"] valueForKey:@"messageWrap"];
+    CMessageWrap *msg = self.viewModel.messageWrap;
     if (![msg IsImgMsg]) return;
     id vc = JokerGetViewControllerFromView((UIView *)(id)self);
     if (!vc) return;
@@ -539,11 +572,14 @@ static void DDImageApplyReplacementToCell(id cell) {
     [picker dismissViewControllerAnimated:YES completion:^{
         dispatch_async(dispatch_get_main_queue(), ^{
             id vc = self.viewController;
-            UITableView *tv = [vc respondsToSelector:@selector(getMsgTableView)] ? [vc getMsgTableView] : nil;
+            UITableView *tv = nil;
+            if ([vc isKindOfClass:[BaseMsgContentViewController class]]) {
+                tv = [(BaseMsgContentViewController *)vc getMsgTableView];
+            }
             if (![tv isKindOfClass:[UITableView class]]) return;
             for (UITableViewCell *c in [tv visibleCells]) {
-                if ([c isKindOfClass:NSClassFromString(@"ImageMessageCellView")]) {
-                    CMessageWrap *m = (CMessageWrap *)[[(id)c valueForKey:@"viewModel"] valueForKey:@"messageWrap"];
+                if ([c isKindOfClass:[ImageMessageCellView class]]) {
+                    CMessageWrap *m = ((CommonMessageCellView *)c).viewModel.messageWrap;
                     if (m.m_uiMesLocalID == self.mesLocalID) {
                         JokerReloadCellAfterReplace(vc, m, (id)c);
                     }
@@ -694,7 +730,7 @@ static unsigned long long DDLingtongFenValue(void) {
     self.navigationItem.scrollEdgeAppearance = appearance;
     self.navigationItem.compactAppearance = appearance;
 
-    _tableViewManager = [[objc_getClass("WCTableViewManager") alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
+    _tableViewManager = [[WCTableViewManager alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     _tableViewManager.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     _tableViewManager.tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
     [self.view addSubview:_tableViewManager.tableView];
@@ -741,9 +777,9 @@ static unsigned long long DDLingtongFenValue(void) {
     [_tableViewManager clearAllSection];
 
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    Class cellCls = objc_getClass("WCTableViewCellManager");
+    Class cellCls = [WCTableViewCellManager class];
 
-    WCTableViewSectionManager *chatSection = [objc_getClass("WCTableViewSectionManager") sectionWithHeader:@"聊天设置"];
+    WCTableViewSectionManager *chatSection = [WCTableViewSectionManager sectionWithHeader:@"聊天设置"];
     chatSection.attributedFooterTitle = [self dd_centeredFooterString:@"聊天文字修改 / 聊天图片修改 / 聊天转账修改 为独立开关：长按消息弹窗菜单小丑按钮，文字消息改内容与引用标题、图片消息替换为相册所选图、转账消息改金额"];
     [chatSection addCell:[cellCls switchCellForSel:@selector(textSwitchChanged:) target:self title:@"聊天文字修改" on:cfg.textEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
@@ -761,7 +797,7 @@ static unsigned long long DDLingtongFenValue(void) {
     [chatSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清除修改缓存" rightView:clearRight]];
     [_tableViewManager addSection:chatSection];
 
-    WCTableViewSectionManager *profileSection = [objc_getClass("WCTableViewSectionManager") sectionWithHeader:@"资料设置"];
+    WCTableViewSectionManager *profileSection = [WCTableViewSectionManager sectionWithHeader:@"资料设置"];
     profileSection.attributedFooterTitle = [self dd_centeredFooterString:@"零钱余额修改开启后可自定义余额与零钱通金额。步数和好友数量修改后需重启微信生效"];
     [profileSection addCell:[cellCls switchCellForSel:@selector(balanceSwitchChanged:) target:self title:@"零钱余额修改" on:cfg.balanceEnabled]];
     if (cfg.balanceEnabled) {
@@ -857,14 +893,16 @@ static unsigned long long DDLingtongFenValue(void) {
 
 - (void)clearChatCacheTapped:(id)sender {
     DDJokerClearAllMessageCache();
+    JokerReloadAllMsgContent();
     [self buildTable];
-    Class toastCls = NSClassFromString(@"WeToast");
-    if (toastCls && [toastCls respondsToSelector:@selector(toast)]) {
-        id toast = [toastCls toast];
-        if ([toast respondsToSelector:@selector(showDoneToastWithText:)]) {
-            [toast showDoneToastWithText:@"已清理"];
-        }
-    }
+    [self dd_showDoneToast:@"已清理"];
+}
+
+- (void)dd_showDoneToast:(NSString *)text {
+    if (!text.length) return;
+    // 微信原生带勾 success toast：WeToast - showDoneToastWithText:（声明见文件顶部）
+    WeToast *toast = [WeToast toast];
+    if (toast) [toast showDoneToastWithText:text];
 }
 
 - (void)balanceSwitchChanged:(UISwitch *)sender {
@@ -1124,11 +1162,9 @@ static unsigned long long DDLingtongFenValue(void) {
 
 %ctor {
     @autoreleasepool {
-        id mgr = objc_getClass("WCPluginsMgr");
-        if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
-            [[mgr sharedInstance] registerControllerWithTitle:@"DD小丑助手"
-                                                      version:@"1.0.0"
-                                                   controller:@"DDJokerSettingsViewController"];
-        }
+        WCPluginsMgr *mgr = [WCPluginsMgr sharedInstance];
+        [mgr registerControllerWithTitle:@"DD小丑助手"
+                                 version:@"1.0.0"
+                              controller:@"DDJokerSettingsViewController"];
     }
 }
