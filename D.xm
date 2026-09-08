@@ -281,12 +281,29 @@ static void DDJokerClearAllMessageCache(void) {
     [[NSFileManager defaultManager] removeItemAtPath:folder error:nil];
 }
 
-static void JokerReloadAllMsgContent(void) {
-    UIWindow *win = nil;
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        if (w.isKeyWindow) { win = w; break; }
+// iOS 15+ 起 UIApplication.windows 已废弃，改用 UIWindowScene.windows（不支持 iOS 13 以下）
+static UIWindow *JokerKeyWindow(void) {
+    if (@available(iOS 13.0, *)) {
+        UIApplication *app = [UIApplication sharedApplication];
+        for (UIScene *scene in app.connectedScenes) {
+            if (scene.activationState != UISceneActivationStateForegroundActive) continue;
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                if (w.isKeyWindow) return w;
+            }
+        }
+        for (UIScene *scene in app.connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                return w;
+            }
+        }
     }
-    if (!win) win = [[UIApplication sharedApplication].windows firstObject];
+    return nil;
+}
+
+static void JokerReloadAllMsgContent(void) {
+    UIWindow *win = JokerKeyWindow();
     if (!win) return;
     UIViewController *top = win.rootViewController;
     while (top.presentedViewController) top = top.presentedViewController;
@@ -495,6 +512,8 @@ static void DDImageApplyReplacementToCell(id cell) {
     CMessageWrap *msg = ((CommonMessageCellView *)cell).viewModel.messageWrap;
     UIImage *rep = DDImageReplacementForMessage(msg);
     if (rep) {
+        // m_imageView 在头文件里是纯 ivar（ImageMessageCellView.h:4 -> YYAsyncImageView *m_imageView;）
+        // 没有 getter 方法，只能靠 KVC 的 ivar 回退取值；这是全文件唯一保留的 KVC
         UIImageView *iv = (UIImageView *)[(ImageMessageCellView *)cell valueForKey:@"m_imageView"];
         [iv setImage:rep];
     }
