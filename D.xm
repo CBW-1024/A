@@ -372,7 +372,7 @@ static UIImage *DDImageReplacementForMessage(CMessageWrap *msg) {
     NSArray *original = %orig;
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     if (!cfg.imageEnabled) return original;
-    CMessageWrap *msg = [self.viewModel messageWrap];
+    CMessageWrap *msg = (CMessageWrap *)[[(id)self valueForKey:@"viewModel"] valueForKey:@"messageWrap"];
     if (![msg IsImgMsg]) return original;
     Class menuItemClass = NSClassFromString(@"MMMenuItem");
     if (!menuItemClass) return original;
@@ -386,16 +386,16 @@ static UIImage *DDImageReplacementForMessage(CMessageWrap *msg) {
     if (action == @selector(dk_changeChatImage)) {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (!cfg.imageEnabled) return NO;
-        CMessageWrap *msg = [self.viewModel messageWrap];
+        CMessageWrap *msg = (CMessageWrap *)[[(id)self valueForKey:@"viewModel"] valueForKey:@"messageWrap"];
         return [msg IsImgMsg];
     }
     return %orig;
 }
 %new
 - (void)dk_changeChatImage {
-    CMessageWrap *msg = [self.viewModel messageWrap];
+    CMessageWrap *msg = (CMessageWrap *)[[(id)self valueForKey:@"viewModel"] valueForKey:@"messageWrap"];
     if (![msg IsImgMsg]) return;
-    id vc = JokerGetViewControllerFromView(self);
+    id vc = JokerGetViewControllerFromView((UIView *)(id)self);
     if (!vc) return;
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
@@ -410,18 +410,18 @@ static UIImage *DDImageReplacementForMessage(CMessageWrap *msg) {
 - (void)showImage {
     %orig;
     if (![DDGlobalConfig shared].imageEnabled) return;
-    UIImage *rep = DDImageReplacementForMessage([self.viewModel messageWrap]);
+    UIImage *rep = DDImageReplacementForMessage((CMessageWrap *)[[(id)self valueForKey:@"viewModel"] valueForKey:@"messageWrap"]);
     if (rep) {
-        id iv = [self valueForKey:@"m_imageView"];
+        id iv = [(id)self valueForKey:@"m_imageView"];
         if ([iv respondsToSelector:@selector(setImage:)]) [iv setImage:rep];
     }
 }
 - (void)layoutContentView {
     %orig;
     if (![DDGlobalConfig shared].imageEnabled) return;
-    UIImage *rep = DDImageReplacementForMessage([self.viewModel messageWrap]);
+    UIImage *rep = DDImageReplacementForMessage((CMessageWrap *)[[(id)self valueForKey:@"viewModel"] valueForKey:@"messageWrap"]);
     if (rep) {
-        id iv = [self valueForKey:@"m_imageView"];
+        id iv = [(id)self valueForKey:@"m_imageView"];
         if ([iv respondsToSelector:@selector(setImage:)]) [iv setImage:rep];
     }
 }
@@ -450,10 +450,9 @@ static UIImage *DDImageReplacementForMessage(CMessageWrap *msg) {
             if (![tv isKindOfClass:[UITableView class]]) return;
             for (UITableViewCell *c in [tv visibleCells]) {
                 if ([c isKindOfClass:NSClassFromString(@"ImageMessageCellView")]) {
-                    ImageMessageCellView *cell = (ImageMessageCellView *)c;
-                    CMessageWrap *m = [cell.viewModel messageWrap];
+                    CMessageWrap *m = (CMessageWrap *)[[(id)c valueForKey:@"viewModel"] valueForKey:@"messageWrap"];
                     if (m.m_uiMesLocalID == self.mesLocalID) {
-                        if ([cell respondsToSelector:@selector(showImage)]) [cell performSelector:@selector(showImage)];
+                        if ([(id)c respondsToSelector:@selector(showImage)]) [(id)c performSelector:@selector(showImage)];
                     }
                 }
             }
