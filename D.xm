@@ -50,6 +50,7 @@
 @property (nonatomic, retain) NSString *m_nsToUsr;
 @property (nonatomic, retain) WCPayInfoItem *m_oWCPayInfoItem;
 - (BOOL)IsTextMsg;
+- (BOOL)IsImgMsg;
 - (BOOL)isReferMsgType;
 - (NSString *)GetDisplayContent;
 - (void)parseWCPayInfoItemIfNeed;
@@ -98,6 +99,7 @@
 
 static NSString * const kDDFeatureTextEnabled = @"DDFeatureTextEnabled";
 static NSString * const kDDFeatureTransferEnabled = @"DDFeatureTransferEnabled";
+static NSString * const kDDFeatureImageEnabled = @"DDFeatureImageEnabled";
 static NSString * const kDDFeatureBalanceEnabled = @"DDFeatureBalanceEnabled";
 static NSString * const kDDFeatureStepsEnabled = @"DDFeatureStepsEnabled";
 static NSString * const kDDFeatureContactsEnabled = @"DDFeatureContactsEnabled";
@@ -111,6 +113,7 @@ static NSString * const kDDLastStepsUpdateDateKey = @"DDLastStepsUpdateDate";
 @interface DDGlobalConfig : NSObject
 + (instancetype)shared;
 @property (nonatomic) BOOL textEnabled;
+@property (nonatomic) BOOL imageEnabled;
 @property (nonatomic) BOOL transferEnabled;
 @property (nonatomic) BOOL balanceEnabled;
 @property (nonatomic) BOOL stepsEnabled;
@@ -128,7 +131,7 @@ static NSString * const kDDLastStepsUpdateDateKey = @"DDLastStepsUpdateDate";
 - (void)saveContacts;
 @end
 
-#pragma mark - ① 聊天文字/转账修改
+#pragma mark - ① 聊天文字/图片/转账修改
 
 static CMessageWrap *JokerGetMessageWrapFromCell(CommonMessageCellView *cell) {
     return cell.viewModel.messageWrap;
@@ -342,6 +345,123 @@ static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *origin
 }
 %end
 
+#pragma mark - ①b 聊天图片修改
+
+@interface DDImagePickerDelegate : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
+@property (nonatomic, assign) unsigned int mesLocalID;
+@property (nonatomic, weak) id viewController;
+- (void)dd_saveImage:(UIImage *)image dismissPicker:(UIImagePickerController *)picker;
+@end
+
+static NSString *DDImageReplacementPath(unsigned int mesLocalID) {
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *folder = [dir stringByAppendingPathComponent:@"DDJokerImages"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:nil];
+    return [folder stringByAppendingPathComponent:[NSString stringWithFormat:@"%u.png", mesLocalID]];
+}
+
+static UIImage *DDImageReplacementForMessage(CMessageWrap *msg) {
+    if (!msg || ![msg IsImgMsg]) return nil;
+    NSString *path = DDImageReplacementPath(msg.m_uiMesLocalID);
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return nil;
+    return [UIImage imageWithContentsOfFile:path];
+}
+
+%hook ImageMessageCellView
+- (NSArray *)operationMenuItems {
+    NSArray *original = %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (!cfg.imageEnabled) return original;
+    CMessageWrap *msg = [self.viewModel messageWrap];
+    if (![msg IsImgMsg]) return original;
+    Class menuItemClass = NSClassFromString(@"MMMenuItem");
+    if (!menuItemClass) return original;
+    UIImage *icon = [[UIImage systemImageNamed:@"face.smiling.fill"] imageWithTintColor:[UIColor whiteColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
+    MMMenuItem *newItem = [[menuItemClass alloc] initWithTitle:@"小丑" icon:icon target:self action:@selector(dk_changeChatImage)];
+    NSMutableArray *newItems = [NSMutableArray arrayWithArray:original];
+    [newItems insertObject:newItem atIndex:0];
+    return newItems;
+}
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+    if (action == @selector(dk_changeChatImage)) {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (!cfg.imageEnabled) return NO;
+        CMessageWrap *msg = [self.viewModel messageWrap];
+        return [msg IsImgMsg];
+    }
+    return %orig;
+}
+%new
+- (void)dk_changeChatImage {
+    CMessageWrap *msg = [self.viewModel messageWrap];
+    if (![msg IsImgMsg]) return;
+    id vc = JokerGetViewControllerFromView(self);
+    if (!vc) return;
+    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+    picker.allowsEditing = NO;
+    DDImagePickerDelegate *delegate = [[DDImagePickerDelegate alloc] init];
+    delegate.mesLocalID = msg.m_uiMesLocalID;
+    delegate.viewController = vc;
+    picker.delegate = delegate;
+    objc_setAssociatedObject(picker, "dd_picker_delegate", delegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [vc presentViewController:picker animated:YES completion:nil];
+}
+- (void)showImage {
+    %orig;
+    if (![DDGlobalConfig shared].imageEnabled) return;
+    UIImage *rep = DDImageReplacementForMessage([self.viewModel messageWrap]);
+    if (rep) {
+        id iv = [self valueForKey:@"m_imageView"];
+        if ([iv respondsToSelector:@selector(setImage:)]) [iv setImage:rep];
+    }
+}
+- (void)layoutContentView {
+    %orig;
+    if (![DDGlobalConfig shared].imageEnabled) return;
+    UIImage *rep = DDImageReplacementForMessage([self.viewModel messageWrap]);
+    if (rep) {
+        id iv = [self valueForKey:@"m_imageView"];
+        if ([iv respondsToSelector:@selector(setImage:)]) [iv setImage:rep];
+    }
+}
+%end
+
+@implementation DDImagePickerDelegate
+- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<NSString *,id> *)info {
+    UIImage *image = info[UIImagePickerControllerOriginalImage];
+    if (image) {
+        [self dd_saveImage:image dismissPicker:picker];
+    } else {
+        [picker dismissViewControllerAnimated:YES completion:nil];
+    }
+}
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+}
+- (void)dd_saveImage:(UIImage *)image dismissPicker:(UIImagePickerController *)picker {
+    NSString *path = DDImageReplacementPath(self.mesLocalID);
+    NSData *data = UIImagePNGRepresentation(image);
+    if (data) [data writeToFile:path atomically:YES];
+    [picker dismissViewControllerAnimated:YES completion:^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            id vc = self.viewController;
+            UITableView *tv = [vc respondsToSelector:@selector(getMsgTableView)] ? [vc getMsgTableView] : nil;
+            if (![tv isKindOfClass:[UITableView class]]) return;
+            for (UITableViewCell *c in [tv visibleCells]) {
+                if ([c isKindOfClass:NSClassFromString(@"ImageMessageCellView")]) {
+                    ImageMessageCellView *cell = (ImageMessageCellView *)c;
+                    CMessageWrap *m = [cell.viewModel messageWrap];
+                    if (m.m_uiMesLocalID == self.mesLocalID) {
+                        if ([cell respondsToSelector:@selector(showImage)]) [cell performSelector:@selector(showImage)];
+                    }
+                }
+            }
+        });
+    }];
+}
+@end
+
 #pragma mark - ② 运动步数修改
 
 static BOOL isToday(NSDate *date) {
@@ -520,11 +640,12 @@ static unsigned long long DDLingtongFenValue(void) {
     [_tableViewManager clearAllSection];
 
     WCTableViewSectionManager *section = [objc_getClass("WCTableViewSectionManager") sectionWithHeader:@"小丑设置"
-                                                                                                 Footer:@"聊天文字修改 / 聊天转账修改 为独立开关：长按消息弹窗菜单小丑按钮，文字消息改内容与引用标题、转账消息改金额。余额小丑开启后可自定义余额与零钱通金额。步数和好友数量修改后需重启微信生效"];
+                                                                                                 Footer:@"聊天文字修改 / 聊天图片修改 / 聊天转账修改 为独立开关：长按消息弹窗菜单小丑按钮，文字消息改内容与引用标题、图片消息替换为相册所选图、转账消息改金额。余额小丑开启后可自定义余额与零钱通金额。步数和好友数量修改后需重启微信生效"];
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     Class cellCls = objc_getClass("WCTableViewCellManager");
 
     [section addCell:[cellCls switchCellForSel:@selector(textSwitchChanged:) target:self title:@"聊天文字修改" on:cfg.textEnabled]];
+    [section addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
     [section addCell:[cellCls switchCellForSel:@selector(transferSwitchChanged:) target:self title:@"聊天转账修改" on:cfg.transferEnabled]];
 
     [section addCell:[cellCls switchCellForSel:@selector(balanceSwitchChanged:) target:self title:@"余额小丑" on:cfg.balanceEnabled]];
@@ -606,6 +727,11 @@ static unsigned long long DDLingtongFenValue(void) {
 
 - (void)textSwitchChanged:(UISwitch *)sender {
     [DDGlobalConfig shared].textEnabled = sender.isOn;
+    [self buildTable];
+}
+
+- (void)imageSwitchChanged:(UISwitch *)sender {
+    [DDGlobalConfig shared].imageEnabled = sender.isOn;
     [self buildTable];
 }
 
@@ -738,6 +864,7 @@ static unsigned long long DDLingtongFenValue(void) {
     if (self = [super init]) {
         NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
         _textEnabled = [def boolForKey:kDDFeatureTextEnabled];
+        _imageEnabled = [def boolForKey:kDDFeatureImageEnabled];
         _transferEnabled = [def boolForKey:kDDFeatureTransferEnabled];
         _balanceEnabled = [def boolForKey:kDDFeatureBalanceEnabled];
         _stepsEnabled = [def boolForKey:kDDFeatureStepsEnabled];
@@ -763,6 +890,12 @@ static unsigned long long DDLingtongFenValue(void) {
 - (void)setTransferEnabled:(BOOL)enabled {
     _transferEnabled = enabled;
     [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureTransferEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setImageEnabled:(BOOL)enabled {
+    _imageEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureImageEnabled];
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
