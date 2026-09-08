@@ -425,29 +425,36 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
     if (!alert) return;
     [alert showTextFieldWithMaxLen:1000];
     [alert setTextFieldDefaultText:current];
-    // 强引用输入框：回调里直接读 text，不依赖 alert 此刻是否还活着
-    //（之前用 __weak 引用 alert，点确定时 alert 可能已释放，回调直接 return，导致修改完全无效）
-    UITextField *inputField = [alert getTextField];
-    if (isTransfer) {
-        [alert setTextFieldPlaceHolder:@"例如：888.88"];
-        if (inputField) inputField.keyboardType = UIKeyboardTypeDecimalPad;
-    }
-    if (!inputField) return;
+    if (isTransfer) [alert setTextFieldPlaceHolder:@"例如：888.88"];
 
+    // 注意两点（都踩过坑）：
+    // 1) 不能用 __weak 引用 alert —— 回调触发时它可能已释放，nil 会让修改静默失效；
+    // 2) 不能在 show 之前判断 getTextField 为空就 return —— 那会让弹窗根本不显示。
+    // 所以：alert 与输入框都强引用，取文本时两条路径都试。
+    __block WCUIAlertView *blockAlert = alert;
+    __block UITextField *inputField = nil;
     [alert addCancelBtnTitle:@"取消" handler:^{}];
     [alert addBtnTitle:@"确定" handler:^{
-        NSString *newText = [inputField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (!newText.length || [newText isEqualToString:current]) return;
-        if (isTransfer) {
-            newText = JokerNormalizeAmount(newText);
-            if (!newText) return;
-            DDJokerSetCachedAmount(msg, newText);
-        } else {
-            DDJokerSetCachedText(msg, newText);
+        NSString *raw = blockAlert ? [blockAlert getTextFieldText] : nil;
+        if (!raw.length) raw = inputField.text;
+        NSString *newText = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (newText.length && ![newText isEqualToString:current]) {
+            if (isTransfer) {
+                NSString *normalized = JokerNormalizeAmount(newText);
+                if (normalized) DDJokerSetCachedAmount(msg, normalized);
+            } else {
+                DDJokerSetCachedText(msg, newText);
+            }
+            JokerReloadCellAfterReplace(vc, msg, cell);
         }
-        JokerReloadCellAfterReplace(vc, msg, cell);
+        blockAlert = nil;   // 打破 alert -> handler -> alert 的保留环
     }];
     [alert show];
+    UITextField *tf = [alert getTextField];   // show 之后输入框一定已创建
+    if (tf) {
+        inputField = tf;
+        if (isTransfer) tf.keyboardType = UIKeyboardTypeDecimalPad;
+    }
 }
 
 static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *original) {
