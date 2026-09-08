@@ -268,26 +268,32 @@ static NSString *JokerGetDisplayText(CMessageWrap *msg) {
     return nil;
 }
 
+static UITableView *JokerFindTableView(UIView *view) {
+    UIView *v = view;
+    while (v) {
+        if ([v isKindOfClass:[UITableView class]]) return (UITableView *)v;
+        v = v.superview;
+    }
+    return nil;
+}
+
 static void JokerReloadCellAfterReplace(id vc, CMessageWrap *msg, CommonMessageCellView *cell) {
-    if (!vc || !msg) return;
-    if ([vc respondsToSelector:@selector(clearNodeLayoutCache)]) {
-        [vc clearNodeLayoutCache];
+    if (!cell) return;
+    UITableView *tv = JokerFindTableView((UIView *)cell);
+    if (![tv isKindOfClass:[UITableView class]] && [vc respondsToSelector:@selector(getMsgTableView)]) {
+        tv = [vc getMsgTableView];
+    }
+    if (![tv isKindOfClass:[UITableView class]]) return;
+    NSIndexPath *ip = [tv indexPathForCell:(UITableViewCell *)cell];
+    if (ip) {
+        [UIView performWithoutAnimation:^{
+            [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
+        }];
+        return;
     }
     if ([vc respondsToSelector:@selector(reloadNodeWithMessageWrap:)]) {
         [vc reloadNodeWithMessageWrap:msg];
     }
-    if ([vc respondsToSelector:@selector(reloadVisibleNodeWithCellView:)]) {
-        [vc reloadVisibleNodeWithCellView:cell];
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (![vc respondsToSelector:@selector(getMsgTableView)]) return;
-        UITableView *tv = [vc getMsgTableView];
-        if (![tv isKindOfClass:[UITableView class]]) return;
-        [UIView performWithoutAnimation:^{
-            [tv beginUpdates];
-            [tv endUpdates];
-        }];
-    });
 }
 
 static void JokerPresentEditor(CommonMessageCellView *cell) {
@@ -299,34 +305,41 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
     NSString *current = JokerGetDisplayText(msg) ?: @"";
     BOOL isTransfer = JokerIsTransferMessage(msg);
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"小丑"
-                                                                   message:@"修改已保存至本机，重启微信后仍生效；关闭功能自动恢复原始内容"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.text = current;
-        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
-        if (isTransfer) {
-            tf.keyboardType = UIKeyboardTypeDecimalPad;
-            tf.placeholder = @"例如：888.88";
-        }
-    }];
+    Class alertCls = NSClassFromString(@"WCUIAlertView");
+    if (!alertCls) return;
+    id alert = [[alertCls alloc] initWithTitle:@"小丑" message:current];
+    if (![alert respondsToSelector:@selector(showTextFieldWithMaxLen:)]) return;
+    [alert showTextFieldWithMaxLen:(isTransfer ? 20 : 2000)];
+    if ([alert respondsToSelector:@selector(setTextFieldDefaultText:)]) [alert setTextFieldDefaultText:current];
+    if ([alert respondsToSelector:@selector(setTextFieldPlaceHolder:)]) {
+        [alert setTextFieldPlaceHolder:(isTransfer ? @"例如：888.88" : nil)];
+    }
+    if (isTransfer && [alert respondsToSelector:@selector(getTextField)]) {
+        id tf = [alert getTextField];
+        if ([tf respondsToSelector:@selector(setKeyboardType:)]) [tf setKeyboardType:UIKeyboardTypeDecimalPad];
+    }
     __weak typeof(cell) weakCell = cell;
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        typeof(weakCell) strongCell = weakCell;
-        NSString *newText = [alert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (newText.length && ![newText isEqualToString:current]) {
-            if (isTransfer) {
-                newText = JokerNormalizeAmount(newText);
-                if (!newText) return;
-                DDJokerSetCachedAmount(msg, newText);
-            } else {
-                DDJokerSetCachedText(msg, newText);
+    if ([alert respondsToSelector:@selector(addCancelBtnTitle:handler:)]) {
+        [alert addCancelBtnTitle:@"取消" handler:nil];
+    }
+    if ([alert respondsToSelector:@selector(addBtnTitle:handler:)]) {
+        [alert addBtnTitle:@"确定" handler:^{
+            typeof(weakCell) strongCell = weakCell;
+            NSString *newText = ([alert respondsToSelector:@selector(getTextFieldText)] ? [alert getTextFieldText] : @"");
+            newText = [newText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (newText.length && ![newText isEqualToString:current]) {
+                if (isTransfer) {
+                    newText = JokerNormalizeAmount(newText);
+                    if (!newText) return;
+                    DDJokerSetCachedAmount(msg, newText);
+                } else {
+                    DDJokerSetCachedText(msg, newText);
+                }
+                JokerReloadCellAfterReplace(vc, msg, strongCell);
             }
-            JokerReloadCellAfterReplace(vc, msg, strongCell);
-        }
-    }]];
-    [vc presentViewController:alert animated:YES completion:nil];
+        }];
+    }
+    if ([alert respondsToSelector:@selector(show)]) [alert show];
 }
 
 static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *original) {
@@ -835,8 +848,12 @@ static unsigned long long DDLingtongFenValue(void) {
 - (void)clearChatCacheTapped:(id)sender {
     DDJokerClearAllMessageCache();
     [self buildTable];
-    if ([self.view respondsToSelector:@selector(showTipsLabelWithText:)]) {
-        [self.view performSelector:@selector(showTipsLabelWithText:) withObject:@"已清理"];
+    Class toastCls = NSClassFromString(@"WeToast");
+    if (toastCls && [toastCls respondsToSelector:@selector(toast)]) {
+        id toast = [toastCls toast];
+        if ([toast respondsToSelector:@selector(showDoneToastWithText:)]) {
+            [toast showDoneToastWithText:@"已清理"];
+        }
     }
 }
 
