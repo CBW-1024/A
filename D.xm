@@ -739,14 +739,14 @@ static unsigned long long DDLingtongFenValue(void) {
     [chatSection addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(transferSwitchChanged:) target:self title:@"聊天转账修改" on:cfg.transferEnabled]];
     UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    clearBtn.frame = CGRectMake(0, 0, 60, 34);
+    clearBtn.frame = CGRectMake(0, 0, 52, 34);
     [clearBtn setTitle:@"清理" forState:UIControlStateNormal];
     [clearBtn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
     clearBtn.backgroundColor = [UIColor systemGray5Color];
     clearBtn.layer.cornerRadius = 6.0;
     clearBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
     [clearBtn addTarget:self action:@selector(clearChatCacheTapped:) forControlEvents:UIControlEventTouchUpInside];
-    UIView *clearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 60, 34)];
+    UIView *clearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
     [clearRight addSubview:clearBtn];
     [chatSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清除修改缓存" rightView:clearRight]];
     [_tableViewManager addSection:chatSection];
