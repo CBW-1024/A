@@ -638,16 +638,19 @@ static unsigned long long DDLingtongFenValue(void) {
 - (void)buildTable {
     [_tableViewManager clearAllSection];
 
-    WCTableViewSectionManager *section = [objc_getClass("WCTableViewSectionManager") sectionWithHeader:@"小丑设置"
-                                                                                                 Footer:@"聊天文字修改 / 聊天图片修改 / 聊天转账修改 为独立开关：长按消息弹窗菜单小丑按钮，文字消息改内容与引用标题、图片消息替换为相册所选图、转账消息改金额。余额小丑开启后可自定义余额与零钱通金额。步数和好友数量修改后需重启微信生效"];
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     Class cellCls = objc_getClass("WCTableViewCellManager");
 
-    [section addCell:[cellCls switchCellForSel:@selector(textSwitchChanged:) target:self title:@"聊天文字修改" on:cfg.textEnabled]];
-    [section addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
-    [section addCell:[cellCls switchCellForSel:@selector(transferSwitchChanged:) target:self title:@"聊天转账修改" on:cfg.transferEnabled]];
+    WCTableViewSectionManager *chatSection = [objc_getClass("WCTableViewSectionManager") sectionWithHeader:@"聊天设置"
+                                                                                                    Footer:@"聊天文字修改 / 聊天图片修改 / 聊天转账修改 为独立开关：长按消息弹窗菜单小丑按钮，文字消息改内容与引用标题、图片消息替换为相册所选图、转账消息改金额"];
+    [chatSection addCell:[cellCls switchCellForSel:@selector(textSwitchChanged:) target:self title:@"聊天文字修改" on:cfg.textEnabled]];
+    [chatSection addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
+    [chatSection addCell:[cellCls switchCellForSel:@selector(transferSwitchChanged:) target:self title:@"聊天转账修改" on:cfg.transferEnabled]];
+    [_tableViewManager addSection:chatSection];
 
-    [section addCell:[cellCls switchCellForSel:@selector(balanceSwitchChanged:) target:self title:@"余额小丑" on:cfg.balanceEnabled]];
+    WCTableViewSectionManager *profileSection = [objc_getClass("WCTableViewSectionManager") sectionWithHeader:@"资料设置"
+                                                                                                        Footer:@"零钱余额修改开启后可自定义余额与零钱通金额。步数和好友数量修改后需重启微信生效"];
+    [profileSection addCell:[cellCls switchCellForSel:@selector(balanceSwitchChanged:) target:self title:@"零钱余额修改" on:cfg.balanceEnabled]];
     if (cfg.balanceEnabled) {
         self.balanceField = [[UITextField alloc] init];
         NSString *currentBalance = [cfg hasBalanceValue] ? cfg.balanceValue : @"";
@@ -657,7 +660,7 @@ static unsigned long long DDLingtongFenValue(void) {
                                                   text:currentBalance];
         WCTableViewCellManager *balanceSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳余额自定义" rightView:balanceRight];
         balanceSubCell.userInfo = @"SubCell";
-        [section addCell:balanceSubCell];
+        [profileSection addCell:balanceSubCell];
 
         self.lingtongField = [[UITextField alloc] init];
         NSString *currentLingtong = [cfg hasLingtongValue] ? cfg.lingtongValue : @"";
@@ -667,10 +670,10 @@ static unsigned long long DDLingtongFenValue(void) {
                                                    text:currentLingtong];
         WCTableViewCellManager *lingtongSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳零钱通自定义" rightView:lingtongRight];
         lingtongSubCell.userInfo = @"SubCell";
-        [section addCell:lingtongSubCell];
+        [profileSection addCell:lingtongSubCell];
     }
 
-    [section addCell:[cellCls switchCellForSel:@selector(stepsSwitchChanged:) target:self title:@"运动步数修改" on:cfg.stepsEnabled]];
+    [profileSection addCell:[cellCls switchCellForSel:@selector(stepsSwitchChanged:) target:self title:@"运动步数修改" on:cfg.stepsEnabled]];
     if (cfg.stepsEnabled) {
         self.stepsField = [[UITextField alloc] init];
         NSString *currentSteps = [cfg hasStepsValue] ? cfg.stepsValueString : @"";
@@ -680,10 +683,10 @@ static unsigned long long DDLingtongFenValue(void) {
                                                text:currentSteps];
         WCTableViewCellManager *stepsSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳步数自定义" rightView:rightView];
         stepsSubCell.userInfo = @"SubCell";
-        [section addCell:stepsSubCell];
+        [profileSection addCell:stepsSubCell];
     }
 
-    [section addCell:[cellCls switchCellForSel:@selector(contactsSwitchChanged:) target:self title:@"好友数量修改" on:cfg.contactsEnabled]];
+    [profileSection addCell:[cellCls switchCellForSel:@selector(contactsSwitchChanged:) target:self title:@"好友数量修改" on:cfg.contactsEnabled]];
     if (cfg.contactsEnabled) {
         self.contactsField = [[UITextField alloc] init];
         NSString *currentContacts = [cfg hasContactsValue] ? cfg.contactsValue : @"";
@@ -693,10 +696,10 @@ static unsigned long long DDLingtongFenValue(void) {
                                                text:currentContacts];
         WCTableViewCellManager *contactsSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳数量自定义" rightView:rightView];
         contactsSubCell.userInfo = @"SubCell";
-        [section addCell:contactsSubCell];
+        [profileSection addCell:contactsSubCell];
     }
+    [_tableViewManager addSection:profileSection];
 
-    [_tableViewManager addSection:section];
     [_tableViewManager reloadTableView];
 }
 
