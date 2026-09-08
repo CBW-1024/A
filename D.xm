@@ -210,6 +210,57 @@ static void JokerApplyAmountToPayInfo(CMessageWrap *msg, NSString *amount) {
     }
 }
 
+static NSString * const kDDJokerTextCacheKey = @"DDJokerTextCache";
+static NSString * const kDDJokerAmountCacheKey = @"DDJokerAmountCache";
+
+static NSString *DDJokerMessageKey(CMessageWrap *msg) {
+    return [NSString stringWithFormat:@"%u", msg.m_uiMesLocalID];
+}
+
+static NSString *DDJokerCachedText(CMessageWrap *msg) {
+    if (!msg) return nil;
+    NSDictionary *d = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kDDJokerTextCacheKey];
+    NSString *v = d[DDJokerMessageKey(msg)];
+    return v.length ? v : nil;
+}
+
+static void DDJokerSetCachedText(CMessageWrap *msg, NSString *text) {
+    if (!msg) return;
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[def dictionaryForKey:kDDJokerTextCacheKey] ?: @{}];
+    if (text.length) d[DDJokerMessageKey(msg)] = text;
+    else [d removeObjectForKey:DDJokerMessageKey(msg)];
+    [def setObject:d forKey:kDDJokerTextCacheKey];
+    [def synchronize];
+}
+
+static NSString *DDJokerCachedAmount(CMessageWrap *msg) {
+    if (!msg) return nil;
+    NSDictionary *d = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kDDJokerAmountCacheKey];
+    NSString *v = d[DDJokerMessageKey(msg)];
+    return v.length ? v : nil;
+}
+
+static void DDJokerSetCachedAmount(CMessageWrap *msg, NSString *amount) {
+    if (!msg) return;
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[def dictionaryForKey:kDDJokerAmountCacheKey] ?: @{}];
+    if (amount.length) d[DDJokerMessageKey(msg)] = amount;
+    else [d removeObjectForKey:DDJokerMessageKey(msg)];
+    [def setObject:d forKey:kDDJokerAmountCacheKey];
+    [def synchronize];
+}
+
+static void DDJokerClearAllMessageCache(void) {
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    [def removeObjectForKey:kDDJokerTextCacheKey];
+    [def removeObjectForKey:kDDJokerAmountCacheKey];
+    [def synchronize];
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *folder = [dir stringByAppendingPathComponent:@"DDJokerImages"];
+    [[NSFileManager defaultManager] removeItemAtPath:folder error:nil];
+}
+
 static NSString *JokerGetDisplayText(CMessageWrap *msg) {
     if (JokerIsTextMessage(msg)) return [msg GetDisplayContent];
     if (JokerIsReferMessage(msg)) return msg.m_nsTitle ?: @"";
@@ -249,7 +300,7 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
     BOOL isTransfer = JokerIsTransferMessage(msg);
 
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"小丑"
-                                                                   message:@"仅当前页面生效，离开后自动恢复"
+                                                                   message:@"修改已保存至本机，重启微信后仍生效；关闭功能自动恢复原始内容"
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.text = current;
@@ -268,13 +319,9 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
             if (isTransfer) {
                 newText = JokerNormalizeAmount(newText);
                 if (!newText) return;
-            }
-            if (JokerIsTextMessage(msg)) {
-                msg.m_nsContent = newText;
-            } else if (JokerIsReferMessage(msg)) {
-                msg.m_nsTitle = newText;
-            } else if (JokerIsTransferMessage(msg)) {
-                JokerApplyAmountToPayInfo(msg, newText);
+                DDJokerSetCachedAmount(msg, newText);
+            } else {
+                DDJokerSetCachedText(msg, newText);
             }
             JokerReloadCellAfterReplace(vc, msg, strongCell);
         }
@@ -298,6 +345,14 @@ static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *origin
 }
 
 %hook TextMessageCellView
+- (void)setViewModel:(id)vm {
+    if ([DDGlobalConfig shared].textEnabled) {
+        CMessageWrap *msg = (CMessageWrap *)[vm valueForKey:@"messageWrap"];
+        NSString *cached = DDJokerCachedText(msg);
+        if (cached) msg.m_nsContent = cached;
+    }
+    %orig;
+}
 - (NSArray *)operationMenuItems {
     return JokerInjectMenuItem(self, %orig);
 }
@@ -314,6 +369,16 @@ static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *origin
 %end
 
 %hook AppMessageCellView
+- (void)setViewModel:(id)vm {
+    if ([DDGlobalConfig shared].textEnabled) {
+        CMessageWrap *msg = (CMessageWrap *)[vm valueForKey:@"messageWrap"];
+        if ([msg isReferMsgType]) {
+            NSString *cached = DDJokerCachedText(msg);
+            if (cached) msg.m_nsTitle = cached;
+        }
+    }
+    %orig;
+}
 - (NSArray *)operationMenuItems {
     return JokerInjectMenuItem(self, %orig);
 }
@@ -330,6 +395,16 @@ static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *origin
 %end
 
 %hook WCPayTransferMessageCellView
+- (void)setViewModel:(id)vm {
+    if ([DDGlobalConfig shared].transferEnabled) {
+        CMessageWrap *msg = (CMessageWrap *)[vm valueForKey:@"messageWrap"];
+        if (JokerIsTransferMessage(msg)) {
+            NSString *cached = DDJokerCachedAmount(msg);
+            if (cached) JokerApplyAmountToPayInfo(msg, cached);
+        }
+    }
+    %orig;
+}
 - (NSArray *)operationMenuItems {
     return JokerInjectMenuItem(self, %orig);
 }
@@ -367,7 +442,21 @@ static UIImage *DDImageReplacementForMessage(CMessageWrap *msg) {
     return [UIImage imageWithContentsOfFile:path];
 }
 
+static void DDImageApplyReplacementToCell(id cell) {
+    if (![DDGlobalConfig shared].imageEnabled) return;
+    CMessageWrap *msg = (CMessageWrap *)[[(id)cell valueForKey:@"viewModel"] valueForKey:@"messageWrap"];
+    UIImage *rep = DDImageReplacementForMessage(msg);
+    if (rep) {
+        id iv = [(id)cell valueForKey:@"m_imageView"];
+        if ([iv respondsToSelector:@selector(setImage:)]) [iv setImage:rep];
+    }
+}
+
 %hook ImageMessageCellView
+- (void)setViewModel:(id)vm {
+    %orig;
+    DDImageApplyReplacementToCell(self);
+}
 - (NSArray *)operationMenuItems {
     NSArray *original = %orig;
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
@@ -409,21 +498,11 @@ static UIImage *DDImageReplacementForMessage(CMessageWrap *msg) {
 }
 - (void)showImage {
     %orig;
-    if (![DDGlobalConfig shared].imageEnabled) return;
-    UIImage *rep = DDImageReplacementForMessage((CMessageWrap *)[[(id)self valueForKey:@"viewModel"] valueForKey:@"messageWrap"]);
-    if (rep) {
-        id iv = [(id)self valueForKey:@"m_imageView"];
-        if ([iv respondsToSelector:@selector(setImage:)]) [iv setImage:rep];
-    }
+    DDImageApplyReplacementToCell(self);
 }
 - (void)layoutContentView {
     %orig;
-    if (![DDGlobalConfig shared].imageEnabled) return;
-    UIImage *rep = DDImageReplacementForMessage((CMessageWrap *)[[(id)self valueForKey:@"viewModel"] valueForKey:@"messageWrap"]);
-    if (rep) {
-        id iv = [(id)self valueForKey:@"m_imageView"];
-        if ([iv respondsToSelector:@selector(setImage:)]) [iv setImage:rep];
-    }
+    DDImageApplyReplacementToCell(self);
 }
 %end
 
@@ -452,7 +531,7 @@ static UIImage *DDImageReplacementForMessage(CMessageWrap *msg) {
                 if ([c isKindOfClass:NSClassFromString(@"ImageMessageCellView")]) {
                     CMessageWrap *m = (CMessageWrap *)[[(id)c valueForKey:@"viewModel"] valueForKey:@"messageWrap"];
                     if (m.m_uiMesLocalID == self.mesLocalID) {
-                        if ([(id)c respondsToSelector:@selector(showImage)]) [(id)c performSelector:@selector(showImage)];
+                        JokerReloadCellAfterReplace(vc, m, (id)c);
                     }
                 }
             }
@@ -646,6 +725,17 @@ static unsigned long long DDLingtongFenValue(void) {
     [chatSection addCell:[cellCls switchCellForSel:@selector(textSwitchChanged:) target:self title:@"聊天文字修改" on:cfg.textEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(transferSwitchChanged:) target:self title:@"聊天转账修改" on:cfg.transferEnabled]];
+    UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    clearBtn.frame = CGRectMake(0, 0, 60, 34);
+    [clearBtn setTitle:@"清理" forState:UIControlStateNormal];
+    [clearBtn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
+    clearBtn.backgroundColor = [UIColor systemGray5Color];
+    clearBtn.layer.cornerRadius = 6.0;
+    clearBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
+    [clearBtn addTarget:self action:@selector(clearChatCacheTapped:) forControlEvents:UIControlEventTouchUpInside];
+    UIView *clearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 60, 34)];
+    [clearRight addSubview:clearBtn];
+    [chatSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清除修改缓存" rightView:clearRight]];
     [_tableViewManager addSection:chatSection];
 
     WCTableViewSectionManager *profileSection = [objc_getClass("WCTableViewSectionManager") sectionWithHeader:@"资料设置"
@@ -740,6 +830,14 @@ static unsigned long long DDLingtongFenValue(void) {
 - (void)transferSwitchChanged:(UISwitch *)sender {
     [DDGlobalConfig shared].transferEnabled = sender.isOn;
     [self buildTable];
+}
+
+- (void)clearChatCacheTapped:(id)sender {
+    DDJokerClearAllMessageCache();
+    [self buildTable];
+    if ([self.view respondsToSelector:@selector(showTipsLabelWithText:)]) {
+        [self.view performSelector:@selector(showTipsLabelWithText:) withObject:@"已清理"];
+    }
 }
 
 - (void)balanceSwitchChanged:(UISwitch *)sender {
