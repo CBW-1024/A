@@ -314,13 +314,9 @@ static NSString *JokerReferMessageTitle(CMessageWrap *msg) {
 // （只有 :572 parseWCPayInfoItemIfNeed），那个判定在真机上恒为 NO，
 // 用它会导致"金额改了没反应"和"点小丑不弹窗"。转账一律按下面的类判定。
 
-// 判断转账的唯一可靠依据：cell / viewModel 的类（不依赖任何支付字段）
+// 判断转账的唯一可靠依据：cell 的类（不依赖任何支付字段）
 static BOOL JokerIsTransferCell(CommonMessageCellView *cell) {
     return [cell isKindOfClass:%c(WCPayTransferMessageCellView)];
-}
-
-static BOOL JokerIsTransferViewModel(id vm) {
-    return [vm isKindOfClass:%c(WCPayTransferMessageViewModel)];
 }
 
 // 注意：必须用 cell 判定，不能用 msg 判定 —— 转账消息在 CMessageWrap 上没有任何可用标记
