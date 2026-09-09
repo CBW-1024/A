@@ -615,8 +615,9 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
     BOOL isTransfer = JokerIsTransferCell(cell);
     NSString *current = JokerGetDisplayText(msg, isTransfer);
 
-    // 微信原生带输入框 alert：WCUIAlertView（声明见文件顶部）
-    WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:@"小丑" message:nil];
+    // 微信原生带输入框 alert：WCUIAlertView（声明见文件顶部）。标题按类型区分
+    NSString *editorTitle = isTransfer ? @"转账修改" : @"文字修改";
+    WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:editorTitle message:nil];
     if (!alert) return;
     [alert showTextFieldWithMaxLen:1000];
     [alert setTextFieldDefaultText:current];
@@ -887,6 +888,7 @@ static void DDImageApplyReplacementToCell(id cell) {
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
     picker.allowsEditing = NO;
+    picker.title = @"图片修改";
     DDWeChatImagePickerDelegate *delegate = [[DDWeChatImagePickerDelegate alloc] init];
     delegate.mesLocalID = msg.m_uiMesLocalID;
     delegate.cellView = self;   // 对齐爱锋：delegate 直接持有 cell，dismiss 后无需递归查找
@@ -1071,7 +1073,7 @@ static NSString *DDTimeStringForDisplay(double ts) {
     NSString *defaultText = base > 0 ? [DDTimeInputFormatter() stringFromDate:[NSDate dateWithTimeIntervalSince1970:base]] : @"";
 
     // 与爱锋一致：微信原生 WCUIAlertView，标题/提示文案都沿用它的（@0xbb174 / @0x6287e8 / @0x628828）
-    WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:@"请输入要修改的时间"
+    WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:@"时间修改"
                                                                            message:@"输入格式如下\n2024-08-01 22:30"];
     [alert showTextFieldWithMaxLen:100];
     [alert setTextFieldDefaultText:defaultText];
