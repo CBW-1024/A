@@ -360,19 +360,6 @@ static NSString *DDJokerMessageKey(CMessageWrap *msg) {
     return [NSString stringWithFormat:@"%u", msg.m_uiMesLocalID];
 }
 
-// 只替换文本里的第一段数字，用于转账金额（保留 ¥ 等前后缀）
-static NSString *JokerReplaceFirstNumber(NSString *text, NSString *number) {
-    if (!text.length || !number.length) return text;
-    NSRange first = [text rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"0123456789"]];
-    if (first.location == NSNotFound) return text;
-    NSUInteger end = first.location;
-    while (end < text.length) {
-        unichar c = [text characterAtIndex:end];
-        if ((c >= '0' && c <= '9') || c == '.') end++;
-        else break;
-    }
-    return [text stringByReplacingCharactersInRange:NSMakeRange(first.location, end - first.location) withString:number];
-}
 
 static NSString *DDJokerCachedText(CMessageWrap *msg) {
     if (!msg) return nil;
@@ -747,32 +734,43 @@ static void JokerInvalidateAllLayout(void) {
 }
 %end
 
-// 金额由 WCPayBaseMessageViewModel 的 descText / titleText 渲染（WCPayBaseMessageViewModel.h:6/7），
-// 之前直接改 WCPayInfoItem.m_nsFeeDesc 会污染 CMessageWrap，导致清理缓存后金额还原不回去
-%hook WCPayBaseMessageViewModel
-- (NSString *)descText {
-    NSString *origin = %orig;
-    if (![DDGlobalConfig shared].transferEnabled) return origin;
-    // 用 viewModel 类判定转账，不依赖 CMessageWrap 的支付字段（那边已无任何可用标记）
-    if (!JokerIsTransferViewModel(self)) return origin;
-    NSString *cached = DDJokerCachedAmount(self.messageWrap);
-    return cached ? JokerReplaceFirstNumber(origin, cached) : origin;
+// 转账金额改为数据层：把覆盖金额写回 CMessageWrap.m_nsContent（对齐爱锋 changeJinE @0xb7c88——
+// 金额在 <feedesc><![CDATA[...]]></feedesc> 里，用 stringByReplacingOccurrences 替换后 setM_nsContent:，
+// setM_nsContent 在 CMessageWrap.h:676 确认存在）。微信自己用新 m_nsContent 渲染 titleText/descText，
+// 不再在显示层替换文本里的数字段（会把 888.88 整个当一段数字替换，丢失小数且错位）。
+static NSMutableDictionary *gDDOriginalTransferXML;
+static NSString *DDTransferFormatAmount(NSString *override, NSString *originalAmount) {
+    // 对齐爱锋 formatString @0xb8094：保留原金额的货币符号前缀（如 ¥）
+    if ([originalAmount hasPrefix:@"¥"] && ![override hasPrefix:@"¥"]) {
+        return [@"¥" stringByAppendingString:override];
+    }
+    return override;
 }
-- (NSString *)titleText {
-    NSString *origin = %orig;
-    if (![DDGlobalConfig shared].transferEnabled) return origin;
-    // 用 viewModel 类判定转账，不依赖 CMessageWrap 的支付字段（那边已无任何可用标记）
-    if (!JokerIsTransferViewModel(self)) return origin;
-    NSString *cached = DDJokerCachedAmount(self.messageWrap);
-    return cached ? JokerReplaceFirstNumber(origin, cached) : origin;
+static NSString *DDTransferOverrideContent(NSString *xml, NSString *override) {
+    // 对齐爱锋 changeJinE @0xb7c88：定位 <feedesc><![CDATA[旧金额]]></feedesc>，替换成新金额
+    if (!xml.length || !override.length) return nil;
+    NSString *open = @"<feedesc><![CDATA[";
+    NSString *close = @"]]></feedesc>";
+    NSRange ro = [xml rangeOfString:open];
+    if (ro.location == NSNotFound) return nil;
+    NSUInteger start = ro.location + ro.length;
+    NSRange rc = [xml rangeOfString:close options:0 range:NSMakeRange(start, xml.length - start)];
+    if (rc.location == NSNotFound) return nil;
+    NSString *old = [xml substringWithRange:NSMakeRange(start, rc.location - start)];
+    NSString *newer = DDTransferFormatAmount(override, old);
+    return [xml stringByReplacingOccurrencesOfString:old withString:newer];
 }
-%end
 
 %hook WCPayTransferMessageCellView
-- (void)layoutContentView {
-    // 爱锋同样 hook 这里：金额是在布局阶段落到 label 上的
-    %orig;
+- (void)setViewModel:(id)vm {
+    // 对齐爱锋 setViewModel @0xb7938：先改 m_nsContent 再 %orig（微信用新值渲染）
     [self dd_applyTransferAmount];
+    %orig;
+}
+- (void)layoutContentView {
+    // 对齐爱锋 layoutContentView @0xb79a4：先改 m_nsContent 再 %orig
+    [self dd_applyTransferAmount];
+    %orig;
 }
 - (NSArray *)operationMenuItems {
     return JokerInjectMenuItem(self, %orig);
@@ -789,16 +787,17 @@ static void JokerInvalidateAllLayout(void) {
     JokerPresentEditor(self);
 }
 %new
-// titleText / descText 已被 hook 成替换后的金额，这里让 label 重新取一次值
+// 对齐爱锋 DKApplyTransferOverrideToModel @0xcb3ec：把覆盖金额写回 messageWrap.m_nsContent。
+// 首次见到该消息时存原始 m_nsContent，清理缓存时写回原始即可还原（进入聊天页 messageWrap 从 DB 重新加载原始）。
 - (void)dd_applyTransferAmount {
+    if (!gDDOriginalTransferXML) gDDOriginalTransferXML = [NSMutableDictionary dictionary];
     CMessageWrap *msg = JokerGetMessageWrapFromCell(self);
     if (!msg) return;
-    // 绝不能用 JokerIsTransferMessage(msg) 判定：CMessageWrap 上没有 m_oWCPayInfoItem，
-    // 那个函数恒为 NO，会把整个转账替换挡掉 —— "金额改了没反应"就是这么来的。
-    // 本方法只挂在 WCPayTransferMessageCellView 上，调用方本身就是转账 cell。
-    if (!DDJokerCachedAmount(msg) && !gJokerNeedsResetLayout) return;
-    [self updateTitleLabel];
-    [self updateDescLabel];
+    unsigned int lid = msg.m_uiMesLocalID;
+    if (!gDDOriginalTransferXML[@(lid)]) gDDOriginalTransferXML[@(lid)] = msg.m_nsContent;
+    NSString *override = DDJokerCachedAmount(msg);
+    NSString *newXML = override ? DDTransferOverrideContent(gDDOriginalTransferXML[@(lid)], override) : gDDOriginalTransferXML[@(lid)];
+    if (newXML && ![newXML isEqualToString:msg.m_nsContent]) [msg setM_nsContent:newXML];
 }
 %end
 
@@ -954,21 +953,22 @@ static void DDImageApplyReplacementToCell(id cell) {
 
 static char kDDTimeVMKey;
 
-// 微信的时间条文案有好几种（"2024年8月1日 星期四 22:30"、"8月1日 22:30"、"昨天 22:30"……），
-// 爱锋是按原文里包含的中文字来挑对应的格式串（wechatku.dylib @0xba368 起），这里照搬这个思路
-static NSString *DDTimeFormatMatching(NSString *originText) {
-    if ([originText rangeOfString:@"年"].location != NSNotFound) return @"yyyy年M月d日 EEEE HH:mm";
-    if ([originText rangeOfString:@"月"].location != NSNotFound) {
-        if ([originText rangeOfString:@"星期"].location != NSNotFound ||
-            [originText rangeOfString:@"周"].location != NSNotFound) return @"M月d日 EEEE HH:mm";
-        return @"M月d日 HH:mm";
-    }
-    if ([originText rangeOfString:@"今天"].location != NSNotFound) return @"今天 HH:mm";
-    if ([originText rangeOfString:@"昨天"].location != NSNotFound) return @"昨天 HH:mm";
-    if ([originText rangeOfString:@"前天"].location != NSNotFound) return @"前天 HH:mm";
-    if ([originText rangeOfString:@"星期"].location != NSNotFound ||
-        [originText rangeOfString:@"周"].location != NSNotFound) return @"EEEE HH:mm";
-    return @"M月d日 HH:mm";
+// 爱锋 timeText @0xba2d0 直接用覆盖时间（DKHelperConfig 字典里的字符串）自己格式化显示，
+// 根本不依赖微信原始 timeText 文本选格式。DD 之前用微信 origin（可能是"昨天"/"刚刚"相对时间）
+// 选格式串，会把用户改的具体日期格式成"昨天 HH:mm"丢失绝对日期 —— 这是时间修改失效的根因。
+// 改为：基于用户指定的 ts 相对今天推算格式（今天/昨天/前天/今年含星期/跨年），与微信原生一致。
+static NSString *DDTimeFormatForTimestamp(double ts) {
+    NSCalendar *cal = [NSCalendar currentCalendar];
+    NSDate *d = [NSDate dateWithTimeIntervalSince1970:ts];
+    NSDate *now = [NSDate date];
+    if ([cal isDateInToday:d]) return @"今天 HH:mm";
+    if ([cal isDateInYesterday:d]) return @"昨天 HH:mm";
+    NSDateComponents *dc = [cal components:NSCalendarUnitDay fromDate:d toDate:now options:0];
+    if (dc.day == 2) return @"前天 HH:mm";
+    NSInteger y = [cal component:NSCalendarUnitYear fromDate:d];
+    NSInteger ny = [cal component:NSCalendarUnitYear fromDate:now];
+    if (y == ny) return @"M月d日 EEEE HH:mm";
+    return @"yyyy年M月d日 EEEE HH:mm";
 }
 
 // 输入/解析统一用 en_US_POSIX + @"yyyy-MM-dd HH:mm"（爱锋 timestampFromDateString: @0xbaf30 同款）。
@@ -986,24 +986,23 @@ static double DDTimeStampFromString(NSString *s) {
     return d ? [d timeIntervalSince1970] : 0;
 }
 
-static NSString *DDTimeStringForDisplay(NSString *originText, double ts) {
+static NSString *DDTimeStringForDisplay(double ts) {
     NSDateFormatter *f = [[NSDateFormatter alloc] init];
     f.locale = [NSLocale localeWithLocaleIdentifier:@"zh_CN"];
     f.timeZone = [NSTimeZone localTimeZone];
-    f.dateFormat = DDTimeFormatMatching(originText);
+    f.dateFormat = DDTimeFormatForTimestamp(ts);
     return [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:ts]];
 }
 
-// 时间条显示的就是 viewModel 的 timeText（ChatTimeViewModel.h:14），和文字走 contentText 一个道理
+// 时间条显示的就是 viewModel 的 timeText（ChatTimeViewModel.h:14）。覆盖时间直接用用户指定的 ts 格式化，
+// 不再读微信 origin（避免相对时间 origin 让绝对日期丢失），与爱锋 timeText @0xba2d0 思路一致。
 %hook ChatTimeViewModel
 - (NSString *)timeText {
-    NSString *origin = %orig;
-    if (![DDGlobalConfig shared].timeEnabled) return origin;
-    if (!origin.length) return origin;
+    if (![DDGlobalConfig shared].timeEnabled) return %orig;
     NSNumber *ts = DDJokerCachedTime(self);
-    if (!ts) return origin;
-    NSString *s = DDTimeStringForDisplay(origin, [ts doubleValue]);
-    return s.length ? s : origin;
+    if (!ts) return %orig;
+    NSString *s = DDTimeStringForDisplay([ts doubleValue]);
+    return s.length ? s : %orig;
 }
 %end
 
