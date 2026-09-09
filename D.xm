@@ -951,21 +951,6 @@ static void DDImageApplyReplacementToCell(id cell) {
     if (!data) return;
     [data writeToFile:path atomically:YES];
 
-    // 选完图后 picker 以动画消失，用户点"选取"的那个 tap 会在过渡窗口被投递到
-    // 已经露出来的 ImageMessageCellView，触发微信的图片预览（全屏浏览器）打开。
-    // 过渡期间屏蔽 keyWindow 交互，吞掉这次误触（iOS 18 专用，不兼容旧系统）。
-    UIWindow *kw = nil;
-    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-        if ([s isKindOfClass:[UIWindowScene class]] && ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *w in ((UIWindowScene *)s).windows) {
-                if (w.isKeyWindow) { kw = w; break; }
-            }
-        }
-        if (kw) break;
-    }
-    BOOL wasEnabled = kw.userInteractionEnabled;
-    if (wasEnabled) kw.userInteractionEnabled = NO;
-
     dispatch_async(dispatch_get_main_queue(), ^{
         id vc = self.viewController;
         UITableView *tv = nil;
@@ -985,11 +970,6 @@ static void DDImageApplyReplacementToCell(id cell) {
             }
         }
         if (!hit) JokerInvalidateAllLayout();
-
-        // 过渡动画约 0.35s，多等一会再恢复交互，确保误触已被吞掉
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (!wasEnabled && kw.userInteractionEnabled == NO) kw.userInteractionEnabled = YES;
-        });
     });
 }
 @end
