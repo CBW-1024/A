@@ -55,34 +55,49 @@
 - (void)reloadTableView;
 @end
 
-@interface WCPayInfoItem : NSObject
-@property (nonatomic, retain) NSString *m_nsFeeDesc;
-@property (nonatomic, retain) NSString *m_receiverDesc;
-@property (nonatomic, retain) NSString *m_senderDesc;
-@property (nonatomic, assign) unsigned int m_uiPaySubType;
-@property (nonatomic, retain) NSString *m_nsTransferID;
-@end
-
+// 已在最新 dump 逐条核对：CMessageWrap 只有 IsTextMsg / IsImgMsg / isReferMsgType /
+// GetDisplayContent / m_uiMesLocalID / m_nsContent / m_nsFromUsr / m_nsToUsr，
+// **没有** m_nsTitle，**没有** m_oWCPayInfoItem（只有 parseWCPayInfoItemIfNeed 这个方法）。
+// 因此：引用消息不再改写 m_nsTitle（写了会 unrecognized selector 崩溃）；
+// 转账一律用 cell/viewModel 类判断，不再碰任何支付字段。
+//（WCPayInfoItem 的声明已整体移除，避免后人误用这些拿不到的属性。）
 @interface CMessageWrap : NSObject
 @property (nonatomic, assign) unsigned int m_uiMesLocalID;
 @property (nonatomic, retain) NSString *m_nsContent;
-@property (nonatomic, retain) NSString *m_nsTitle;
 @property (nonatomic, retain) NSString *m_nsFromUsr;
 @property (nonatomic, retain) NSString *m_nsToUsr;
-@property (nonatomic, retain) WCPayInfoItem *m_oWCPayInfoItem;
 - (BOOL)IsTextMsg;
 - (BOOL)IsImgMsg;
 - (BOOL)isReferMsgType;
 - (NSString *)GetDisplayContent;
-- (void)parseWCPayInfoItemIfNeed;
 @end
 
-@interface CommonMessageViewModel : NSObject
-@property (nonatomic, readonly) CMessageWrap *messageWrap;
+// 重要：这份 dump 把继承链抹成了 NSObject，只列出"本类自己实现"的方法，
+// 父类方法不会重复出现在子类里。所以不能在子类头文件里搜不到就判定方法不存在 ——
+// messageWrap / resetLayoutCache 实际定义在 BaseMessageViewModel
+// （BaseMessageViewModel.h:57 -(id)messageWrap; :78 -(void)resetLayoutCache;），
+// CommonMessageViewModel / TextMessageViewModel 靠继承拿到，运行时是能响应的。
+@interface BaseMessageViewModel : NSObject
+@property (nonatomic, retain) CMessageWrap *messageWrap;
+- (void)resetLayoutCache;
 @end
 
-@interface CommonMessageCellView : UIView
+@interface CommonMessageViewModel : BaseMessageViewModel
+@end
+
+// BaseMessageCellView.h:94 -(void)layoutContentView; :96 -(void)layoutInternal;
+//                    :126 -(void)prepareForReuse; :65 -(id)operationMenuItems;
+// CommonMessageCellView.h:120 -(void)setViewModel:
+@interface BaseMessageCellView : UIView
+- (void)layoutContentView;
+- (void)layoutInternal;
+- (void)prepareForReuse;
+- (id)operationMenuItems;
+@end
+
+@interface CommonMessageCellView : BaseMessageCellView
 @property (nonatomic, readonly) CommonMessageViewModel *viewModel;
+- (void)setViewModel:(id)vm;
 @end
 
 @interface BaseMsgContentViewController : UIViewController
@@ -98,9 +113,24 @@
 - (void)resetLayoutCache;
 @end
 
+// 文本最终画在 RichTextView 上，而它是**异步绘制**的（RichTextView.h:120 newAsyncDisplayTask），
+// 所以只改 viewModel 数据不会立刻重绘 —— 这正是"改完要退出重进才生效"的根因。
+// 必须显式 setContent: + forceDisplayInSync 强制同步重绘，才能改完马上变。
+// RichTextView.h:205 -(void)setContent:(id); :156 -(void)calculateAndUpdateFrame;
+//              :171 -(void)forceDisplayInSync; :100 -(id)getContent;
+@interface RichTextView : UIView
+- (id)getContent;
+- (void)setContent:(id)content;
+- (void)calculateAndUpdateFrame;
+- (void)forceDisplayInSync;
+@end
+
 @interface TextMessageCellView : CommonMessageCellView
-- (id)getTextString;   // TextMessageCellView.h:164
-- (void)layoutInternal;
+- (id)getRichTextView;     // TextMessageCellView.h:36
+- (id)getTextString;       // TextMessageCellView.h:40
+- (void)layoutContentView; // TextMessageCellView.h:67
+- (void)setViewModel:(id)vm; // TextMessageCellView.h:139
+// layoutInternal 由父类提供（CommonMessageCellView.h:78），爱锋就是 hook 它
 @end
 
 // 转账/收付款：金额由 viewModel 的 titleText / descText 渲染（WCPayBaseMessageViewModel.h:6/7）
@@ -110,13 +140,39 @@
 @end
 
 @interface WCPayTransferMessageViewModel : WCPayBaseMessageViewModel @end
+// 转账：金额在 layoutContentView 里落到 label，改完要主动触发 updateTitleLabel/updateDescLabel
 @interface WCPayTransferMessageCellView : CommonMessageCellView
 - (void)layoutContentView;
+- (void)updateTitleLabel;
+- (void)updateDescLabel;
 @end
 
-@interface AppMessageCellView : CommonMessageCellView @end
 @interface ImageMessageCellView : CommonMessageCellView
-- (void)showImage;           // ImageMessageCellView.h，微信自身的图片加载/显示入口
+- (void)showImage;                  // ImageMessageCellView.h，微信自身的图片加载/显示入口
+- (void)OnDownloadImageOk:(id)a0;   // 异步下载完成后会再次 setImage，必须在这里补一次替换
+@end
+
+// 注意：头文件 dump 里没有 AppMessageCellView（只有 AppUrlMessageCellView 等），
+// 引用消息（isReferMsgType）实际由 TextMessageCellView 渲染，统一走文本这条链路
+
+// 聊天时间条（对应爱锋"时间小丑"）
+// ChatTimeViewModel.h:14 -(id)timeText; :10 -(double)showingTime; :19 -(void)setShowingTime:(double);
+//                    :20 -(void)updateLayouts;
+// ChatTimeCellView.h:5 -(id)initWithViewModel:; :9 -(void)layoutInternal; :13 -(void)setViewModel:
+@interface ChatTimeViewModel : BaseMessageViewModel
+@property (nonatomic) double showingTime;
+- (NSString *)timeText;
+@end
+
+@interface ChatTimeCellView : UIView
+- (id)initWithViewModel:(id)vm;
+- (void)setViewModel:(id)vm;
+- (void)layoutInternal;
+// 下面几个是本插件 %new 出来的，先声明以便相互调用（-Werror 下不能有未声明选择器）
+- (UILabel *)dk_timeLabel;
+- (void)dk_installTimeEditGesture;
+- (void)dk_handleTimeLongPress:(UILongPressGestureRecognizer *)g;
+- (void)dk_showTimeInput;
 @end
 
 @interface MMMenuItem : UIMenuItem
@@ -128,15 +184,19 @@
 - (unsigned int)hkStepCount;
 @end
 
-@interface WCDataItem : NSObject
-- (unsigned int)stepCount;
-@end
-
 @interface MMUILabel : UILabel @end
 
-@interface ScrollNumber : UIView
-- (BOOL)isLQT;
+// ScrollNumber.h 确认存在：-(void)updateNumber:(unsigned long long); -(void)defaultNumber:(unsigned long long);
+//                          -(unsigned long long)currentNumber; -(unsigned long long)getNumber;
+// 注意 isLQT：爱锋 hooks_final.json 里它标记为 "new"，说明那本来就不是微信的 API，
+// 而是爱锋自己 %new 出来的判定方法 —— 所以 dump 里搜不到是正常的，我们也自己实现一个。
+// 真实父类无法从 dump 确认（继承被抹成 NSObject），可能是 UIView 也可能不是，
+// 因此下面凡是走响应链的访问都必须先做 UIResponder 类型检查，否则 nextResponder 会崩。
+@interface ScrollNumber : NSObject
+- (BOOL)isLQT;                                 // 本插件 %new 实现，见下方 hook
 - (void)updateNumber:(unsigned long long)a0;
+- (void)defaultNumber:(unsigned long long)a0;
+- (unsigned long long)currentNumber;
 @end
 
 #pragma mark - 配置管理（接口声明）
@@ -144,6 +204,7 @@
 static NSString * const kDDFeatureTextEnabled = @"DDFeatureTextEnabled";
 static NSString * const kDDFeatureTransferEnabled = @"DDFeatureTransferEnabled";
 static NSString * const kDDFeatureImageEnabled = @"DDFeatureImageEnabled";
+static NSString * const kDDFeatureTimeEnabled = @"DDFeatureTimeEnabled";
 static NSString * const kDDFeatureBalanceEnabled = @"DDFeatureBalanceEnabled";
 static NSString * const kDDFeatureStepsEnabled = @"DDFeatureStepsEnabled";
 static NSString * const kDDFeatureContactsEnabled = @"DDFeatureContactsEnabled";
@@ -158,6 +219,7 @@ static NSString * const kDDLastStepsUpdateDateKey = @"DDLastStepsUpdateDate";
 + (instancetype)shared;
 @property (nonatomic) BOOL textEnabled;
 @property (nonatomic) BOOL imageEnabled;
+@property (nonatomic) BOOL timeEnabled;
 @property (nonatomic) BOOL transferEnabled;
 @property (nonatomic) BOOL balanceEnabled;
 @property (nonatomic) BOOL stepsEnabled;
@@ -200,31 +262,33 @@ static BOOL JokerIsReferMessage(CMessageWrap *msg) {
     return [msg isReferMsgType];
 }
 
-static BOOL JokerIsTransferMessage(CMessageWrap *msg) {
-    if (!msg) return NO;
-    [msg parseWCPayInfoItemIfNeed];
-    WCPayInfoItem *payInfo = msg.m_oWCPayInfoItem;
-    if (!payInfo) return NO;
-    return (payInfo.m_uiPaySubType == 3 || payInfo.m_uiPaySubType == 4 || payInfo.m_nsTransferID.length > 0);
+// 已删除 JokerIsTransferMessage(msg)：CMessageWrap.h 里没有 m_oWCPayInfoItem
+// （只有 :572 parseWCPayInfoItemIfNeed），那个判定在真机上恒为 NO，
+// 用它会导致"金额改了没反应"和"点小丑不弹窗"。转账一律按下面的类判定。
+
+// 判断转账的唯一可靠依据：cell / viewModel 的类（不依赖任何支付字段）
+static BOOL JokerIsTransferCell(CommonMessageCellView *cell) {
+    return [cell isKindOfClass:%c(WCPayTransferMessageCellView)];
 }
 
-static BOOL JokerIsSupportedMessage(CMessageWrap *msg) {
-    return JokerIsTextMessage(msg) || JokerIsReferMessage(msg) || JokerIsTransferMessage(msg);
+static BOOL JokerIsTransferViewModel(id vm) {
+    return [vm isKindOfClass:%c(WCPayTransferMessageViewModel)];
 }
 
-static BOOL JokerEnabledForMessage(CMessageWrap *msg) {
-    if (JokerIsTransferMessage(msg)) return [DDGlobalConfig shared].transferEnabled;
-    return [DDGlobalConfig shared].textEnabled;
-}
-
-static NSString *JokerGetTransferAmount(CMessageWrap *msg) {
-    if (!JokerIsTransferMessage(msg)) return nil;
-    [msg parseWCPayInfoItemIfNeed];
-    NSString *amount = msg.m_oWCPayInfoItem.m_nsFeeDesc ?: @"";
-    if ([amount hasPrefix:@"¥"]) {
-        amount = [amount substringFromIndex:1];
+// 注意：必须用 cell 判定，不能用 msg 判定 —— 转账消息在 CMessageWrap 上没有任何可用标记
+static BOOL JokerIsSupportedCell(CommonMessageCellView *cell) {
+    if (!cell) return NO;
+    if (JokerIsTransferCell(cell)) return YES;
+    if ([cell isKindOfClass:%c(TextMessageCellView)]) {
+        CMessageWrap *msg = JokerGetMessageWrapFromCell(cell);
+        return JokerIsTextMessage(msg) || JokerIsReferMessage(msg);
     }
-    return amount;
+    return NO;
+}
+
+static BOOL JokerEnabledForCell(CommonMessageCellView *cell) {
+    if (JokerIsTransferCell(cell)) return [DDGlobalConfig shared].transferEnabled;
+    return [DDGlobalConfig shared].textEnabled;
 }
 
 static NSString *JokerNormalizeAmount(NSString *amount) {
@@ -242,28 +306,10 @@ static NSString *JokerNormalizeAmount(NSString *amount) {
 
 static NSString * const kDDJokerTextCacheKey = @"DDJokerTextCache";
 static NSString * const kDDJokerAmountCacheKey = @"DDJokerAmountCache";
+static NSString * const kDDJokerTimeCacheKey = @"DDJokerTimeCache";
 
 static NSString *DDJokerMessageKey(CMessageWrap *msg) {
     return [NSString stringWithFormat:@"%u", msg.m_uiMesLocalID];
-}
-
-// 原值快照：只有「不得不直接改写 CMessageWrap 属性」的场景（引用消息标题）才用，
-// 清理缓存时靠它把被改写过的对象还原回原始内容
-static NSString * const kDDJokerOriginalSnapshotKey = @"DDJokerOriginalSnapshot";
-
-static void DDJokerSaveOriginal(CMessageWrap *msg, NSString *original) {
-    if (!msg || !original.length) return;
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[def dictionaryForKey:kDDJokerOriginalSnapshotKey] ?: @{}];
-    NSString *k = DDJokerMessageKey(msg);
-    if (d[k]) return;
-    d[k] = original;
-    [def setObject:d forKey:kDDJokerOriginalSnapshotKey];
-}
-
-static NSString *DDJokerOriginal(CMessageWrap *msg) {
-    if (!msg) return nil;
-    return [[NSUserDefaults standardUserDefaults] dictionaryForKey:kDDJokerOriginalSnapshotKey][DDJokerMessageKey(msg)];
 }
 
 // 只替换文本里的第一段数字，用于转账金额（保留 ¥ 等前后缀）
@@ -314,10 +360,44 @@ static void DDJokerSetCachedAmount(CMessageWrap *msg, NSString *amount) {
     [def synchronize];
 }
 
+#pragma mark - ①c 聊天时间修改缓存
+
+// 时间条（ChatTimeViewModel）可能绑定消息，也可能只是个纯时间分隔条。
+// 爱锋同样是优先用消息 ID（wechatku.dylib @0xcb650）：
+//   m_n64MesSvrID != 0 → "message_server_%lld"，否则 "message_local_%u_%u_%@_%@"，
+//   拿不到消息才退回 "time_timestamp_%.3f"（showingTime）。
+// 这里沿用同样的优先级，但复用插件统一的消息 key，方便"清除修改缓存"一次清干净。
+static NSString *DDJokerTimeKey(id vm) {
+    id wrap = [vm respondsToSelector:@selector(messageWrap)] ? [vm messageWrap] : nil;
+    if ([wrap respondsToSelector:@selector(m_uiMesLocalID)] && [wrap m_uiMesLocalID] != 0) {
+        return DDJokerMessageKey((CMessageWrap *)wrap);
+    }
+    double t = [vm respondsToSelector:@selector(showingTime)] ? [vm showingTime] : 0.0;
+    return [NSString stringWithFormat:@"ts_%.3f", t];
+}
+
+static NSNumber *DDJokerCachedTime(id vm) {
+    if (!vm) return nil;
+    NSDictionary *d = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kDDJokerTimeCacheKey];
+    id v = d[DDJokerTimeKey(vm)];
+    return [v isKindOfClass:[NSNumber class]] ? v : nil;
+}
+
+static void DDJokerSetCachedTime(id vm, double timestamp) {
+    if (!vm) return;
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[def dictionaryForKey:kDDJokerTimeCacheKey] ?: @{}];
+    if (timestamp > 0) d[DDJokerTimeKey(vm)] = @(timestamp);
+    else [d removeObjectForKey:DDJokerTimeKey(vm)];
+    [def setObject:d forKey:kDDJokerTimeCacheKey];
+    [def synchronize];
+}
+
 static void DDJokerClearAllMessageCache(void) {
     NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
     [def removeObjectForKey:kDDJokerTextCacheKey];
     [def removeObjectForKey:kDDJokerAmountCacheKey];
+    [def removeObjectForKey:kDDJokerTimeCacheKey];
     [def synchronize];
     NSString *dir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
     NSString *folder = [dir stringByAppendingPathComponent:@"DDJokerImages"];
@@ -362,25 +442,44 @@ static void JokerReloadAllMsgContent(void) {
     }
 }
 
-// 图片：reloadData 后主动触发微信自己的加载流程，确保替换图被还原
+// 关键：微信聊天页里 [tableView visibleCells] 返回的是 UITableViewCell，
+// 而 ImageMessageCellView / TextMessageCellView 是挂在 cell.contentView 上的 UIView，
+// 直接对 visibleCells 判 isKindOfClass 永远匹配不到 —— 必须递归往子里找。
+static void DDCollectViewsOfClass(UIView *root, Class cls, NSMutableArray *out) {
+    if (!root) return;
+    if ([root isKindOfClass:cls]) {
+        if (![out containsObject:root]) [out addObject:root];
+        return;   // 命中即停，避免把子层同名 view 也收进来
+    }
+    for (UIView *v in root.subviews) DDCollectViewsOfClass(v, cls, out);
+}
+
+static NSArray *DDVisibleCellViewsOfClass(UITableView *tv, Class cls) {
+    NSMutableArray *out = [NSMutableArray array];
+    if (![tv isKindOfClass:[UITableView class]] || !cls) return out;
+    for (UITableViewCell *c in [tv visibleCells]) {
+        DDCollectViewsOfClass(c.contentView, cls, out);
+        DDCollectViewsOfClass(c, cls, out);
+    }
+    return out;
+}
+
+// 图片：重走微信自己的加载流程，替换图才会落到 imageView 上
 static void JokerRefreshVisibleImageCells(void) {
     for (UIViewController *vc in JokerAllChatViewControllers()) {
         UITableView *tv = [(BaseMsgContentViewController *)vc getMsgTableView];
         if (![tv isKindOfClass:[UITableView class]]) continue;
-        for (UITableViewCell *c in [tv visibleCells]) {
-            if ([c isKindOfClass:%c(ImageMessageCellView)]) {
-                [(ImageMessageCellView *)c showImage];
-            }
+        for (ImageMessageCellView *cellView in DDVisibleCellViewsOfClass(tv, %c(ImageMessageCellView))) {
+            if ([cellView respondsToSelector:@selector(showImage)]) [cellView showImage];
         }
     }
 }
 
-// 输入框回填要显示"当前正在显示的内容"，所以优先取缓存值
-static NSString *JokerGetDisplayText(CMessageWrap *msg) {
-    if (JokerIsTextMessage(msg)) return DDJokerCachedText(msg) ?: [msg GetDisplayContent];
-    if (JokerIsReferMessage(msg)) return DDJokerCachedText(msg) ?: (msg.m_nsTitle ?: @"");
-    if (JokerIsTransferMessage(msg)) return DDJokerCachedAmount(msg) ?: JokerGetTransferAmount(msg);
-    return nil;
+// 输入框回填要显示"当前正在显示的内容"，所以优先取缓存值。
+// 转账金额不再从 WCPayInfoItem 读（新版本拿不到），直接用缓存值回填
+static NSString *JokerGetDisplayText(CMessageWrap *msg, BOOL isTransfer) {
+    if (isTransfer) return DDJokerCachedAmount(msg) ?: @"";
+    return DDJokerCachedText(msg) ?: ([msg GetDisplayContent] ?: @"");
 }
 
 static UITableView *JokerFindTableView(UIView *view) {
@@ -392,7 +491,54 @@ static UITableView *JokerFindTableView(UIView *view) {
     return nil;
 }
 
+// 富文本是异步绘制的（RichTextView.h:120 newAsyncDisplayTask），改完数据不会自动重绘 ——
+// 必须显式 setContent: + forceDisplayInSync，否则要等 cell 复用/重进页面才看得到变化。
+static void JokerApplyTextToRichView(id richView, NSString *text) {
+    if (!richView || !text) return;
+    if (![richView respondsToSelector:@selector(setContent:)]) return;
+    [richView setContent:text];
+    if ([richView respondsToSelector:@selector(calculateAndUpdateFrame)]) [richView calculateAndUpdateFrame];
+    if ([richView respondsToSelector:@selector(forceDisplayInSync)]) [richView forceDisplayInSync];
+    if ([richView isKindOfClass:[UIView class]]) [richView setNeedsDisplay];
+}
+
+// TextMessageViewModel 把 contentText 懒加载缓存进 ivar，不清就一直返回旧值，
+// 这正是"改完要退出重进才生效"的根因（resetLayoutCache 见 BaseMessageViewModel.h:78）
+static void JokerResetViewModelCache(CommonMessageCellView *cell) {
+    if (![cell respondsToSelector:@selector(viewModel)]) return;
+    id vm = cell.viewModel;
+    if ([vm respondsToSelector:@selector(resetLayoutCache)]) [vm resetLayoutCache];
+}
+
+// 与爱锋一致：不依赖 tableView reload，而是直接触发 cell 自身的显示/布局流程
+static void JokerRefreshCellDirectly(CommonMessageCellView *cell) {
+    if (!cell) return;
+    JokerResetViewModelCache(cell);
+    CMessageWrap *msg = JokerGetMessageWrapFromCell(cell);
+
+    if ([cell isKindOfClass:%c(TextMessageCellView)]) {
+        NSString *cached = [DDGlobalConfig shared].textEnabled ? DDJokerCachedText(msg) : nil;
+        // 没有缓存（关开关 / 清过缓存）就还原成原文，否则关掉修改后文字变不回去
+        if (!cached && (JokerIsTextMessage(msg) || JokerIsReferMessage(msg))) {
+            cached = [msg GetDisplayContent];
+        }
+        if ([cell respondsToSelector:@selector(getRichTextView)]) {
+            JokerApplyTextToRichView([(TextMessageCellView *)cell getRichTextView], cached);
+        }
+        [(TextMessageCellView *)cell layoutContentView];
+    } else if ([cell isKindOfClass:%c(WCPayTransferMessageCellView)]) {
+        [(WCPayTransferMessageCellView *)cell layoutContentView];
+        // 金额是在这两个方法里落到 label 上的，只 layout 不够
+        if ([cell respondsToSelector:@selector(updateTitleLabel)]) [(WCPayTransferMessageCellView *)cell updateTitleLabel];
+        if ([cell respondsToSelector:@selector(updateDescLabel)]) [(WCPayTransferMessageCellView *)cell updateDescLabel];
+    } else if ([cell isKindOfClass:%c(ImageMessageCellView)]) {
+        [(ImageMessageCellView *)cell showImage];
+    }
+    [cell setNeedsLayout];
+}
+
 static void JokerReloadCellAfterReplace(id vc, CMessageWrap *msg, CommonMessageCellView *cell) {
+    JokerRefreshCellDirectly(cell);
     UITableView *tv = cell ? JokerFindTableView((UIView *)cell) : nil;
     if (![tv isKindOfClass:[UITableView class]] && [vc isKindOfClass:%c(BaseMsgContentViewController)]) {
         tv = [(BaseMsgContentViewController *)vc getMsgTableView];
@@ -402,23 +548,29 @@ static void JokerReloadCellAfterReplace(id vc, CMessageWrap *msg, CommonMessageC
         JokerReloadAllMsgContent();
         return;
     }
-    NSIndexPath *ip = [tv indexPathForCell:(UITableViewCell *)cell];
+    // cell 是挂在 UITableViewCell.contentView 上的 UIView，直接传给 indexPathForCell:
+    // 永远返回 nil（类型都不对），只能靠全局刷新兜底 —— 改成按中心点换算 indexPath
+    CGPoint center = [cell convertPoint:CGPointMake(CGRectGetMidX(cell.bounds), CGRectGetMidY(cell.bounds)) toView:tv];
+    NSIndexPath *ip = [tv indexPathForRowAtPoint:center];
     if (ip) {
         [UIView performWithoutAnimation:^{
             [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
         }];
         return;
     }
-    JokerReloadAllMsgContent();
+    JokerInvalidateAllLayout();
 }
 
 static void JokerPresentEditor(CommonMessageCellView *cell) {
+    // 用 cell 判定，不能用 msg 判定：转账消息在 CMessageWrap 上没有任何可用标记，
+    // 用 JokerIsSupportedMessage(msg) 会把转账直接拦掉 —— 表现为"点小丑没弹窗"
+    if (!JokerIsSupportedCell(cell)) return;
     CMessageWrap *msg = JokerGetMessageWrapFromCell(cell);
-    if (!JokerIsSupportedMessage(msg)) return;
     id vc = JokerGetViewControllerFromView(cell);   // 取不到也不影响弹窗，只影响兜底刷新
 
-    NSString *current = JokerGetDisplayText(msg) ?: @"";
-    BOOL isTransfer = JokerIsTransferMessage(msg);
+    // 转账用 cell 类型判断，不依赖 CMessageWrap 的支付字段（新 dump 已无 m_oWCPayInfoItem）
+    BOOL isTransfer = JokerIsTransferCell(cell);
+    NSString *current = JokerGetDisplayText(msg, isTransfer);
 
     // 微信原生带输入框 alert：WCUIAlertView（声明见文件顶部）
     WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:@"小丑" message:nil];
@@ -458,9 +610,10 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
 }
 
 static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *original) {
-    CMessageWrap *msg = JokerGetMessageWrapFromCell(cell);
-    if (!JokerEnabledForMessage(msg)) return original;
-    if (!JokerIsSupportedMessage(msg)) return original;
+    // 一律用 cell 判定：CMessageWrap 上没有任何可用的转账标记，
+    // 用 msg 判定会让转账消息既拿不到菜单、也弹不出修改框
+    if (!JokerEnabledForCell(cell)) return original;
+    if (!JokerIsSupportedCell(cell)) return original;
 
     if (!%c(MMMenuItem)) return original;
 
@@ -478,27 +631,38 @@ static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *origin
     NSString *origin = %orig;
     if (![DDGlobalConfig shared].textEnabled) return origin;
     CMessageWrap *msg = self.messageWrap;
-    if (!JokerIsTextMessage(msg)) return origin;
+    // 引用消息（isReferMsgType）同样由 TextMessageCellView 渲染，走同一条替换链路
+    if (!JokerIsTextMessage(msg) && !JokerIsReferMessage(msg)) return origin;
     NSString *cached = DDJokerCachedText(msg);
     return cached ?: origin;
 }
 %end
 
-// 清理缓存后需要强制清掉 viewModel 里已算好的 contentText 布局缓存，否则仍显示旧文本
+// 清理缓存/切换开关后需要强制清掉 viewModel 里已算好的 contentText 布局缓存，否则仍显示旧文本
 static BOOL gJokerNeedsResetLayout = NO;
 
-%hook TextMessageCellView
-- (void)setViewModel:(id)vm {
-    CMessageWrap *msg = [(CommonMessageViewModel *)vm messageWrap];
-    NSString *cached = ([DDGlobalConfig shared].textEnabled && JokerIsTextMessage(msg)) ? DDJokerCachedText(msg) : nil;
-    NSString *original = msg.m_nsContent;
-    // 临时替换：让 viewModel 按新文本计算 contentText 和气泡尺寸，避免只改显示导致截断
-    if (cached) msg.m_nsContent = cached;
-    %orig;
-    // 立即还原：不污染 CMessageWrap 对象，关闭开关/清理缓存后自动恢复原始内容
-    if (cached) msg.m_nsContent = original;
+// 开关切换、清理缓存都走这里：置位 → 全量重绘 → 稍后复位。
+// 置位期间 dd_applyTransferAmount / setViewModel: 才会主动重算，金额和文字才还原得回去。
+static void JokerInvalidateAllLayout(void) {
+    gJokerNeedsResetLayout = YES;
+    JokerReloadAllMsgContent();
+    JokerRefreshVisibleImageCells();   // 图片走的是 setImage，需触发微信重新加载
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        gJokerNeedsResetLayout = NO;
+    });
+}
 
-    if (gJokerNeedsResetLayout && [vm isKindOfClass:%c(TextMessageViewModel)]) {
+%hook TextMessageCellView
+// 之前这里在 %orig 前临时改 m_nsContent、%orig 后又立刻还原，而真正的文本计算发生在
+// 之后的 layoutContentView，所以那段改写完全无效，还白白污染了一次 CMessageWrap。
+// 正确做法：%orig 之后清掉 viewModel 的懒加载缓存，等布局重新取 contentText 时就会拿到替换值。
+- (void)setViewModel:(id)vm {
+    %orig;
+    if (![vm respondsToSelector:@selector(resetLayoutCache)]) return;
+    CMessageWrap *msg = [(CommonMessageViewModel *)vm messageWrap];
+    if (!JokerIsTextMessage(msg) && !JokerIsReferMessage(msg)) return;
+    // 开启且有缓存 → 清缓存让替换值生效；关闭 → 也清一次让原文还原回去
+    if (gJokerNeedsResetLayout || DDJokerCachedText(msg) || ![DDGlobalConfig shared].textEnabled) {
         [(TextMessageViewModel *)vm resetLayoutCache];
     }
 }
@@ -506,7 +670,7 @@ static BOOL gJokerNeedsResetLayout = NO;
     id origin = %orig;
     if (![DDGlobalConfig shared].textEnabled) return origin;
     CMessageWrap *msg = JokerGetMessageWrapFromCell(self);
-    if (!JokerIsTextMessage(msg)) return origin;
+    if (!JokerIsTextMessage(msg) && !JokerIsReferMessage(msg)) return origin;
     NSString *cached = DDJokerCachedText(msg);
     return cached ?: origin;
 }
@@ -515,39 +679,7 @@ static BOOL gJokerNeedsResetLayout = NO;
 }
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     if (action == @selector(joker_handleMenuItem:)) {
-        return JokerEnabledForMessage(JokerGetMessageWrapFromCell(self)) && JokerIsSupportedMessage(JokerGetMessageWrapFromCell(self));
-    }
-    return %orig;
-}
-%new
-- (void)joker_handleMenuItem:(id)sender {
-    JokerPresentEditor(self);
-}
-%end
-
-%hook AppMessageCellView
-// 引用消息没有可拦截的渲染方法，只能改 m_nsTitle；
-// 因此要先存原值快照，缓存被清理（或开关关闭）时用它还原
-- (void)setViewModel:(id)vm {
-    CMessageWrap *msg = [(CommonMessageViewModel *)vm messageWrap];
-    if ([msg isReferMsgType]) {
-        NSString *cached = [DDGlobalConfig shared].textEnabled ? DDJokerCachedText(msg) : nil;
-        if (cached) {
-            DDJokerSaveOriginal(msg, msg.m_nsTitle);
-            msg.m_nsTitle = cached;
-        } else {
-            NSString *original = DDJokerOriginal(msg);
-            if (original) msg.m_nsTitle = original;
-        }
-    }
-    %orig;
-}
-- (NSArray *)operationMenuItems {
-    return JokerInjectMenuItem(self, %orig);
-}
-- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
-    if (action == @selector(joker_handleMenuItem:)) {
-        return JokerEnabledForMessage(JokerGetMessageWrapFromCell(self)) && JokerIsSupportedMessage(JokerGetMessageWrapFromCell(self));
+        return JokerEnabledForCell(self) && JokerIsSupportedCell(self);
     }
     return %orig;
 }
@@ -563,34 +695,52 @@ static BOOL gJokerNeedsResetLayout = NO;
 - (NSString *)descText {
     NSString *origin = %orig;
     if (![DDGlobalConfig shared].transferEnabled) return origin;
-    CMessageWrap *msg = self.messageWrap;
-    if (!JokerIsTransferMessage(msg)) return origin;
-    NSString *cached = DDJokerCachedAmount(msg);
+    // 用 viewModel 类判定转账，不依赖 CMessageWrap 的支付字段（那边已无任何可用标记）
+    if (!JokerIsTransferViewModel(self)) return origin;
+    NSString *cached = DDJokerCachedAmount(self.messageWrap);
     return cached ? JokerReplaceFirstNumber(origin, cached) : origin;
 }
 - (NSString *)titleText {
     NSString *origin = %orig;
     if (![DDGlobalConfig shared].transferEnabled) return origin;
-    CMessageWrap *msg = self.messageWrap;
-    if (!JokerIsTransferMessage(msg)) return origin;
-    NSString *cached = DDJokerCachedAmount(msg);
+    // 用 viewModel 类判定转账，不依赖 CMessageWrap 的支付字段（那边已无任何可用标记）
+    if (!JokerIsTransferViewModel(self)) return origin;
+    NSString *cached = DDJokerCachedAmount(self.messageWrap);
     return cached ? JokerReplaceFirstNumber(origin, cached) : origin;
 }
 %end
 
 %hook WCPayTransferMessageCellView
+- (void)layoutContentView {
+    // 爱锋同样 hook 这里：金额是在布局阶段落到 label 上的
+    %orig;
+    [self dd_applyTransferAmount];
+}
 - (NSArray *)operationMenuItems {
     return JokerInjectMenuItem(self, %orig);
 }
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+    // 本 hook 就挂在 WCPayTransferMessageCellView 上，天然是转账 cell，直接用开关判定
     if (action == @selector(joker_handleMenuItem:)) {
-        return JokerEnabledForMessage(JokerGetMessageWrapFromCell(self)) && JokerIsSupportedMessage(JokerGetMessageWrapFromCell(self));
+        return [DDGlobalConfig shared].transferEnabled;
     }
     return %orig;
 }
 %new
 - (void)joker_handleMenuItem:(id)sender {
     JokerPresentEditor(self);
+}
+%new
+// titleText / descText 已被 hook 成替换后的金额，这里让 label 重新取一次值
+- (void)dd_applyTransferAmount {
+    CMessageWrap *msg = JokerGetMessageWrapFromCell(self);
+    if (!msg) return;
+    // 绝不能用 JokerIsTransferMessage(msg) 判定：CMessageWrap 上没有 m_oWCPayInfoItem，
+    // 那个函数恒为 NO，会把整个转账替换挡掉 —— "金额改了没反应"就是这么来的。
+    // 本方法只挂在 WCPayTransferMessageCellView 上，调用方本身就是转账 cell。
+    if (!DDJokerCachedAmount(msg) && !gJokerNeedsResetLayout) return;
+    if ([self respondsToSelector:@selector(updateTitleLabel)]) [self updateTitleLabel];
+    if ([self respondsToSelector:@selector(updateDescLabel)]) [self updateDescLabel];
 }
 %end
 
@@ -616,14 +766,32 @@ static UIImage *DDImageReplacementForMessage(CMessageWrap *msg) {
     return [UIImage imageWithContentsOfFile:path];
 }
 
+// 最新 dump 不含 ivar 信息，无法确认 m_imageView 是否还在。
+// 直接 valueForKey: 一旦 key 不存在会抛 NSUnknownKeyException 让微信崩溃，
+// 所以先用 class_getInstanceVariable 探测，取不到再退化为按面积找最大的 UIImageView
+static UIImageView *DDImageViewFromCell(UIView *cell) {
+    if (!cell) return nil;
+    Ivar ivar = class_getInstanceVariable([cell class], "m_imageView");
+    if (ivar) {
+        id value = object_getIvar(cell, ivar);
+        if ([value isKindOfClass:[UIImageView class]]) return (UIImageView *)value;
+    }
+    UIImageView *best = nil;
+    CGFloat bestArea = 0;
+    for (UIView *v in cell.subviews) {
+        if (![v isKindOfClass:[UIImageView class]]) continue;
+        CGFloat area = v.bounds.size.width * v.bounds.size.height;
+        if (area > bestArea) { bestArea = area; best = (UIImageView *)v; }
+    }
+    return best;
+}
+
 static void DDImageApplyReplacementToCell(id cell) {
     if (![DDGlobalConfig shared].imageEnabled) return;
     CMessageWrap *msg = ((CommonMessageCellView *)cell).viewModel.messageWrap;
     UIImage *rep = DDImageReplacementForMessage(msg);
     if (rep) {
-        // m_imageView 在头文件里是纯 ivar（ImageMessageCellView.h:4 -> YYAsyncImageView *m_imageView;）
-        // 没有 getter 方法，只能靠 KVC 的 ivar 回退取值；这是全文件唯一保留的 KVC
-        UIImageView *iv = (UIImageView *)[(ImageMessageCellView *)cell valueForKey:@"m_imageView"];
+        UIImageView *iv = DDImageViewFromCell((UIView *)cell);
         [iv setImage:rep];
     }
 }
@@ -675,6 +843,11 @@ static void DDImageApplyReplacementToCell(id cell) {
     %orig;
     DDImageApplyReplacementToCell(self);
 }
+- (void)OnDownloadImageOk:(id)a0 {
+    // 微信异步下载完成后会再次 setImage 覆盖掉替换图，必须在这里补一次
+    %orig;
+    DDImageApplyReplacementToCell(self);
+}
 - (void)layoutContentView {
     %orig;
     DDImageApplyReplacementToCell(self);
@@ -706,12 +879,173 @@ static void DDImageApplyReplacementToCell(id cell) {
             if ([vc isKindOfClass:%c(BaseMsgContentViewController)]) {
                 tv = [(BaseMsgContentViewController *)vc getMsgTableView];
             }
-            if ([tv isKindOfClass:[UITableView class]]) [tv reloadData];
-            else JokerReloadAllMsgContent();
+            BOOL hit = NO;
+            if ([tv isKindOfClass:[UITableView class]]) {
+                // visibleCells 出来的是 UITableViewCell，ImageMessageCellView 是它 contentView 里的子 view，
+                // 直接判类型永远命中不了 —— 必须用递归查找（这就是"改完图要重进才生效"的真因）
+                for (ImageMessageCellView *cellView in DDVisibleCellViewsOfClass(tv, %c(ImageMessageCellView))) {
+                    CMessageWrap *m = JokerGetMessageWrapFromCell((CommonMessageCellView *)cellView);
+                    if (m.m_uiMesLocalID == self.mesLocalID) {
+                        if ([cellView respondsToSelector:@selector(showImage)]) [cellView showImage];
+                        hit = YES;
+                    }
+                }
+            }
+            if (!hit) JokerInvalidateAllLayout();
         });
     }];
 }
 @end
+
+#pragma mark - ①c 聊天时间修改
+
+static char kDDTimeVMKey;
+
+// 微信的时间条文案有好几种（"2024年8月1日 星期四 22:30"、"8月1日 22:30"、"昨天 22:30"……），
+// 爱锋是按原文里包含的中文字来挑对应的格式串（wechatku.dylib @0xba368 起），这里照搬这个思路
+static NSString *DDTimeFormatMatching(NSString *originText) {
+    if ([originText rangeOfString:@"年"].location != NSNotFound) return @"yyyy年M月d日 EEEE HH:mm";
+    if ([originText rangeOfString:@"月"].location != NSNotFound) {
+        if ([originText rangeOfString:@"星期"].location != NSNotFound ||
+            [originText rangeOfString:@"周"].location != NSNotFound) return @"M月d日 EEEE HH:mm";
+        return @"M月d日 HH:mm";
+    }
+    if ([originText rangeOfString:@"今天"].location != NSNotFound) return @"今天 HH:mm";
+    if ([originText rangeOfString:@"昨天"].location != NSNotFound) return @"昨天 HH:mm";
+    if ([originText rangeOfString:@"前天"].location != NSNotFound) return @"前天 HH:mm";
+    if ([originText rangeOfString:@"星期"].location != NSNotFound ||
+        [originText rangeOfString:@"周"].location != NSNotFound) return @"EEEE HH:mm";
+    return @"M月d日 HH:mm";
+}
+
+// 输入/解析统一用 en_US_POSIX + @"yyyy-MM-dd HH:mm"（爱锋 timestampFromDateString: @0xbaf30 同款）。
+// 必须用 en_US_POSIX，否则用户改了 12/24 小时制或地区后会解析出 nil。
+static NSDateFormatter *DDTimeInputFormatter(void) {
+    NSDateFormatter *f = [[NSDateFormatter alloc] init];
+    f.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    f.dateFormat = @"yyyy-MM-dd HH:mm";
+    return f;
+}
+
+static double DDTimeStampFromString(NSString *s) {
+    if (!s.length) return 0;
+    NSDate *d = [DDTimeInputFormatter() dateFromString:s];
+    return d ? [d timeIntervalSince1970] : 0;
+}
+
+static NSString *DDTimeStringForDisplay(NSString *originText, double ts) {
+    NSDateFormatter *f = [[NSDateFormatter alloc] init];
+    f.locale = [NSLocale localeWithLocaleIdentifier:@"zh_CN"];
+    f.timeZone = [NSTimeZone localTimeZone];
+    f.dateFormat = DDTimeFormatMatching(originText);
+    return [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:ts]];
+}
+
+// 时间条显示的就是 viewModel 的 timeText（ChatTimeViewModel.h:14），和文字走 contentText 一个道理
+%hook ChatTimeViewModel
+- (NSString *)timeText {
+    NSString *origin = %orig;
+    if (![DDGlobalConfig shared].timeEnabled) return origin;
+    if (!origin.length) return origin;
+    NSNumber *ts = DDJokerCachedTime(self);
+    if (!ts) return origin;
+    NSString *s = DDTimeStringForDisplay(origin, [ts doubleValue]);
+    return s.length ? s : origin;
+}
+%end
+
+%hook ChatTimeCellView
+- (id)initWithViewModel:(id)vm {
+    id r = %orig;
+    // vm 先存起来：弹窗时要用它读 showingTime 和写缓存
+    objc_setAssociatedObject(r, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [(ChatTimeCellView *)r dk_installTimeEditGesture];
+    return r;
+}
+- (void)setViewModel:(id)vm {
+    %orig;
+    objc_setAssociatedObject(self, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [self dk_installTimeEditGesture];
+}
+// 长按手势装在 label 上，而 label 可能晚于 init 才创建，cell 复用时也会换，
+// 所以 didMoveToWindow 里再补一次（爱锋同样 hook 了它，且实现是幂等的）
+- (void)didMoveToWindow {
+    %orig;
+    [self dk_installTimeEditGesture];
+}
+%new
+- (UILabel *)dk_timeLabel {
+    // 爱锋 @0xbac08 也是先试 ivar m_timeLabel，取不到再退化为遍历
+    Ivar iv = class_getInstanceVariable([self class], "m_timeLabel");
+    if (iv) {
+        id v = object_getIvar(self, iv);
+        if ([v isKindOfClass:[UILabel class]]) return (UILabel *)v;
+    }
+    NSMutableArray *q = [NSMutableArray arrayWithObject:self];
+    for (NSUInteger i = 0; i < q.count && i < 40; i++) {
+        UIView *v = q[i];
+        if (v != (UIView *)self && [v isKindOfClass:[UILabel class]] && ((UILabel *)v).text.length) {
+            return (UILabel *)v;
+        }
+        for (UIView *s in v.subviews) [q addObject:s];
+    }
+    return nil;
+}
+%new
+- (void)dk_installTimeEditGesture {
+    if (![DDGlobalConfig shared].timeEnabled) return;
+    UILabel *label = [self dk_timeLabel];
+    if (!label) return;
+    for (UIGestureRecognizer *g in label.gestureRecognizers) {
+        if ([g isKindOfClass:[UILongPressGestureRecognizer class]]) return;   // 幂等，不重复装
+    }
+    label.userInteractionEnabled = YES;
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(dk_handleTimeLongPress:)];
+    lp.minimumPressDuration = 0.5;      // 爱锋 @0xbada4 同为 0.5 秒
+    lp.allowableMovement = 24;
+    lp.cancelsTouchesInView = NO;
+    [label addGestureRecognizer:lp];
+}
+%new
+- (void)dk_handleTimeLongPress:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    [self dk_showTimeInput];
+}
+%new
+- (void)dk_showTimeInput {
+    if (![DDGlobalConfig shared].timeEnabled) return;
+    id vm = objc_getAssociatedObject(self, &kDDTimeVMKey);
+    if (!vm || !%c(WCUIAlertView)) return;
+
+    NSNumber *cached = DDJokerCachedTime(vm);
+    double base = cached ? [cached doubleValue]
+                         : ([vm respondsToSelector:@selector(showingTime)] ? [vm showingTime] : 0);
+    NSString *defaultText = base > 0 ? [DDTimeInputFormatter() stringFromDate:[NSDate dateWithTimeIntervalSince1970:base]] : @"";
+
+    // 与爱锋一致：微信原生 WCUIAlertView，标题/提示文案都沿用它的（@0xbb174 / @0x6287e8 / @0x628828）
+    __block WCUIAlertView *blockAlert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:@"请输入要修改的时间"
+                                                                                         message:@"输入格式如下\n2024-08-01 22:30"];
+    [blockAlert showTextFieldWithMaxLen:100];
+    [blockAlert setTextFieldDefaultText:defaultText];
+    [blockAlert addCancelBtnTitle:@"取消" handler:^{ blockAlert = nil; }];
+    [blockAlert addBtnTitle:@"确定" handler:^{
+        NSString *raw = blockAlert ? [blockAlert getTextFieldText] : nil;
+        NSString *t = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        double ts = DDTimeStampFromString(t);
+        if (ts > 0) {
+            DDJokerSetCachedTime(vm, ts);
+            // 直接把 viewModel 的时间改掉并让它重算布局，比 reload 整个 tableView 快且可靠
+            if ([vm respondsToSelector:@selector(setShowingTime:)]) [vm setShowingTime:ts];
+            if ([vm respondsToSelector:@selector(updateLayouts)]) [vm updateLayouts];
+            [self layoutInternal];
+            [self setNeedsLayout];
+        }
+        blockAlert = nil;   // 打破 alert -> handler -> alert 的保留环
+    }];
+    [blockAlert show];
+    objc_setAssociatedObject(self, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+%end
 
 #pragma mark - ② 运动步数修改
 
@@ -749,15 +1083,8 @@ static BOOL isToday(NSDate *date) {
 }
 %end
 
-%hook WCDataItem
-- (unsigned int)stepCount {
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (cfg.stepsEnabled && [cfg hasStepsValue]) {
-        return (unsigned int)[cfg stepsIntegerValue];
-    }
-    return %orig;
-}
-%end
+// 最新 dump 里 WCDataItem 是朋友圈数据项，没有 stepCount —— 这个 hook 是无效的，删掉。
+// 步数只走 WCDeviceStepObject（m7StepCount / hkStepCount，dump 已确认）
 
 #pragma mark - ③ 好友数量修改
 
@@ -796,25 +1123,128 @@ static unsigned long long DDLingtongFenValue(void) {
     return (unsigned long long)(v * 100.0 + 0.5);
 }
 
-%hook ScrollNumber
-- (void)updateNumber:(unsigned long long)original {
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (!cfg.balanceEnabled) {
-        %orig(original);
-        return;
+typedef NS_ENUM(NSInteger, DDBalancePageKind) {
+    DDBalancePageNone = 0,     // 非钱包页 —— 必须原样返回，不能插手
+    DDBalancePageBalance,      // 零钱/余额：WCPayBalanceDetailViewController
+    DDBalancePageLQT           // 零钱通：WCPayLQTDetailViewController / WCPayLQTMoneyViewController
+};
+
+// 安全版响应链查找。ScrollNumber 的真实父类无法从 dump 确认（继承被抹成 NSObject），
+// 它可能压根不是 UIResponder —— 那种情况下直接 nextResponder 就是 unrecognized selector 崩溃。
+// 另外一个更关键的问题：ScrollNumber 是通用滚动数字控件，倒计时（TimeoutNumber）、
+// 红包金额等都在用，无条件改所有实例会把无关控件的数值也改掉，严重时就是"进页面闪退"。
+// 所以这里除了做类型检查，还要求响应链上的 VC 必须是余额/零钱通页，否则一律不插手。
+static UIViewController *DDViewControllerOfView(id view) {
+    if (!view || ![view isKindOfClass:[UIResponder class]]) return nil;
+    UIResponder *r = (UIResponder *)view;
+    NSInteger guard = 0;
+    while (r && guard++ < 128) {          // 上限防御响应链成环
+        if ([r isKindOfClass:[UIViewController class]]) return (UIViewController *)r;
+        r = [r nextResponder];
     }
-    if ([self isLQT]) {
-        if ([cfg hasLingtongValue]) {
-            %orig(DDLingtongFenValue());
+    return nil;
+}
+
+// 反汇编爱锋 isLQT（wechatku.dylib @0xbe820）得到的真实判定：
+//   vc = [DKHelper currentViewController]
+//   [vc isKindOfClass:KindaViewController] && [[vc title] isEqualToString:@"钱包"]
+//   → 取 self.superview.superview.superview.subviews[0].subviews[1]（一个 UILabel）
+//   → [label.text hasPrefix:@"零钱通"]  →  YES 表示这个 ScrollNumber 是零钱通
+// 两点结论：①爱锋同样只在钱包页生效，不是全局改；②区分零钱/零钱通靠的是旁边的文字。
+// 这里不照抄它硬编码的下标（层级一变就数组越界），改成在附近 view 树里搜"零钱通"字样。
+static BOOL DDIsWalletBalancePage(UIViewController *vc) {
+    if (!vc) return NO;
+    NSString *cls = NSStringFromClass([vc class]);
+    NSString *title = [vc respondsToSelector:@selector(title)] ? [vc title] : nil;
+    // 钱包主页：KindaViewController + 标题"钱包"（零钱与零钱通并排显示）
+    if ([cls isEqualToString:@"KindaViewController"] && [title isEqualToString:@"钱包"]) return YES;
+    // 余额详情页 / 零钱通详情页
+    if ([cls rangeOfString:@"WCPayBalanceDetail"].location != NSNotFound) return YES;
+    if ([cls rangeOfString:@"WCPayLQT"].location != NSNotFound) return YES;
+    return NO;
+}
+
+static BOOL DDHasTextNearView(id view, NSString *want, NSInteger depth) {
+    if (!view || depth > 5 || ![view isKindOfClass:[UIView class]]) return NO;
+    if ([view isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)view).text;
+        if (t.length && [t rangeOfString:want].location != NSNotFound) return YES;
+    }
+    NSInteger n = 0;
+    for (UIView *sub in ((UIView *)view).subviews) {
+        if (++n > 24) break;              // 限制遍历规模，别在一次刷新里扫穿整棵树
+        if (DDHasTextNearView(sub, want, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+static BOOL DDHasLQTBeside(id scrollNumber) {
+    id v = scrollNumber;
+    for (int i = 0; i < 5 && v; i++) {
+        if (DDHasTextNearView(v, @"零钱通", 0)) return YES;
+        if (![v respondsToSelector:@selector(superview)]) break;
+        v = [v superview];
+    }
+    return NO;
+}
+
+static DDBalancePageKind DDBalancePageKindOf(id obj) {
+    // 不在钱包页就一律不插手：ScrollNumber 是通用滚动数字控件（倒计时 TimeoutNumber 等都在用），
+    // 全局改会把无关控件的数值也改掉，这正是"开启余额小丑后闪退"的根因
+    if (!DDIsWalletBalancePage(DDViewControllerOfView(obj))) return DDBalancePageNone;
+    return DDHasLQTBeside(obj) ? DDBalancePageLQT : DDBalancePageBalance;
+}
+
+// ScrollNumber 会为每一位数字建一整列滚动 view，位数极端时内存暴涨会被系统杀掉（也是闪退），
+// 所以给金额封顶 11 位（约 9999 万元），足够用且不会把控件撑爆
+static unsigned long long DDClampFen(unsigned long long fen) {
+    const unsigned long long kMaxFen = 99999999999ULL;
+    return fen > kMaxFen ? kMaxFen : fen;
+}
+
+%hook ScrollNumber
+// 与爱锋一致：isLQT 是自己加的判定方法（爱锋 hooks 里同样标记 "new"），
+// 结果用 associatedObject 缓存，避免每次刷新都遍历一遍响应链
+%new
+- (BOOL)isLQT {
+    id cached = objc_getAssociatedObject(self, @selector(isLQT));
+    if (cached) return [cached boolValue];
+    // 只在已经能定论时才缓存：VC 还没挂上就缓存 NO，会把结果永久锁死成"余额"
+    DDBalancePageKind kind = DDBalancePageKindOf(self);
+    if (kind == DDBalancePageNone) return NO;
+    BOOL v = (kind == DDBalancePageLQT);
+    objc_setAssociatedObject(self, @selector(isLQT), @(v), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return v;
+}
+
+// 微信初始化时走 defaultNumber:，只 hook updateNumber: 会让刚进页面先闪一下真值
+- (void)defaultNumber:(unsigned long long)original {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        DDBalancePageKind kind = cfg.balanceEnabled ? DDBalancePageKindOf(self) : DDBalancePageNone;
+        if (kind == DDBalancePageNone) { %orig(original); return; }   // 非钱包页，不插手
+        if (kind == DDBalancePageLQT) {
+            %orig([cfg hasLingtongValue] ? DDClampFen(DDLingtongFenValue()) : original);
         } else {
-            %orig(original);
+            %orig([cfg hasBalanceValue] ? DDClampFen(DDBalanceFenValue()) : original);
         }
-    } else {
-        if ([cfg hasBalanceValue]) {
-            %orig(DDBalanceFenValue());
+    } @catch (NSException *exception) {
+        %orig(original);   // 任何异常都退回原值，绝不让微信崩
+    }
+}
+
+- (void)updateNumber:(unsigned long long)original {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        DDBalancePageKind kind = cfg.balanceEnabled ? DDBalancePageKindOf(self) : DDBalancePageNone;
+        if (kind == DDBalancePageNone) { %orig(original); return; }   // 非钱包页，不插手
+        if (kind == DDBalancePageLQT) {
+            %orig([cfg hasLingtongValue] ? DDClampFen(DDLingtongFenValue()) : original);
         } else {
-            %orig(original);
+            %orig([cfg hasBalanceValue] ? DDClampFen(DDBalanceFenValue()) : original);
         }
+    } @catch (NSException *exception) {
+        %orig(original);
     }
 }
 %end
@@ -903,9 +1333,10 @@ static unsigned long long DDLingtongFenValue(void) {
     Class cellCls = %c(WCTableViewCellManager);
 
     WCTableViewSectionManager *chatSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"聊天设置"];
-    chatSection.attributedFooterTitle = [self dd_centeredFooterString:@"聊天文字修改 / 聊天图片修改 / 聊天转账修改 为独立开关：长按消息弹窗菜单小丑按钮，文字消息改内容与引用标题、图片消息替换为相册所选图、转账消息改金额"];
+    chatSection.attributedFooterTitle = [self dd_centeredFooterString:@"聊天文字 / 图片 / 时间 / 转账修改 为独立开关：长按消息弹窗菜单小丑按钮，文字改内容与引用标题、图片替换为相册所选图、时间改显示、转账改金额"];
     [chatSection addCell:[cellCls switchCellForSel:@selector(textSwitchChanged:) target:self title:@"聊天文字修改" on:cfg.textEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
+    [chatSection addCell:[cellCls switchCellForSel:@selector(timeSwitchChanged:) target:self title:@"聊天时间修改" on:cfg.timeEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(transferSwitchChanged:) target:self title:@"聊天转账修改" on:cfg.transferEnabled]];
     UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     clearBtn.frame = CGRectMake(0, 0, 52, 34);
@@ -1001,35 +1432,34 @@ static unsigned long long DDLingtongFenValue(void) {
 
 - (void)textSwitchChanged:(UISwitch *)sender {
     [DDGlobalConfig shared].textEnabled = sender.isOn;
-    JokerReloadAllMsgContent();   // 关闭立即恢复原文，开启立即套用已保存的修改
+    JokerInvalidateAllLayout();   // 关闭立即恢复原文，开启立即套用已保存的修改
     [self buildTable];
 }
 
 - (void)imageSwitchChanged:(UISwitch *)sender {
     [DDGlobalConfig shared].imageEnabled = sender.isOn;
-    JokerReloadAllMsgContent();
-    JokerRefreshVisibleImageCells();
+    JokerInvalidateAllLayout();
+    [self buildTable];
+}
+
+- (void)timeSwitchChanged:(UISwitch *)sender {
+    [DDGlobalConfig shared].timeEnabled = sender.isOn;
+    JokerInvalidateAllLayout();
     [self buildTable];
 }
 
 - (void)transferSwitchChanged:(UISwitch *)sender {
     [DDGlobalConfig shared].transferEnabled = sender.isOn;
-    JokerReloadAllMsgContent();
+    // 关开关时也必须置位，否则 dd_applyTransferAmount 认为"没改动"而跳过，金额还原不回去
+    JokerInvalidateAllLayout();
     [self buildTable];
 }
 
 - (void)clearChatCacheTapped:(id)sender {
-    gJokerNeedsResetLayout = YES;     // 让聊天页在重建时清掉已缓存的 contentText
     DDJokerClearAllMessageCache();    // 清文本/金额缓存字典 + 替换图目录
-    JokerReloadAllMsgContent();       // 全量重绘所有聊天页（遍历全部 window 的 VC 树，不再只查单个导航栈）
-    JokerRefreshVisibleImageCells();  // 图片走的是 setImage，需触发微信重新加载原图
+    JokerInvalidateAllLayout();       // 全量重绘所有聊天页（遍历全部 window 的 VC 树，不再只查单个导航栈）
     [self buildTable];
     [self dd_showDoneToast:@"已清理"];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        gJokerNeedsResetLayout = NO;
-    });
-    // 注意：kDDJokerOriginalSnapshotKey 不能在这里清 —— 引用消息的标题是直接改写
-    // CMessageWrap 的，要靠快照在下次 setViewModel: 时还原；聊天页不在内存时尤其需要
 }
 
 - (void)dd_showDoneToast:(NSString *)text {
@@ -1164,6 +1594,7 @@ static unsigned long long DDLingtongFenValue(void) {
         NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
         _textEnabled = [def boolForKey:kDDFeatureTextEnabled];
         _imageEnabled = [def boolForKey:kDDFeatureImageEnabled];
+        _timeEnabled = [def boolForKey:kDDFeatureTimeEnabled];
         _transferEnabled = [def boolForKey:kDDFeatureTransferEnabled];
         _balanceEnabled = [def boolForKey:kDDFeatureBalanceEnabled];
         _stepsEnabled = [def boolForKey:kDDFeatureStepsEnabled];
@@ -1195,6 +1626,12 @@ static unsigned long long DDLingtongFenValue(void) {
 - (void)setImageEnabled:(BOOL)enabled {
     _imageEnabled = enabled;
     [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureImageEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setTimeEnabled:(BOOL)enabled {
+    _timeEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureTimeEnabled];
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
