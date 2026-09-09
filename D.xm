@@ -145,6 +145,7 @@
 - (void)layoutContentView;
 - (void)updateTitleLabel;
 - (void)updateDescLabel;
+- (void)dd_applyTransferAmount;   // 本插件 %new 出来的方法，先声明以便 layoutContentView 内直接调用
 @end
 
 @interface ImageMessageCellView : CommonMessageCellView
@@ -162,6 +163,7 @@
 @interface ChatTimeViewModel : BaseMessageViewModel
 @property (nonatomic) double showingTime;
 - (NSString *)timeText;
+- (void)updateLayouts;   // ChatTimeViewModel.h:20，改时间后让 viewModel 重算布局
 @end
 
 @interface ChatTimeCellView : UIView
@@ -536,6 +538,10 @@ static void JokerRefreshCellDirectly(CommonMessageCellView *cell) {
     }
     [cell setNeedsLayout];
 }
+
+// 提前声明：JokerInvalidateAllLayout 的定义在下方（依赖 gJokerNeedsResetLayout），
+// 但本函数及多处开关回调在定义之前就会调用它，static 函数必须先声明后使用
+static void JokerInvalidateAllLayout(void);
 
 static void JokerReloadCellAfterReplace(id vc, CMessageWrap *msg, CommonMessageCellView *cell) {
     JokerRefreshCellDirectly(cell);
@@ -1023,13 +1029,17 @@ static NSString *DDTimeStringForDisplay(NSString *originText, double ts) {
     NSString *defaultText = base > 0 ? [DDTimeInputFormatter() stringFromDate:[NSDate dateWithTimeIntervalSince1970:base]] : @"";
 
     // 与爱锋一致：微信原生 WCUIAlertView，标题/提示文案都沿用它的（@0xbb174 / @0x6287e8 / @0x628828）
-    __block WCUIAlertView *blockAlert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:@"请输入要修改的时间"
-                                                                                         message:@"输入格式如下\n2024-08-01 22:30"];
-    [blockAlert showTextFieldWithMaxLen:100];
-    [blockAlert setTextFieldDefaultText:defaultText];
-    [blockAlert addCancelBtnTitle:@"取消" handler:^{ blockAlert = nil; }];
-    [blockAlert addBtnTitle:@"确定" handler:^{
-        NSString *raw = blockAlert ? [blockAlert getTextFieldText] : nil;
+    WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:@"请输入要修改的时间"
+                                                                           message:@"输入格式如下\n2024-08-01 22:30"];
+    [alert showTextFieldWithMaxLen:100];
+    [alert setTextFieldDefaultText:defaultText];
+    // alert 通过 handler: 强引用这两个 block，若 block 再强引用 alert 会形成保留环（-Werror 直接报错），
+    // 故用 __weak：弹窗显示期间 alert 由微信内部持有仍存活，点击时 weakAlert 仍有效
+    __weak WCUIAlertView *weakAlert = alert;
+    [alert addCancelBtnTitle:@"取消" handler:^{ }];
+    [alert addBtnTitle:@"确定" handler:^{
+        WCUIAlertView *a = weakAlert;
+        NSString *raw = a ? [a getTextFieldText] : nil;
         NSString *t = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         double ts = DDTimeStampFromString(t);
         if (ts > 0) {
@@ -1040,9 +1050,8 @@ static NSString *DDTimeStringForDisplay(NSString *originText, double ts) {
             [self layoutInternal];
             [self setNeedsLayout];
         }
-        blockAlert = nil;   // 打破 alert -> handler -> alert 的保留环
     }];
-    [blockAlert show];
+    [alert show];
     objc_setAssociatedObject(self, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 %end
