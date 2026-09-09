@@ -633,6 +633,17 @@ static void DDJokerSetCachedTime(id vm, double timestamp) {
     DDJokerSaveCache(kDDJokerTimeCacheKey, d);
 }
 
+// 把"缓存的修改时间"写进 showingTime 的 ivar：开关开 + 该条有缓存 + 当前不是修改值才写。
+// 在【布局通路之外】调用（didMoveToWindow 的 dispatch_async）才会让微信按新值重算 m_timeText；
+// 在布局通路内（首帧 layout / updateLayouts / layoutInternal 钩子里）调用只改 ivar、不触发重绘，属兜底。
+static void DDApplyTimeOverride(id vm) {
+    if (!vm || ![DDGlobalConfig shared].timeEnabled) return;
+    NSNumber *cached = DDJokerCachedTime(vm);
+    if (cached && DDShowingTimeOf(vm) != [cached doubleValue]) {
+        DDSetShowingTime(vm, [cached doubleValue]);
+    }
+}
+
 static void DDJokerClearAllMessageCache(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
     // 文字/金额/时间覆盖值：随聊天内容刷新，清掉无妨
@@ -1282,18 +1293,10 @@ static double DDTimeStampFromString(NSString *s) {
 // 改时间后微信重算时间条就走这里，打出来才能确认"改了没反应"到底卡在哪一步
 - (void)updateLayouts {
     DDJokerHit(@"ChatTimeViewModel.updateLayouts");
-    // 覆盖必须在这里、%orig 之前写进 showingTime：
-    // 微信在【首次布局】时就用 showingTime 算出 m_timeText 直接画到 collapsed（普通）时间条，
-    // 这一步早于 timeText getter 被调用。若只把覆盖写在 timeText 里，离开聊天页重新进入后
-    // 新建 vm 先被 updateLayouts 用真实时间画出来、之后又不再触发 timeText 重查，
-    // 普通时间条就会显示真实时间，要等点一下时间条（微信重跑 updateLayouts+timeText）才修正。
-    // 这就是"重新进入显示真实时间、点一下才变回修改时间"的根因（DDJokerDiag.log 00:56 段佐证：
-    // 两种显示格式都由同一 showingTime 推导，故只要首帧就用修改值算 m_timeText 即可两格式同步修正）。
-    NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(self) : nil;
-    if (cached && DDShowingTimeOf(self) != [cached doubleValue]) {
-        DDSetShowingTime(self, [cached doubleValue]);
-        DDLOG(@"updateLayouts 应用覆盖 vm=%p → %@", self, DDTimeDesc([cached doubleValue]));
-    }
+    // 覆盖写进 showingTime：兜底用。决定性修复在 ChatTimeCellView.didMoveToWindow 的 dispatch_async
+    // （布局通路之外）里——那里才真正让微信按新值重算 m_timeText。这里 %orig 前先写好 showingTime，
+    // 万一有路径在首帧 layout 之前走到 updateLayouts，也能直接拿到修改值。
+    DDApplyTimeOverride(self);
     DDLOG(@"updateLayouts vm=%p 前 showingTime=%@", self, DDTimeDesc(DDShowingTimeOf(self)));
     %orig;
     DDLOG(@"updateLayouts vm=%p 后 showingTime=%@", self, DDTimeDesc(DDShowingTimeOf(self)));
@@ -1306,42 +1309,21 @@ static double DDTimeStampFromString(NSString *s) {
     id r = %orig;
     // vm 先存起来：弹窗时要用它读 showingTime 和写缓存
     objc_setAssociatedObject(r, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    // 单元格创建时就先把时间覆盖写到 showingTime：微信紧接着的首帧 layout/updateLayouts 会用修改值算 m_timeText，
-    // 这样【离开聊天页再进入】新建的时间条从第一帧起就显示修改时间，不用等点一下才重算。
-    // 证据（DDJokerDiag.log 01:13:46）：只在 timeText/updateLayouts 钩子里改 showingTime 不够——
-    // 微信首帧 layout 用真实 showingTime 把 m_timeText 算好、label 已上屏，之后 timeText 再改 showingTime 也不重绘，
-    // 现象就是"重进显示真实时间、点一下才变修改时间"。覆盖必须在 cell 创建、首帧 layout 之前落地。
-    if (vm) {
-        NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(vm) : nil;
-        if (cached && DDShowingTimeOf(vm) != [cached doubleValue]) {
-            DDSetShowingTime(vm, [cached doubleValue]);
-            DDLOG(@"initWithViewModel 应用覆盖 vm=%p → %@", vm, DDTimeDesc([cached doubleValue]));
-        }
-    }
+    // 兜底：cell 创建时先把缓存的修改时间写进 showingTime。决定性修复在 didMoveToWindow 的 dispatch_async。
+    DDApplyTimeOverride(vm);
     [(ChatTimeCellView *)r dk_installTimeEditGesture];
     return r;
 }
 - (void)setViewModel:(id)vm {
     %orig;
     objc_setAssociatedObject(self, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    if (vm) {
-        NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(vm) : nil;
-        if (cached && DDShowingTimeOf(vm) != [cached doubleValue]) {
-            DDSetShowingTime(vm, [cached doubleValue]);
-            DDLOG(@"setViewModel 应用覆盖 vm=%p → %@", vm, DDTimeDesc([cached doubleValue]));
-        }
-    }
+    DDApplyTimeOverride(vm);
     [self dk_installTimeEditGesture];
 }
-// 覆盖落点（决定性）：写在 layoutInternal 的 %orig 之前。
-// 证据（DDJokerDiag.log 01:25:00）：重进聊天页新建的 vm，即便 timeText 钩子把 showingTime 改成修改值、
-// 且 updateLayouts 跑在 modified showingTime 上，timeText 仍吐真实串——因为微信在【首帧 layout】
-// 用真实 showingTime 把 m_timeText 算死；而 updateLayouts 在 cell「尚未已布局/可见」时不会重算 m_timeText
-// （编辑路径之所以生效，是用户在屏上点确定后强制定 deferred relayout，那时 cell 已可见，updateLayouts 才重算）。
-// ChatTimeCellView.h 确认有 - (void)layoutInternal，其内部会调 vm.updateLayouts 用当前 showingTime 算 m_timeText。
-// 我们在 %orig 之前把 showingTime 改成修改值，首帧 m_timeText 就直接是修改时间，短/长两种格式同步修正。
-// 比 didMoveToWindow 可靠：ChatTimeCellView 实为 NSObject（dump 头文件佐证），didMoveToWindow 未必按预期触发；
-// 而 layoutInternal 是微信正常 layout 通路、必走，且早到 m_timeText 算之前。
+    // 兜底：布局通路内调用只把修改时间写进 showingTime ivar，但【不会】触发 m_timeText 重算
+    // （日志实证：微信首帧 layout 用真实 showingTime 把 m_timeText 算死，布局通路内的 updateLayouts 不重算）。
+    // 真正让"重进首帧即显示修改时间"的修复在 didMoveToWindow 的 dispatch_async（布局通路之外）。
+    // 这里仍保留：一是 %orig 前写好 showingTime 作兜底，二是日志打出每帧的缓存/showingTime 状态便于诊断。
 - (void)layoutInternal {
     DDJokerHit(@"ChatTimeCellView.layoutInternal");
     id vm = objc_getAssociatedObject(self, &kDDTimeVMKey);
@@ -1350,12 +1332,7 @@ static double DDTimeStampFromString(NSString *s) {
         DDLOG(@"layoutInternal cell=%p vm=%p 缓存=%@ showingTime=%@ 关联vm=%@",
               self, vm, DDTimeDesc([cached doubleValue]), DDTimeDesc(DDShowingTimeOf(vm)), vm ? @"有" : @"无");
     }
-    if (vm) {
-        if (cached && DDShowingTimeOf(vm) != [cached doubleValue]) {
-            DDSetShowingTime(vm, [cached doubleValue]);
-            DDLOG(@"layoutInternal 应用覆盖 vm=%p → %@", vm, DDTimeDesc([cached doubleValue]));
-        }
-    }
+    DDApplyTimeOverride(vm);
     %orig;
 }
 // 微信时间条有第二种显示：点一下时间条会切出带日期的完整时间（ChatTimeCellView.h:11 onClickTimeLabel）。
@@ -1396,8 +1373,8 @@ static double DDTimeStampFromString(NSString *s) {
         if (!v) return;
         NSNumber *c = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(v) : nil;
         if (!c) return;
-        if (DDShowingTimeOf(v) != [c doubleValue]) DDSetShowingTime(v, [c doubleValue]);
-        DDRefreshTimeText(v);                 // [vm updateLayouts] —— 重算 m_timeText（编辑路径实证生效）
+        DDApplyTimeOverride(v);
+        DDRefreshTimeText(v);                 // [vm updateLayouts] —— 布局通路外重算 m_timeText（编辑路径实证生效）
         [(ChatTimeCellView *)self layoutInternal];
         [self setNeedsLayout];
         DDLOG(@"didMoveToWindow 已重排 cell=%p vm=%p → %@", self, v, DDTimeDesc([c doubleValue]));
