@@ -218,10 +218,12 @@
 @end
 
 // WCPayMainViewControllerV2 服务页（"我"→ 服务 tab）顶层 VC，
-// dump 头文件 WCPayMainViewControllerV2.h:1（继承 NSObject，可能是 NewPay 的 MM 容器）和 :115 viewWillAppear:
-// 直接声明方法让编译器认得，运行时再走 viewWillAppear: 兜底刷新 ScrollNumber
-@interface WCPayMainViewControllerV2 : NSObject
-- (void)viewWillAppear:(BOOL)animated;
+// dump 头文件 WCPayMainViewControllerV2.h:1、:115 viewWillAppear:
+// ⚠️ dump 里继承被抹成 NSObject，但从 :114 viewDidLoad / :115 viewWillAppear: 看它实际必然是
+//    UIViewController 子类。这里声明成 UIViewController，是为了让 [self view] 编译期可见
+//    （CI 报过 "no visible @interface ... declares the selector 'view'"）。
+//    Logos 的 %hook 是按【类名】在运行时 hook 的，声明的父类不影响 hook 是否生效。
+@interface WCPayMainViewControllerV2 : UIViewController
 @end
 
 // ScrollNumber.h 确认存在：-(void)updateNumber:(unsigned long long); -(void)defaultNumber:(unsigned long long);
@@ -517,7 +519,6 @@ static NSString *DDJokerImagesDir(void) {
     return dir;
 }
 
-
 static NSString *DDJokerCachedText(CMessageWrap *msg) {
     if (!msg) return nil;
     NSDictionary *d = DDJokerLoadCache(kDDJokerTextCacheKey);
@@ -591,7 +592,6 @@ static Ivar DDShowingTimeIvarOf(id vm) {
         free(list);
         c = class_getSuperclass(c);
     }
-    if (iv) DDLOG(@"_showingTime 精确匹配失败，模糊命中 %s（类 %s）", ivar_getName(iv), class_getName(cls));
     return iv;
 }
 
@@ -604,13 +604,10 @@ static double DDShowingTimeOf(id vm) {
 static void DDSetShowingTime(id vm, double ts) {
     Ivar iv = DDShowingTimeIvarOf(vm);
     if (!iv) {
-        DDLOG(@"写 showingTime 失败：vm=%p 找不到 _showingTime ivar（见导出日志的 ivar 列表）", vm);
         return;
     }
     double old = *(double *)((uint8_t *)(__bridge void *)vm + ivar_getOffset(iv));
     *(double *)((uint8_t *)(__bridge void *)vm + ivar_getOffset(iv)) = ts;
-    DDLOG(@"写 showingTime vm=%p ivar=%s offset=%td : %.3f -> %.3f",
-          vm, ivar_getName(iv), ivar_getOffset(iv), old, ts);
 }
 
 // 改完 showingTime 让微信重算：updateLayouts 会按新的 showingTime 重新生成 m_timeText
@@ -885,9 +882,6 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
     NSString *editorMessage = isTransfer ? @"请输入需要修改的金额\n留空还原" : @"请输入需要修改的文字\n留空还原";
     WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:editorTitle message:editorMessage];
     if (!alert) return;
-    DDJokerHit(isTransfer ? @"JokerPresentEditor:转账" : @"JokerPresentEditor:文字");
-    DDLOG(@"打开修改弹窗 cell=%s 转账=%d key=%@ 当前值=%@",
-          class_getName([cell class]), isTransfer, DDJokerMessageKey(msg), current);
     [alert showTextFieldWithMaxLen:1000];
     [alert setTextFieldDefaultText:current];
 
@@ -902,7 +896,6 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
         NSString *raw = blockAlert ? [blockAlert getTextFieldText] : nil;
         if (!raw.length) raw = inputField.text;
         NSString *newText = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        DDLOG(@"%@弹窗确定：输入=[%@] key=%@", isTransfer ? @"转账" : @"文字", newText, DDJokerMessageKey(msg));
         if (newText.length) {
             if ([newText isEqualToString:current]) { blockAlert = nil; return; }   // 没改动
             if (isTransfer) {
@@ -918,7 +911,6 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
             // 文字走数据层，DDJokerApplyTextOverride 会用 DDJokerTextOriginal 里的备份写回 m_nsContent。
             if (isTransfer) DDJokerSetCachedAmount(msg, nil);
             else DDJokerSetCachedText(msg, nil);
-            DDLOG(@"  → 留空还原，已清缓存 key=%@", DDJokerMessageKey(msg));
             JokerReloadCellAfterReplace(vc, msg, cell);
         }
         blockAlert = nil;   // 打破 alert -> handler -> alert 的保留环
@@ -962,15 +954,12 @@ static void DDJokerApplyTextOverride(CMessageWrap *msg) {
     NSString *cached = [DDGlobalConfig shared].textEnabled ? DDJokerCachedText(msg) : nil;
     NSString *target = cached ?: original;
     if (target.length && ![target isEqualToString:msg.m_nsContent]) {
-        DDLOG(@"文字数据层写入 key=%@ 有覆盖=%d : [%@] -> [%@]",
-              DDJokerMessageKey(msg), cached != nil, msg.m_nsContent, target);
         [msg setM_nsContent:target];
     }
 }
 
 %hook TextMessageViewModel
 - (NSString *)contentText {
-    DDJokerHit(@"TextMessageViewModel.contentText");
     DDJokerApplyTextOverride(self.messageWrap);   // 爱锋 @0xba15c：先改 model 再取 %orig
     NSString *origin = %orig;
     if (![DDGlobalConfig shared].textEnabled) return origin;
@@ -1011,7 +1000,6 @@ static void JokerInvalidateAllLayout(void) {
     }
 }
 - (id)getTextString {
-    DDJokerHit(@"TextMessageCellView.getTextString");
     CMessageWrap *msg = JokerGetMessageWrapFromCell(self);
     DDJokerApplyTextOverride(msg);   // 爱锋 @0xbcb80：getTextString 里同样先改 model，复制/转发取到的是改后文本
     id origin = %orig;
@@ -1095,12 +1083,10 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 // 命中的是金额正则段，文本里没有金额时原样返回。
 %hook WCPayTransferMessageViewModel
 - (NSString *)titleText {
-    DDJokerHit(@"WCPayTransferMessageViewModel.titleText");
     NSString *origin = %orig;
     if (![DDGlobalConfig shared].transferEnabled) return origin;
     NSString *cached = DDJokerCachedAmount(self.messageWrap);
     NSString *out = cached ? DDTransferReplaceAmountInText(origin, cached) : origin;
-    if (cached) DDLOG(@"转账 titleText 原文=%@ 覆盖=%@ 结果=%@", origin, cached, out);   // 只在真有覆盖值时打，避免每次重绘刷屏
     return out;
 }
 - (NSString *)descText {
@@ -1283,22 +1269,12 @@ static double DDTimeStampFromString(NSString *s) {
 // 本插件只负责把 showingTime 改成目标时间戳，显示文本与格式全部由微信原生实现给出。
 %hook ChatTimeViewModel
 - (NSString *)timeText {
-    static long calls = 0;
-    calls++;
-
     gDDLastTimeVM = self;   // 供设置页导出日志时取"最近一条时间条"（导出时会顺带 dump 它的类结构）
-    DDJokerHit(@"ChatTimeViewModel.timeText");
 
     // 先取一次原始 showingTime：首次调用时它还没被改写，正好把 key 钉在原始值上
     double raw = DDRawShowingTimeOf(self);
     NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(self) : nil;
     double target = cached ? [cached doubleValue] : raw;   // 没覆盖值时目标是原始时间（顺带完成还原）
-    BOOL verbose = (calls <= 3 || calls % 50 == 0);
-    if (verbose || cached) {
-        DDLOG(@"timeText vm=%p 开关=%d key=%@ 原始=%.3f 目标=%.3f 缓存=%@",
-              self, [DDGlobalConfig shared].timeEnabled, DDJokerTimeKey(self),
-              raw, target, cached ? [NSString stringWithFormat:@"%.3f", target] : @"无");
-    }
 
     // showingTime 不是目标值就写进去，再让微信按新值重算 m_timeText。
     // 关开关 / 清缓存时 target 就是原始值，同一段逻辑顺带把显示还原回真实时间。
@@ -1310,28 +1286,21 @@ static double DDTimeStampFromString(NSString *s) {
     // 格式完全交给微信原生实现：今天只显示"15:56"、昨天"昨天 15:56"、更早带日期，
     // 全都由微信自己的分档规则决定。之前自己拼"今天 HH:mm"与原生不一致，现已不再自创格式。
     NSString *o = %orig;
-    if (verbose || cached) DDLOG(@"  → 微信原生 timeText = %@", o);
     if (!o && cached) {
         // 日志实证（DDJokerDiag-2.log 00:20:45）：新建的 vm 上 updateLayouts 没能把 m_timeText 算出来，
         // 微信就返回 nil，界面上表现为时间条空白。这里不自创文本填补（避免和原生日历口径不一致），
         // 只留一条醒目标记，下次导出日志一眼能看出是"微信没算出来"还是"我们没写进去"。
-        DDLOG(@"  !! 微信原生 timeText 返回 nil vm=%p showingTime=%@ 目标=%@ —— 时间条可能空白（微信自身未重算）",
-              self, DDTimeDesc(DDShowingTimeOf(self)), DDTimeDesc(target));
     }
     return o;
 }
 // 改时间后微信重算时间条就走这里，打出来才能确认"改了没反应"到底卡在哪一步
 - (void)updateLayouts {
-    DDJokerHit(@"ChatTimeViewModel.updateLayouts");
-    DDLOG(@"updateLayouts vm=%p 前 showingTime=%@", self, DDTimeDesc(DDShowingTimeOf(self)));
     %orig;
-    DDLOG(@"updateLayouts vm=%p 后 showingTime=%@", self, DDTimeDesc(DDShowingTimeOf(self)));
 }
 %end
 
 %hook ChatTimeCellView
 - (id)initWithViewModel:(id)vm {
-    DDJokerHit(@"ChatTimeCellView.initWithViewModel:");
     id r = %orig;
     // vm 先存起来：弹窗时要用它读 showingTime 和写缓存
     objc_setAssociatedObject(r, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1344,31 +1313,16 @@ static double DDTimeStampFromString(NSString *s) {
     [self dk_installTimeEditGesture];
 }
 - (void)layoutInternal {
-    DDJokerHit(@"ChatTimeCellView.layoutInternal");
     %orig;
 }
 // 微信时间条有第二种显示：点一下时间条会切出带日期的完整时间（ChatTimeCellView.h:11 onClickTimeLabel）。
-// 这里只做取证、不改行为：把点击前后的 vm.timeText 和 label 实际文本都打出来，
-// 下次导出日志就能判断它是跟着 showingTime 走（那我们改了它就自动跟着变），
-// 还是走了另一套取 CMessageWrap.m_uiCreateTime 的逻辑（那要单独处理）。不猜。
-- (void)onClickTimeLabel {
-    id vm = objc_getAssociatedObject(self, &kDDTimeVMKey);
-    UILabel *lb = [self dk_timeLabel];
-    DDLOG(@"点击时间条 cell=%p vm=%p 点击前 timeText=[%@] label.attributed=[%@]",
-          self, vm, [vm respondsToSelector:@selector(timeText)] ? [vm timeText] : nil, lb.attributedText.string);
-    %orig;
-    DDLOG(@"  → 点击后 timeText=[%@] label.attributed=[%@] showingTime=%@",
-          [vm respondsToSelector:@selector(timeText)] ? [vm timeText] : nil,
-          [self dk_timeLabel].attributedText.string,
-          vm ? DDTimeDesc(DDShowingTimeOf(vm)) : @"无");
-}
+// 两种格式都由同一个 showingTime 推导，所以我们改 showingTime 后两者会同步变化，无需单独处理。
 // 长按手势装在 label 上，而 label 可能晚于 init 才创建，cell 复用时也会换，
 // 决定性修复落点：把编辑路径（长按弹窗确定后那套 setShowingTime+updateLayouts+layoutInternal+setNeedsLayout）
 // 延到【布局通路之外】执行。日志实证：微信只在布局通路之外被调 updateLayouts 时才会用修改值重算 m_timeText；
 // 首帧 layout / 布局通路内的 updateLayouts（initWithViewModel、layoutInternal、timeText 钩子里调用的那次）
 // 一律不重算，导致重进聊天页普通时间条显示真实时间、要等点一下才变——点一下正好触发了布局通路外的重排。
 - (void)didMoveToWindow {
-    DDJokerHit(@"ChatTimeCellView.didMoveToWindow");
     %orig;
     [self dk_installTimeEditGesture];
     if (!self.window) return;
@@ -1378,7 +1332,6 @@ static double DDTimeStampFromString(NSString *s) {
     if (!cached) return;   // 无覆盖的时间条零开销，普通聊天气泡不受影响
     // didMoveToWindow 可能仍落在微信当前布局周期内，故用 dispatch_async(main) 把重排推到布局通路之外，
     // 与编辑路径（弹窗确定回调里同步重排）等价 → 首帧即显示修改时间。
-    DDLOG(@"didMoveToWindow 排程重排（布局通路外）cell=%p vm=%p 缓存=%@", self, vm, DDTimeDesc([cached doubleValue]));
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!self.window) return;
         id v = objc_getAssociatedObject(self, &kDDTimeVMKey);
@@ -1389,7 +1342,6 @@ static double DDTimeStampFromString(NSString *s) {
         DDRefreshTimeText(v);                 // [vm updateLayouts] —— 布局通路外重算 m_timeText（编辑路径实证生效）
         [(ChatTimeCellView *)self layoutInternal];
         [self setNeedsLayout];
-        DDLOG(@"didMoveToWindow 已重排 cell=%p vm=%p → %@", self, v, DDTimeDesc([c doubleValue]));
     });
 }
 %new
@@ -1417,7 +1369,7 @@ static double DDTimeStampFromString(NSString *s) {
 - (void)dk_installTimeEditGesture {
     if (![DDGlobalConfig shared].timeEnabled) return;
     UILabel *label = [self dk_timeLabel];
-    if (!label) { DDJokerHit(@"dk_installTimeEditGesture:找不到label"); return; }   // 找不到 label 长按就永远不弹窗
+    if (!label) return;   // 找不到 label 长按就永远不弹窗
     for (UIGestureRecognizer *g in label.gestureRecognizers) {
         if ([g isKindOfClass:[UILongPressGestureRecognizer class]]) return;   // 幂等，不重复装
     }
@@ -1427,12 +1379,10 @@ static double DDTimeStampFromString(NSString *s) {
     lp.allowableMovement = 24;
     lp.cancelsTouchesInView = NO;
     [label addGestureRecognizer:lp];
-    DDJokerHit(@"dk_installTimeEditGesture:已安装");
 }
 %new
 - (void)dk_handleTimeLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
-    DDJokerHit(@"dk_handleTimeLongPress");
     [self dk_showTimeInput];
 }
 %new
@@ -1445,10 +1395,6 @@ static double DDTimeStampFromString(NSString *s) {
     double base = cached ? [cached doubleValue]
                          : DDShowingTimeOf(vm);
     NSString *defaultText = base > 0 ? [DDTimeInputFormatter() stringFromDate:[NSDate dateWithTimeIntervalSince1970:base]] : @"";
-    DDJokerHit(@"dk_showTimeInput");
-    DDLOG(@"打开时间弹窗 vm=%p 缓存=%@ 基准=%@ 预填=%@ 关联vm=%d",
-          vm, cached ?: @"无", DDTimeDesc(base), defaultText,
-          objc_getAssociatedObject(self, &kDDTimeVMKey) == vm);
 
     // 与爱锋一致：微信原生 WCUIAlertView，标题/提示文案都沿用它的（@0xbb174 / @0x6287e8 / @0x628828）
     WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:@"时间修改"
@@ -1470,8 +1416,6 @@ static double DDTimeStampFromString(NSString *s) {
         if (!raw.length) { raw = inputField.text; fromField = YES; }   // alert 提前释放时的兜底取值路径
         NSString *t = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         double ts = DDTimeStampFromString(t);
-        DDLOG(@"时间弹窗确定：输入=[%@] 来源=%@ alert存活=%d 解析=%@ vm=%p",
-              t, fromField ? @"UITextField兜底" : @"getTextFieldText", blockAlert != nil, DDTimeDesc(ts), vm);
         if (ts > 0) {
             // 爱锋 changeTime @0xbb284 的收尾（反汇编实证）：
             //   DKWriteShowingTime @0xccfd8 把新时间戳直接写进 vm 的 showingTime ivar（str d8, [x19, x0]），
@@ -1483,7 +1427,6 @@ static double DDTimeStampFromString(NSString *s) {
             DDRefreshTimeText(vm);       // updateLayouts 按新的 showingTime 重算 m_timeText
             [self layoutInternal];       // ChatTimeCellView.h:9，用重算后的 timeText 重画
             [self setNeedsLayout];
-            DDLOG(@"  → 已写入：目标 ts=%@ 写后 showingTime=%@", DDTimeDesc(ts), DDTimeDesc(DDShowingTimeOf(vm)));
         } else if (DDJokerCachedTime(vm)) {
             // 留空 = 还原：清缓存（传 0 即移除），并把 showingTime 写回原始值
             DDJokerSetCachedTime(vm, 0);
@@ -1492,18 +1435,7 @@ static double DDTimeStampFromString(NSString *s) {
             DDRefreshTimeText(vm);
             [self layoutInternal];
             [self setNeedsLayout];
-            DDLOG(@"  → 改后 showingTime=%@", DDTimeDesc(DDShowingTimeOf(vm)));
-        } else {
-            DDLOG(@"  → 未改动（输入为空且没有缓存，或解析失败）");
         }
-        // 关键验收点：0.3 秒后把时间条上真正显示的文字打出来。
-        // 如果这里还是真实时间，说明 cell 根本没用 timeText 的返回值，日志会直接指出下一步排查方向。
-        // text 与 attributedText 都要打：日志实证微信时间条用的是 attributedText，只看 text 永远是 (null)。
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            UILabel *lb = [self dk_timeLabel];
-            DDLOG(@"  → 0.3 秒后时间条实际文本 = text[%@] attributed[%@]",
-                  lb.text, lb.attributedText.string);
-        });
         blockAlert = nil;   // 打破 alert -> handler -> alert 的保留环
     }];
     [alert show];
@@ -1522,7 +1454,6 @@ static double DDTimeStampFromString(NSString *s) {
 
 %hook WCDeviceStepObject
 - (unsigned int)m7StepCount {
-    DDJokerHit(@"步数.m7StepCount");
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     if (cfg.stepsEnabled && [cfg hasStepsValue]) {
         NSInteger v = [cfg stepsIntegerValue];
@@ -1550,7 +1481,6 @@ static double DDTimeStampFromString(NSString *s) {
 
 %hook ContactsDataLogic
 - (unsigned int)m_uiNormalContact {
-    DDJokerHit(@"好友数.m_uiNormalContact");
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     if (cfg.contactsEnabled && [cfg hasContactsValue]) {
         NSInteger v = [cfg.contactsValue integerValue];
