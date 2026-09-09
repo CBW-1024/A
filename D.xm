@@ -154,11 +154,11 @@
 // 引用消息（isReferMsgType）实际由 TextMessageCellView 渲染，统一走文本这条链路
 
 // 聊天时间条（对应爱锋"时间小丑"）
-// ChatTimeViewModel.h:14 -(id)timeText; :10 -(double)showingTime; :19 -(void)setShowingTime:(double);
-//                    :20 -(void)updateLayouts;
+// ChatTimeViewModel.h:14 -(id)timeText; :20 -(void)updateLayouts;
+// 注意：showingTime(:10) / setShowingTime:(:19) 虽然头文件里有，但改不动时间条，
+// 一律走 _showingTime ivar 直接读写（爱锋 @0xccfd8 / @0xcd044 同款，见下方 DDShowingTimeOf 注释）
 // ChatTimeCellView.h:5 -(id)initWithViewModel:; :9 -(void)layoutInternal; :13 -(void)setViewModel:
 @interface ChatTimeViewModel : BaseMessageViewModel
-@property (nonatomic) double showingTime;
 - (NSString *)timeText;
 - (void)updateLayouts;   // ChatTimeViewModel.h:20，改时间后让 viewModel 重算布局
 @end
@@ -417,16 +417,35 @@ static void DDJokerSetCachedAmount(CMessageWrap *msg, NSString *amount) {
 
 #pragma mark - ①c 聊天时间修改缓存
 
-// 时间条没有消息身份时，只能用 showingTime 当 key。但我们改时间会调 setShowingTime:，
-// showingTime 一变 key 就漂移到新值，下次读到空缓存 → 弹回真实时间（这是之前"改了没反应"的根因）。
+// 爱锋 DKWriteShowingTime @0xccfd8 / DKRawShowingTime @0xcd044 都是直接读写 vm 的 ivar：
+//   class_getInstanceVariable(cls, "_showingTime") @0xcd008 / @0xcd06c
+//   → ivar_getOffset → str/ldr d8, [x19, x0]（@0xcd014 写 / @0xcd078 读）
+// 全程不走 setShowingTime: —— 实测 setter 改不动时间条的显示，必须直接改 ivar 才生效。
+// （_showingTime 这个 ivar 名来自反汇编里 class_getInstanceVariable 的实参字符串 @0x114f19）
+static double DDShowingTimeOf(id vm) {
+    if (!vm) return 0.0;
+    Ivar iv = class_getInstanceVariable([vm class], "_showingTime");
+    if (!iv) return 0.0;
+    return *(double *)((uint8_t *)(__bridge void *)vm + ivar_getOffset(iv));
+}
+
+static void DDSetShowingTime(id vm, double ts) {
+    if (!vm) return;
+    Ivar iv = class_getInstanceVariable([vm class], "_showingTime");
+    if (!iv) return;
+    *(double *)((uint8_t *)(__bridge void *)vm + ivar_getOffset(iv)) = ts;
+}
+
+// 时间条没有消息身份时，只能用 showingTime 当 key。但我们改时间会直接改写这个 ivar，
+// 它一变 key 就漂移到新值，下次读到空缓存 → 弹回真实时间（这是之前"改了没反应"的根因之一）。
 // 对齐爱锋 DKRawShowingTime @0xcd044：记住这条时间条的"原始 showingTime"，
 // 首次读取时（此时还没被改写）记下来，之后一律用原始值算 key，key 就不再漂移。
 static char kDDRawTimeKey;
 static double DDRawShowingTimeOf(id vm) {
-    if (!vm || ![vm respondsToSelector:@selector(showingTime)]) return 0.0;
+    if (!vm) return 0.0;
     NSNumber *raw = objc_getAssociatedObject(vm, &kDDRawTimeKey);
     if (!raw) {
-        raw = @([vm showingTime]);
+        raw = @(DDShowingTimeOf(vm));
         objc_setAssociatedObject(vm, &kDDRawTimeKey, raw, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     return [raw doubleValue];
@@ -1081,7 +1100,7 @@ static NSString *DDTimeStringForDisplay(double ts) {
     NSNumber *ts = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(self) : nil;
     if (!ts) {
         // 关开关 / 清过缓存：showingTime 还停在上一次的覆盖值上，不还原就回不到真实时间
-        if (raw > 0 && [self showingTime] != raw) [self setShowingTime:raw];
+        if (raw > 0 && DDShowingTimeOf(self) != raw) DDSetShowingTime(self, raw);
         return %orig;
     }
     NSString *s = DDTimeStringForDisplay([ts doubleValue]);
@@ -1154,7 +1173,7 @@ static NSString *DDTimeStringForDisplay(double ts) {
 
     NSNumber *cached = DDJokerCachedTime(vm);
     double base = cached ? [cached doubleValue]
-                         : [vm showingTime];
+                         : DDShowingTimeOf(vm);
     NSString *defaultText = base > 0 ? [DDTimeInputFormatter() stringFromDate:[NSDate dateWithTimeIntervalSince1970:base]] : @"";
 
     // 与爱锋一致：微信原生 WCUIAlertView，标题/提示文案都沿用它的（@0xbb174 / @0x6287e8 / @0x628828）
@@ -1178,7 +1197,7 @@ static NSString *DDTimeStringForDisplay(double ts) {
             // 之前只写缓存 + 触发布局，showingTime 没动，vm 重算出来的仍然是真实时间 —— 这才是真正根因。
             // 顺序不能反：先写缓存（此时 showingTime 还是原始值，key 才钉得住），再改 showingTime。
             DDJokerSetCachedTime(vm, ts);
-            [vm setShowingTime:ts];      // ChatTimeViewModel.h:19，让 vm 内部状态真的变成新时间
+            DDSetShowingTime(vm, ts);    // 直接写 _showingTime ivar，爱锋 @0xccfd8 同款
             [vm updateLayouts];          // ChatTimeViewModel.h:20，触发 timeText 重算
             [self layoutInternal];       // ChatTimeCellView.h:9，用重算后的 timeText 重画
             [self setNeedsLayout];
@@ -1186,7 +1205,7 @@ static NSString *DDTimeStringForDisplay(double ts) {
             // 留空 = 还原：清缓存（传 0 即移除），并把 showingTime 写回原始值
             DDJokerSetCachedTime(vm, 0);
             double rawTime = DDRawShowingTimeOf(vm);
-            if (rawTime > 0) [vm setShowingTime:rawTime];
+            if (rawTime > 0) DDSetShowingTime(vm, rawTime);
             [vm updateLayouts];
             [self layoutInternal];
             [self setNeedsLayout];
