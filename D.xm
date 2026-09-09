@@ -796,6 +796,19 @@ static void JokerInvalidateAllLayout(void) {
 
 #pragma mark - ①b 聊天图片修改
 
+// 微信原生相册选择器（头文件证据：MMImagePickerController.h，方法签名逐条核对）
+@interface MMImagePickerController : NSObject
+- (id)initForJustReturnMMAsset:(BOOL)a0 withAdjustRevertIndex:(unsigned long long)a1 withDirectToFirstAlbum:(BOOL)a2 withOnlyShowVideoMessage:(BOOL)a3 withNotShowVideoSizeAlertView:(BOOL)a4 withPickerVCForceFullScrenn:(BOOL)a5;
+- (void)setM_delegate:(id)a0;
+- (id)photoPicker;
+- (id)selectedImageAssets;
+@end
+
+// 微信相册资产（头文件证据：MMAsset.h:67）
+@interface MMAsset : NSObject
+- (void)asyncImageOriginData:(BOOL)a0 completion:(id)a1 errorBlock:(id)a2;
+@end
+
 // 微信原生相册回调代理
 // 协议方法选择器取自爱锋 DKLaunchViewController 符号：
 //   MMImagePickerController:didFinishPickingImageWithEditImageAttr:
