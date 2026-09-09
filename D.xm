@@ -280,7 +280,7 @@
 // 真实父类无法从 dump 确认（继承被抹成 NSObject），可能是 UIView 也可能不是，
 // 因此下面凡是走响应链的访问都必须先做 UIResponder 类型检查，否则 nextResponder 会崩。
 @interface ScrollNumber : NSObject
-- (BOOL)isLQT;                                 // 本插件 %new 实现，见下方 hook
+// 注：本插件不再 %new isLQT 方法；改用 C 函数 DDScrollNumberIsLQT（见余额段），逻辑等价爱锋 @0xbe820。
 - (void)updateNumber:(unsigned long long)a0;
 - (void)defaultNumber:(unsigned long long)a0;
 - (void)setCurrentNumber:(unsigned long long)a0;   // ScrollNumber.h:39，详情页设数字的入口（之前漏掉，导致我的零钱/零钱通详情页只走 %orig 真值）
@@ -1566,95 +1566,38 @@ static unsigned long long DDLingtongFenValue(void) {
     return (unsigned long long)(v * 100.0 + 0.5);
 }
 
-typedef NS_ENUM(NSInteger, DDBalancePageKind) {
-    DDBalancePageNone = 0,     // 非钱包页 —— 必须原样返回，不能插手
-    DDBalancePageBalance,      // 零钱/余额：WCPayBalanceDetailViewController
-    DDBalancePageLQT           // 零钱通：WCPayLQTDetailViewController / WCPayLQTMoneyViewController
-};
-
-// 安全版响应链查找。ScrollNumber 的真实父类无法从 dump 确认（继承被抹成 NSObject），
-// 它可能压根不是 UIResponder —— 那种情况下直接 nextResponder 就是 unrecognized selector 崩溃。
-// 另外一个更关键的问题：ScrollNumber 是通用滚动数字控件，倒计时（TimeoutNumber）、
-// 红包金额等都在用，无条件改所有实例会把无关控件的数值也改掉，严重时就是"进页面闪退"。
-// 所以这里除了做类型检查，还要求响应链上的 VC 必须是余额/零钱通页，否则一律不插手。
-static UIViewController *DDViewControllerOfView(id view) {
-    if (!view || ![view isKindOfClass:[UIResponder class]]) return nil;
-    UIResponder *r = (UIResponder *)view;
-    NSInteger guard = 0;
-    while (r && guard++ < 128) {          // 上限防御响应链成环
-        if ([r isKindOfClass:[UIViewController class]]) return (UIViewController *)r;
-        r = [r nextResponder];
-    }
-    return nil;
-}
-
-// 反汇编爱锋 isLQT（wechatku.dylib @0xbe820）得到的真实判定：
-//   vc = [DKHelper currentViewController]
-//   [vc isKindOfClass:KindaViewController] && [[vc title] isEqualToString:@"钱包"]
-//   → 取 self.superview.superview.superview.subviews[0].subviews[1]（一个 UILabel）
-//   → [label.text hasPrefix:@"零钱通"]  →  YES 表示这个 ScrollNumber 是零钱通
-// 两点结论：①爱锋同样只在钱包页生效，不是全局改；②区分零钱/零钱通靠的是旁边的文字。
-// 这里不照抄它硬编码的下标（层级一变就数组越界），改成在附近 view 树里搜"零钱通"字样。
-static BOOL DDIsWalletBalancePage(UIViewController *vc) {
-    if (!vc) return NO;
-    NSString *cls = NSStringFromClass([vc class]);
-    NSString *title = [vc respondsToSelector:@selector(title)] ? [vc title] : nil;
-    // 钱包主页：KindaViewController + 标题"钱包"（零钱与零钱通并排显示）
-    if ([cls isEqualToString:@"KindaViewController"] && [title isEqualToString:@"钱包"]) return YES;
-    // 余额详情页 / 零钱通详情页
-    if ([cls rangeOfString:@"WCPayBalanceDetail"].location != NSNotFound) return YES;
-    if ([cls rangeOfString:@"WCPayLQT"].location != NSNotFound) return YES;
-    // 服务页（"我"→ 服务 tab）：顶部的"钱包 ¥2.40"入口卡片就在这里。
-    // WCPayMainViewControllerV2 是服务页 VC（dump 头文件 WCPayMainViewControllerV2.h:1），
-    // 把这条加进白名单后，这页里所有 ScrollNumber 也会被 defaultNumber:/updateNumber:/setCurrentNumber: 接管。
-    if ([cls rangeOfString:@"WCPayMainViewControllerV2"].location != NSNotFound) return YES;
+// 对齐爱锋 isLQT（wechatku.dylib @0xbe820）：不依赖 VC 类名、不依赖白名单，
+// 直接在 ScrollNumber 附近的视图树里找"零钱通"字样。
+//   找到 → 这是零钱通数字（用零钱通自定义值）；找不到 → 视作余额数字（用余额自定义值）。
+// 爱锋在主页走"沿 superview 上钻 3 层再下钻 subviews"，在详情页走"WCPayWebImageView 旁找 UILabel"，
+// 本质都是在附近找零钱通标签。这里统一成：从本 view 向上爬若干层父视图，
+// 在每一层的兄弟 subviews（含一层子视图）里搜 text 含"零钱通"的 UILabel。
+// 向上不超过 4 层，避免跨到同页另一个卡片（零钱卡 / 零钱通卡同级）造成误判。
+// ScrollNumber 真实父类被 dump 抹成 NSObject，故入参用 id，内部再转 UIView* 走视图树。
+static BOOL DDScrollNumberIsLQT(id sn) {
+    @try {
+        UIView *v = (UIView *)sn;
+        for (int depth = 0; depth < 4 && v; depth++) {
+            UIView *parent = v.superview;
+            if (parent) {
+                for (UIView *sib in parent.subviews) {
+                    if (sib == v) continue;
+                    if ([sib isKindOfClass:[UILabel class]]) {
+                        NSString *t = ((UILabel *)sib).text;
+                        if (t.length && [t rangeOfString:@"零钱通"].location != NSNotFound) return YES;
+                    }
+                    for (UIView *sub in sib.subviews) {
+                        if ([sub isKindOfClass:[UILabel class]]) {
+                            NSString *t = ((UILabel *)sub).text;
+                            if (t.length && [t rangeOfString:@"零钱通"].location != NSNotFound) return YES;
+                        }
+                    }
+                }
+            }
+            v = parent;
+        }
+    } @catch (NSException *e) {}
     return NO;
-}
-
-static BOOL DDHasTextNearView(id view, NSString *want, NSInteger depth) {
-    if (!view || depth > 5 || ![view isKindOfClass:[UIView class]]) return NO;
-    if ([view isKindOfClass:[UILabel class]]) {
-        NSString *t = ((UILabel *)view).text;
-        if (t.length && [t rangeOfString:want].location != NSNotFound) return YES;
-    }
-    NSInteger n = 0;
-    for (UIView *sub in ((UIView *)view).subviews) {
-        if (++n > 24) break;              // 限制遍历规模，别在一次刷新里扫穿整棵树
-        if (DDHasTextNearView(sub, want, depth + 1)) return YES;
-    }
-    return NO;
-}
-
-static BOOL DDHasLQTBeside(id scrollNumber) {
-    id v = scrollNumber;
-    for (int i = 0; i < 5 && v; i++) {
-        if (DDHasTextNearView(v, @"零钱通", 0)) return YES;
-        if (![v respondsToSelector:@selector(superview)]) break;
-        v = [v superview];
-    }
-    return NO;
-}
-
-// 余额/零钱通的判定。⚠️ 判定顺序来自用户实机视图层级截图，不是猜的：
-//   【我的零钱 ¥2.40】KindaUIView → TimeoutNumber("我的零钱, 2点4 0元") → ScrollNumber
-//   【零钱通 ¥0.10】KindaUIView("账户余额 0点1 0元") → TimeoutNumber(", 0点1 0元") → ScrollNumber
-// 两条结论：
-//   ① 余额大数字确实走 ScrollNumber，但被 TimeoutNumber 包着 —— 不能排除它；
-//   ② 零钱通页的 TimeoutNumber 上根本没"零钱通"字样（a11y label 是 ", 0点1 0元"），
-//      所以"旁边有没有零钱通文字"这个判定在详情页不可靠，必须【优先按 VC 类名】定。
-static DDBalancePageKind DDBalancePageKindOf(id obj) {
-    UIViewController *vc = DDViewControllerOfView(obj);
-    // 不在钱包页就一律不插手：ScrollNumber 是通用滚动数字控件，
-    // 全局改会把无关控件的数值也改掉，这正是"开启余额小丑后闪退"的根因
-    if (!DDIsWalletBalancePage(vc)) return DDBalancePageNone;
-
-    // ① VC 类名最可靠：我的零钱与零钱通是两个独立 VC
-    NSString *cls = NSStringFromClass([vc class]);
-    if ([cls rangeOfString:@"WCPayLQT"].location != NSNotFound) return DDBalancePageLQT;
-    if ([cls rangeOfString:@"WCPayBalanceDetail"].location != NSNotFound) return DDBalancePageBalance;
-
-    // ② 钱包主页 / 服务页上零钱与零钱通是并排两个控件，只能靠旁边的文字区分
-    return DDHasLQTBeside(obj) ? DDBalancePageLQT : DDBalancePageBalance;
 }
 
 // ScrollNumber 会为每一位数字建一整列滚动 view，位数极端时内存暴涨会被系统杀掉（也是闪退），
@@ -1664,38 +1607,217 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     return fen > kMaxFen ? kMaxFen : fen;
 }
 
+// 详情页（我的零钱 / 零钱通）余额大数字有两种可能载体：
+//   WCPayBalanceDetailViewController.h:14 balanceTitleLabel（UILabel）
+//   WCPayBalanceDetailViewController.h:46 / WCPayLQTDetailViewController.h:54 timeoutNumber（TimeoutNumber）
+// 上面只 hook TimeoutNumber 的 updateNumber: 在详情页没生效，说明详情页走的是别的赋值入口，
+// 或主数字干脆就是 balanceTitleLabel 这个 UILabel。所以这俩载体都要接管。
+//
+// 下面这个工具：把文本里第一个金额 token 换成自定义值（分），保留原格式（¥ 前缀 / 小数位 / 千分位）。
+// 找不到任何金额就返回原串，绝不破坏其它文本。证据：用户最初截图「我的零钱 ¥2.40」「零钱通 ¥0.10」。
+static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fen) {
+    if (!text.length) return text;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"[¥￥]\\s*\\d[\\d,]*(\\.\\d+)?" options:0 error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
+    if (!m || m.range.location == NSNotFound) {
+        re = [NSRegularExpression regularExpressionWithPattern:@"\\d[\\d,]*(\\.\\d+)?" options:0 error:nil];
+        m = [re firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
+    }
+    if (!m || m.range.location == NSNotFound) return text;
+    NSRange r = m.range;
+    NSString *num = [text substringWithRange:r];
+    BOOL sym = ([num hasPrefix:@"¥"] || [num hasPrefix:@"￥"]);
+    NSString *core = sym ? [num substringFromIndex:1] : num;
+    core = [core stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    BOOL comma = ([core rangeOfString:@","].location != NSNotFound);
+    NSInteger dec = 0;
+    NSRange dot = [core rangeOfString:@"."];
+    if (dot.location != NSNotFound) dec = (NSInteger)core.length - (NSInteger)dot.location - 1;
+    if (dec < 0) dec = 0; if (dec > 6) dec = 6;
+    unsigned long long scaled = fen;
+    if (dec > 2) { for (int i = 0; i < dec - 2; i++) scaled *= 10; }
+    else { for (int i = 0; i < 2 - dec; i++) scaled /= 10; }
+    unsigned long long ip = scaled / (unsigned long long)pow(10, dec);
+    unsigned long long fp = scaled % (unsigned long long)pow(10, dec);
+    NSMutableString *ipStr = [NSMutableString stringWithFormat:@"%llu", ip];
+    if (comma) {
+        NSMutableString *tmp = [NSMutableString string];
+        NSInteger c = 0;
+        for (NSInteger i = (NSInteger)ipStr.length - 1; i >= 0; i--) {
+            [tmp insertString:[ipStr substringWithRange:NSMakeRange(i, 1)] atIndex:0];
+            if (++c % 3 == 0 && c < (NSInteger)ipStr.length) [tmp insertString:@"," atIndex:0];
+        }
+        ipStr = tmp;
+    }
+    NSString *newNum = dec > 0 ? [NSString stringWithFormat:@"%@.%0*llu", ipStr, (int)dec, fp] : [ipStr copy];
+    if (sym) newNum = [@"¥" stringByAppendingString:newNum];
+    NSMutableString *out = [text mutableCopy];
+    [out replaceCharactersInRange:r withString:newNum];
+    return out;
+}
 
-#pragma mark - ④ 余额显示修改（最小可证实现）
+// 详情页（我的零钱）余额 UILabel 改写：refreshViewWithData: / updateBalanceTitleLabel 之后，
+// 把 balanceTitleLabel.text 的金额换成自定义值。只动这一个 label，不碰其它文本，避免误伤"昨日收益"等小字。
+// ⚠️ 必须定义在 %hook 块【外面】：Logos 的 %hook 会把方法展开成 C 函数，里面写 static 函数会变成非法嵌套。
+static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hit) {
+    @try {
+        if (![vc respondsToSelector:@selector(balanceTitleLabel)]) return;
+        id lb = [vc balanceTitleLabel];
+        if (![lb isKindOfClass:[UILabel class]]) return;
+        NSString *t = ((UILabel *)lb).text;
+        if (!t.length) return;
+        NSString *nt = DDBalanceRewriteMoneyText(t, fen);
+        if (![nt isEqualToString:t]) { ((UILabel *)lb).text = nt; DDJokerHit(hit); }
+    } @catch (NSException *e) {}
+}
 
-// 实证（用户视图层级截图 + DD小丑.txt 手势版对照）：
-//   钱包页「我的零钱 ¥2.40」「零钱通 ¥0.10」大数字层级 = KindaUIView → TimeoutNumber → ScrollNumber
-//   DD小丑.txt（手势版）仅 hook TimeoutNumber.updateNumber: 一个方法即可改余额显示 → 已验证可用。
-// 我们之前 hook 了一大堆（ScrollNumber 的 currentNumber getter / setCurrentNumber: / defaultNumber:、
-// TimeoutNumber 的 defaultNumber:/updateNumberInternal:/setNoAnimationStart:/updateScrollNumber/layoutSubviews、
-// 以及 WCPayBalanceInfo / WCPayLQTInfo 等数据源 getter），结果互相干扰、被微信二次覆盖回真值——
-// 日志里 updateNumber:/setCurrentNumber: 都注入了 600/300，屏幕却仍显示真值就是铁证。
-// 收敛到最小集：只在这一步把值换成自定义值。WeChat 拿到服务端数据后必然调 updateNumber:，
-// 我们改掉后无论它内部走 ScrollNumber 还是 updateScrollNumber，最终落到的值都是我们覆盖后的。
-// 判定仍用 DDBalancePageKindOf（白名单 VC 内才动手，倒计时等非钱包控件一律 %orig），零钱/零钱通分别取值。
-%hook TimeoutNumber
+
+#pragma mark - ④ 余额显示修改（锚定爱锋 wechatku.dylib 真反汇编：只读 getter 接管）
+
+// 爱锋 wechatku.dylib 反汇编实证（hooks_final.json + stubmap 反汇编）：
+//   ScrollNumber 挂了 4 个 hook：
+//     currentNumber        (getter, 0xbecc4) —— 只读入口：每次渲染都读它
+//     updateNumber:        (0xbed30)          —— 写入口（替换传入值）
+//     defaultNumber:       (0xbeda4)          —— 写入口（初始化值）
+//     isLQT                (%new, 0xbe820)     —— 运行时判定"这是不是零钱通数字"
+//   TimeoutNumber 只挂了 layoutSubviews (0xbe624)：%orig 之后调 [self updateScrollNumber] 强制重绘。
+//
+//   关键结论：爱锋【不 hook 任何 TimeoutNumber 写方法】，而是直接打 ScrollNumber 这一叶渲染层，
+//            并且最重要的是 hook 了 currentNumber getter（读路径）。无论微信走哪条写路径
+//            （updateNumber:/defaultNumber:/setCurrentNumber:），最终渲染都读 getter ——
+//            在读路径把真值换成自定义值，就永远赢，不存在"被二次覆盖回真值"。
+//
+//   这正是我们之前一直失败的根因：我们打的是 TimeoutNumber 的写方法（写路径），
+//   而详情页的大数字由 ScrollNumber 直接持有/渲染，且详情页走的是 ScrollNumber.setCurrentNumber:
+//   这条写路径（见 ScrollNumber.h:39 前向声明注释），它根本不经过我们 hook 的 TimeoutNumber 四个方法，
+//   于是详情页只看到 %orig 真值。之前还加了"只详情页生效"的白名单（DDIsWalletBalancePage），但 hook 的类错了，
+//   缩窄白名单也没用 —— 真问题是"插在写路径、且插错了类"。
+//
+//   对齐爱锋：不再用任何页面白名单 / VC 类名判定。区分"余额还是零钱通"完全靠
+//   DDScrollNumberIsLQT —— 在 ScrollNumber 附近视图树里找"零钱通"字样（等价爱锋 isLQT @0xbe820）。
+//   因此主页卡片、我的零钱详情、零钱通详情统统走同一条逻辑；且因为打的是 getter 读路径，
+//
+//   ⚠️ getter 每帧都会调，绝不能打日志/计数（会刷屏+掉帧），计数只放在写入口 hook 里。
+
+%hook ScrollNumber
+- (unsigned long long)currentNumber {
+    unsigned long long orig = %orig;
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (!cfg.balanceEnabled) return orig;
+        // 对齐爱锋：不查白名单、不依赖 VC 类名，直接按附近"零钱通"字样选值（见 DDScrollNumberIsLQT）
+        if (DDScrollNumberIsLQT(self)) {
+            if ([cfg hasLingtongValue]) return DDClampFen(DDLingtongFenValue());
+        } else {
+            if ([cfg hasBalanceValue]) return DDClampFen(DDBalanceFenValue());
+        }
+    } @catch (NSException *e) {}
+    return orig;
+}
+
+// 写入口：把真值换成自定义值再 %orig，让滚动动画起点就是自定义值，渲染读 getter 也是自定义值，
+// 不会出现"真值→自定义值"的一帧闪烁。三条写路径全接管（updateNumber:/defaultNumber:/setCurrentNumber:）。
 - (void)updateNumber:(unsigned long long)original {
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
-            DDBalancePageKind kind = DDBalancePageKindOf(self);
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) {
-                DDJokerHit(@"余额.updateNumber.LQT");
-                %orig(DDClampFen(DDLingtongFenValue()));
-                return;
-            }
-            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) {
-                DDJokerHit(@"余额.updateNumber.余额");
-                %orig(DDClampFen(DDBalanceFenValue()));
-                return;
+            if (DDScrollNumberIsLQT(self)) {
+                if ([cfg hasLingtongValue]) { DDJokerHit(@"余额.ScrollNumber.updateNumber.LQT"); %orig(DDClampFen(DDLingtongFenValue())); return; }
+            } else {
+                if ([cfg hasBalanceValue]) { DDJokerHit(@"余额.ScrollNumber.updateNumber.余额"); %orig(DDClampFen(DDBalanceFenValue())); return; }
             }
         }
     } @catch (NSException *e) {}
     %orig(original);
+}
+- (void)defaultNumber:(unsigned long long)original {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled) {
+            if (DDScrollNumberIsLQT(self)) {
+                if ([cfg hasLingtongValue]) { DDJokerHit(@"余额.ScrollNumber.defaultNumber.LQT"); %orig(DDClampFen(DDLingtongFenValue())); return; }
+            } else {
+                if ([cfg hasBalanceValue]) { DDJokerHit(@"余额.ScrollNumber.defaultNumber.余额"); %orig(DDClampFen(DDBalanceFenValue())); return; }
+            }
+        }
+    } @catch (NSException *e) {}
+    %orig(original);
+}
+- (void)setCurrentNumber:(unsigned long long)original {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled) {
+            if (DDScrollNumberIsLQT(self)) {
+                if ([cfg hasLingtongValue]) { DDJokerHit(@"余额.ScrollNumber.setCurrentNumber.LQT"); %orig(DDClampFen(DDLingtongFenValue())); return; }
+            } else {
+                if ([cfg hasBalanceValue]) { DDJokerHit(@"余额.ScrollNumber.setCurrentNumber.余额"); %orig(DDClampFen(DDBalanceFenValue())); return; }
+            }
+        }
+    } @catch (NSException *e) {}
+    %orig(original);
+}
+%end
+
+// TimeoutNumber 这一层不再 hook 写方法（爱锋也不 hook）。只保留 layoutSubviews 兜底：
+// 在布局时强制 [self updateScrollNumber] 把内部数字重新同步到 ScrollNumber，
+// 让刚进详情页、首帧还没赋值时的那一版重绘也走我们的 getter。
+%hook TimeoutNumber
+- (void)layoutSubviews {
+    %orig;
+    @try {
+        // 对齐爱锋 0xbe624：%orig 之后直接 [self updateScrollNumber] 强制重绘，
+        // 不查白名单（爱锋全量生效），让首帧还没赋值时的那一版重绘也走我们的 getter。
+        if ([self respondsToSelector:@selector(updateScrollNumber)])
+            [self updateScrollNumber];
+    } @catch (NSException *e) {}
+}
+%end
+
+// 详情页（我的零钱）UILabel 这一支：数据回来后 refreshViewWithData: 读 WCPayBalanceInfo 把 balanceTitleLabel.text
+// 设成真值。我们在 %orig 之后把那个 label 的文本金额改写成自定义值，作为 ScrollNumber getter 那一支的正交双保险。
+// 只动 balanceTitleLabel 一个 label，不碰其它文本。每次改写都幂等（已是目标值就跳过）。
+%hook WCPayBalanceDetailViewController
+- (void)refreshViewWithData:(id)arg {
+    %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled && [cfg hasBalanceValue])
+        DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()), @"余额.详情UILabel.余额");
+}
+- (void)updateBalanceTitleLabel {
+    %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled && [cfg hasBalanceValue])
+        DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()), @"余额.详情UILabel.余额");
+}
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (!(cfg.balanceEnabled && [cfg hasBalanceValue])) return;
+    // 数据可能在 viewWillAppear 之后才补齐（首帧先画真值），延迟重试一次，幂等无副作用。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try { DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()), @"余额.详情UILabel.余额"); } @catch (NSException *e) {}
+    });
+}
+%end
+
+// 详情页（零钱通）：主余额由上面 ScrollNumber getter（读路径）接管；
+// 这里再补一道 UILabel 兜底——万一它的余额也走了 balanceTitleLabel 这个 label，刷新后一并改写。
+%hook WCPayLQTDetailViewController
+- (void)refreshViewWithData:(id)arg {
+    %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled && [cfg hasLingtongValue])
+        DDBalancePatchTitleLabel(self, DDClampFen(DDLingtongFenValue()), @"余额.详情UILabel.LQT");
+}
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (!(cfg.balanceEnabled && [cfg hasLingtongValue])) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try { DDBalancePatchTitleLabel(self, DDClampFen(DDLingtongFenValue()), @"余额.详情UILabel.LQT"); } @catch (NSException *e) {}
+    });
 }
 %end
 
