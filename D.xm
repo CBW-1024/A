@@ -603,10 +603,7 @@ static double DDShowingTimeOf(id vm) {
 
 static void DDSetShowingTime(id vm, double ts) {
     Ivar iv = DDShowingTimeIvarOf(vm);
-    if (!iv) {
-        return;
-    }
-    double old = *(double *)((uint8_t *)(__bridge void *)vm + ivar_getOffset(iv));
+    if (!iv) return;
     *(double *)((uint8_t *)(__bridge void *)vm + ivar_getOffset(iv)) = ts;
 }
 
@@ -1412,8 +1409,7 @@ static double DDTimeStampFromString(NSString *s) {
     [alert addCancelBtnTitle:@"取消" handler:^{ blockAlert = nil; }];
     [alert addBtnTitle:@"确定" handler:^{
         NSString *raw = blockAlert ? [blockAlert getTextFieldText] : nil;
-        BOOL fromField = NO;
-        if (!raw.length) { raw = inputField.text; fromField = YES; }   // alert 提前释放时的兜底取值路径
+        if (!raw.length) raw = inputField.text;   // alert 提前释放时的兜底取值路径
         NSString *t = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         double ts = DDTimeStampFromString(t);
         if (ts > 0) {
