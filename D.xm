@@ -2,6 +2,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <substrate.h>
+#include <string.h>     // strcmp（诊断段判断 ivar 类型编码用到）
 
 #pragma mark - 微信类声明
 
@@ -216,6 +217,7 @@ static NSString * const kDDFeatureTimeEnabled = @"DDFeatureTimeEnabled";
 static NSString * const kDDFeatureBalanceEnabled = @"DDFeatureBalanceEnabled";
 static NSString * const kDDFeatureStepsEnabled = @"DDFeatureStepsEnabled";
 static NSString * const kDDFeatureContactsEnabled = @"DDFeatureContactsEnabled";
+static NSString * const kDDFeatureDiagEnabled = @"DDFeatureDiagEnabled";
 
 static NSString * const kDDStepsValueStringKey = @"DDStepsValueString";
 static NSString * const kDDContactsCountValueKey = @"DDContactsCountValue";
@@ -231,6 +233,8 @@ static NSString * const kDDLingtongValueKey = @"DDLingtongValue";
 @property (nonatomic) BOOL balanceEnabled;
 @property (nonatomic) BOOL stepsEnabled;
 @property (nonatomic) BOOL contactsEnabled;
+// 诊断日志开关（默认开）：关掉后所有 DDLOG 直接返回，避免高频 hook 刷爆日志
+@property (nonatomic) BOOL diagEnabled;
 @property (nonatomic, copy) NSString *stepsValueString;
 @property (nonatomic, copy) NSString *contactsValue;
 @property (nonatomic, copy) NSString *balanceValue;
@@ -243,6 +247,96 @@ static NSString * const kDDLingtongValueKey = @"DDLingtongValue";
 - (void)saveSteps;
 - (void)saveContacts;
 @end
+
+#pragma mark - 诊断日志（核心）
+
+// 定位"改了不生效"这类问题的唯一可靠办法是把运行时状态打出来。
+// 设计：DDLOG 同时写 NSLog（连 Xcode/Console 能看到）和内存缓冲（设置页"导出诊断日志"导出成文件）；
+// 内存缓冲按 30 万字符做环形截断，避免聊天页长时间挂着把内存吃满。
+
+// strcasestr 在 iOS SDK 里不一定声明（-Werror 下隐式声明直接报错），自己实现一份大小写无关的包含判断
+static BOOL DDStringHas(const char *haystack, const char *needle) {
+    if (!haystack || !needle || !*needle) return NO;
+    NSString *h = [[NSString stringWithUTF8String:haystack] lowercaseString];
+    NSString *n = [[NSString stringWithUTF8String:needle] lowercaseString];
+    return (h && n) ? ([h rangeOfString:n].location != NSNotFound) : NO;
+}
+
+static NSDateFormatter *DDLogTimeFormatter(void) {
+    static NSDateFormatter *fmt = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        fmt.dateFormat = @"HH:mm:ss.SSS";
+    });
+    return fmt;
+}
+
+static NSMutableString *DDLogBuffer(void) {
+    static NSMutableString *buf = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ buf = [NSMutableString string]; });
+    return buf;
+}
+
+static NSMutableDictionary *DDLogHits(void) {
+    static NSMutableDictionary *hits = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ hits = [NSMutableDictionary dictionary]; });
+    return hits;
+}
+
+static void DDJokerLog(NSString *fmt, ...) {
+    if (![DDGlobalConfig shared].diagEnabled) return;
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSString *line = [NSString stringWithFormat:@"%@  %@",
+                      [DDLogTimeFormatter() stringFromDate:[NSDate date]], msg];
+    NSLog(@"[DD小丑] %@", line);
+    NSMutableString *buf = DDLogBuffer();
+    @synchronized (buf) {
+        [buf appendFormat:@"%@\n", line];
+        if (buf.length > 300000) {
+            [buf deleteCharactersInRange:NSMakeRange(0, buf.length - 200000)];   // 只留最近 20 万字符
+        }
+    }
+}
+
+#define DDLOG(...) DDJokerLog(__VA_ARGS__)
+
+// 命中计数：计数本身不受诊断开关影响（便宜），只有"打日志"受开关控制。
+// timeText 这种每次重绘都走的 hook 只打前 3 次和每 50 次，总次数留到导出时一次性列出。
+static void DDJokerHit(NSString *tag) {
+    NSMutableDictionary *hits = DDLogHits();
+    NSInteger n = 0;
+    @synchronized (hits) {
+        n = [hits[tag] integerValue] + 1;
+        hits[tag] = @(n);
+    }
+    if (n <= 3 || n % 50 == 0) DDLOG(@"HIT %@ 第 %ld 次", tag, (long)n);
+}
+
+// 导出前先清空，可以得到一份"只含本次复现步骤"的干净日志
+static void DDJokerClearDiagLog(void) {
+    NSMutableString *buf = DDLogBuffer();
+    @synchronized (buf) { [buf setString:@""]; }
+    NSMutableDictionary *hits = DDLogHits();
+    @synchronized (hits) { [hits removeAllObjects]; }
+}
+
+static NSString *DDJokerDescribeHitStats(void) {
+    NSMutableDictionary *hits = DDLogHits();
+    if (!hits.count) return @"  (还没有任何 hook 被触发)\n";
+    NSMutableString *s = [NSMutableString string];
+    NSArray *keys = [hits keysSortedByValueUsingSelector:@selector(compare:)];
+    for (NSString *k in keys) {
+        [s appendFormat:@"  %-46s : %@ 次\n", [k UTF8String], hits[k]];
+    }
+    return s;
+}
 
 #pragma mark - ① 聊天文字/图片/转账修改
 
@@ -422,18 +516,46 @@ static void DDJokerSetCachedAmount(CMessageWrap *msg, NSString *amount) {
 //   → ivar_getOffset → str/ldr d8, [x19, x0]（@0xcd014 写 / @0xcd078 读）
 // 全程不走 setShowingTime: —— 实测 setter 改不动时间条的显示，必须直接改 ivar 才生效。
 // （_showingTime 这个 ivar 名来自反汇编里 class_getInstanceVariable 的实参字符串 @0x114f19）
+// 先按名字精确找 _showingTime；找不到就退回模糊匹配（真身名字可能随版本变了），
+// 实在找不到返回 NULL —— 这种情况导出日志里的 ivar 列表会直接给出正确答案。
+static Ivar DDShowingTimeIvarOf(id vm) {
+    if (!vm) return NULL;
+    Class cls = [vm class];
+    Ivar iv = class_getInstanceVariable(cls, "_showingTime");
+    if (iv) return iv;
+    // 沿父类链找"名字里带 showingtime 的 double ivar"
+    Class c = cls;
+    while (c && !iv) {
+        unsigned int n = 0;
+        Ivar *list = class_copyIvarList(c, &n);
+        for (unsigned int i = 0; i < n; i++) {
+            const char *nm = ivar_getName(list[i]) ?: "";
+            const char *ty = ivar_getTypeEncoding(list[i]) ?: "";
+            if (strcmp(ty, "d") == 0 && DDStringHas(nm, "showingtime")) { iv = list[i]; break; }
+        }
+        free(list);
+        c = class_getSuperclass(c);
+    }
+    if (iv) DDLOG(@"_showingTime 精确匹配失败，模糊命中 %s（类 %s）", ivar_getName(iv), class_getName(cls));
+    return iv;
+}
+
 static double DDShowingTimeOf(id vm) {
-    if (!vm) return 0.0;
-    Ivar iv = class_getInstanceVariable([vm class], "_showingTime");
+    Ivar iv = DDShowingTimeIvarOf(vm);
     if (!iv) return 0.0;
     return *(double *)((uint8_t *)(__bridge void *)vm + ivar_getOffset(iv));
 }
 
 static void DDSetShowingTime(id vm, double ts) {
-    if (!vm) return;
-    Ivar iv = class_getInstanceVariable([vm class], "_showingTime");
-    if (!iv) return;
+    Ivar iv = DDShowingTimeIvarOf(vm);
+    if (!iv) {
+        DDLOG(@"写 showingTime 失败：vm=%p 找不到 _showingTime ivar（见导出日志的 ivar 列表）", vm);
+        return;
+    }
+    double old = *(double *)((uint8_t *)(__bridge void *)vm + ivar_getOffset(iv));
     *(double *)((uint8_t *)(__bridge void *)vm + ivar_getOffset(iv)) = ts;
+    DDLOG(@"写 showingTime vm=%p ivar=%s offset=%td : %.3f -> %.3f",
+          vm, ivar_getName(iv), ivar_getOffset(iv), old, ts);
 }
 
 // 时间条没有消息身份时，只能用 showingTime 当 key。但我们改时间会直接改写这个 ivar，
@@ -491,6 +613,156 @@ static void DDJokerClearAllMessageCache(void) {
     NSString *dir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
     NSString *folder = [dir stringByAppendingPathComponent:@"DDJokerImages"];
     [[NSFileManager defaultManager] removeItemAtPath:folder error:nil];
+}
+
+// 导出日志时用的"最近一条时间条"：弱引用，vm 被释放自动置 nil，不会延长生命周期
+static __weak id gDDLastTimeVM = nil;
+
+// DDTimeStringForDisplay 定义在后面的「①c 聊天时间修改」段，这里先声明（-Werror 不允许隐式声明）
+static NSString *DDTimeStringForDisplay(double ts);
+
+static NSString *DDTimeDesc(double ts) {
+    if (ts <= 0) return @"0 (无效)";
+    return [NSString stringWithFormat:@"%.3f  %@", ts, [NSDate dateWithTimeIntervalSince1970:ts]];
+}
+
+// 把一个类的 ivar / 方法 / 父类链全部打出来 —— 用来确认 _showingTime 在当前微信版本里到底叫什么
+static NSString *DDJokerDescribeClassIvars(Class cls) {
+    NSMutableString *s = [NSMutableString string];
+    if (!cls) return @"  (类不存在：dump 里的类名在当前微信版本变了)\n";
+    [s appendFormat:@"  类名    : %s\n", class_getName(cls)];
+
+    NSMutableArray *chain = [NSMutableArray array];
+    Class sup = class_getSuperclass(cls);
+    while (sup) { [chain addObject:[NSString stringWithUTF8String:class_getName(sup)]]; sup = class_getSuperclass(sup); }
+    [s appendFormat:@"  父类链  : %@\n", chain.count ? [chain componentsJoinedByString:@" → "] : @"(无)"];
+
+    unsigned int n = 0;
+    Ivar *list = class_copyIvarList(cls, &n);
+    [s appendFormat:@"  ivar 数 : %u\n", n];
+    for (unsigned int i = 0; i < n; i++) {
+        Ivar iv = list[i];
+        [s appendFormat:@"    [%02u] %-32s type=%-8s offset=%td\n",
+         i, ivar_getName(iv) ?: "", ivar_getTypeEncoding(iv) ?: "", ivar_getOffset(iv)];
+    }
+    free(list);
+
+    Ivar hit = class_getInstanceVariable(cls, "_showingTime");
+    if (hit) {
+        [s appendFormat:@"  _showingTime : 命中，offset=%td\n", ivar_getOffset(hit)];
+    } else {
+        [s appendString:@"  _showingTime : 未命中（名字变了！以下父类链里所有带 time 的 ivar 是候选）\n"];
+        Class c = cls;
+        while (c) {
+            unsigned int k = 0;
+            Ivar *ivs = class_copyIvarList(c, &k);
+            for (unsigned int i = 0; i < k; i++) {
+                const char *nm = ivar_getName(ivs[i]) ?: "";
+                if (DDStringHas(nm, "time")) {
+                    [s appendFormat:@"      候选 [%s] %-28s type=%-8s offset=%td\n",
+                     class_getName(c), nm, ivar_getTypeEncoding(ivs[i]) ?: "", ivar_getOffset(ivs[i])];
+                }
+            }
+            free(ivs);
+            c = class_getSuperclass(c);
+        }
+    }
+
+    unsigned int m = 0;
+    Method *ms = class_copyMethodList(cls, &m);
+    [s appendFormat:@"  方法数  : %u（只列名字含 time/date 的）\n", m];
+    for (unsigned int i = 0; i < m; i++) {
+        SEL sel = method_getName(ms[i]);
+        const char *nm = sel_getName(sel) ?: "";
+        if (DDStringHas(nm, "time") || DDStringHas(nm, "date")) {
+            [s appendFormat:@"    - %-34s %s\n", nm, method_getTypeEncoding(ms[i]) ?: ""];
+        }
+    }
+    free(ms);
+    return s;
+}
+
+static NSString *DDJokerDescribeTimeVM(id vm) {
+    if (!vm) return @"  (还没触发过 ChatTimeViewModel.timeText：先打开一个聊天页滚动几下再导出)\n";
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"  vm=%p  类=%s\n", vm, class_getName([vm class])];
+    [s appendFormat:@"  showingTime 当前值 : %@\n", DDTimeDesc(DDShowingTimeOf(vm))];
+    [s appendFormat:@"  原始 showingTime   : %@\n", DDTimeDesc(DDRawShowingTimeOf(vm))];
+    [s appendFormat:@"  时间 key           : %@\n", DDJokerTimeKey(vm)];
+    NSNumber *cached = DDJokerCachedTime(vm);
+    [s appendFormat:@"  缓存命中           : %@\n",
+     cached ? [NSString stringWithFormat:@"%@ → 显示 %@", DDTimeDesc([cached doubleValue]),
+                                         DDTimeStringForDisplay([cached doubleValue])] : @"无"];
+    return s;
+}
+
+// 缓存盘点：顺带回答"清理之后到底有没有残留"
+static NSString *DDJokerDescribeCaches(void) {
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    NSMutableString *s = [NSMutableString string];
+    NSDictionary *time = [def dictionaryForKey:kDDJokerTimeCacheKey];
+    NSDictionary *text = [def dictionaryForKey:kDDJokerTextCacheKey];
+    NSDictionary *amount = [def dictionaryForKey:kDDJokerAmountCacheKey];
+    NSDictionary *origin = [def dictionaryForKey:kDDJokerTextOriginalKey];
+    [s appendFormat:@"  时间缓存 %lu 条 : %@\n", (unsigned long)time.count, time ?: @{}];
+    [s appendFormat:@"  文字缓存 %lu 条\n", (unsigned long)text.count];
+    [s appendFormat:@"  金额缓存 %lu 条\n", (unsigned long)amount.count];
+    [s appendFormat:@"  原文备份 %lu 条（清理缓存时刻意保留，用于文字还原）\n", (unsigned long)origin.count];
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *folder = [dir stringByAppendingPathComponent:@"DDJokerImages"];
+    NSArray *imgs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:folder error:nil];
+    [s appendFormat:@"  替换图片目录 %@ : %lu 个文件\n", folder, (unsigned long)imgs.count];
+    return s;
+}
+
+static NSString *DDJokerExportLogText(void) {
+    NSMutableString *out = [NSMutableString string];
+    [out appendString:@"===== DD小丑助手 诊断日志 =====\n"];
+
+    NSDateFormatter *f = [[NSDateFormatter alloc] init];
+    f.locale = [NSLocale localeWithLocaleIdentifier:@"zh_CN"];
+    f.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    [out appendFormat:@"导出时间 : %@\n", [f stringFromDate:[NSDate date]]];
+    [out appendFormat:@"系统版本 : %@ %@\n", [UIDevice currentDevice].systemName, [UIDevice currentDevice].systemVersion];
+    NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
+    [out appendFormat:@"微信版本 : %@ (%@)\n", info[@"CFBundleShortVersionString"], info[@"CFBundleVersion"]];
+
+    DDGlobalConfig *c = [DDGlobalConfig shared];
+    [out appendFormat:@"开关状态 : 文字=%d 图片=%d 时间=%d 转账=%d 诊断=%d\n",
+     c.textEnabled, c.imageEnabled, c.timeEnabled, c.transferEnabled, c.diagEnabled];
+    [out appendString:@"复现步骤 : 清空日志 → 进聊天页复现问题（改时间/改文字/改金额）→ 回本页导出，把日志发出去即可定位\n"];
+
+    [out appendString:@"\n----- hook 命中统计 -----\n"];
+    [out appendString:DDJokerDescribeHitStats()];
+
+    [out appendString:@"\n----- 缓存盘点 -----\n"];
+    [out appendString:DDJokerDescribeCaches()];
+
+    [out appendString:@"\n----- ChatTimeViewModel 运行时结构 -----\n"];
+    [out appendString:DDJokerDescribeClassIvars(NSClassFromString(@"ChatTimeViewModel"))];
+
+    [out appendString:@"\n----- 最近一条时间条 -----\n"];
+    [out appendString:DDJokerDescribeTimeVM(gDDLastTimeVM)];
+
+    [out appendString:@"\n----- 日志正文 -----\n"];
+    NSMutableString *buf = DDLogBuffer();
+    NSString *body = @"";
+    @synchronized (buf) { body = [buf copy]; }
+    [out appendString:body.length ? body : @"(空：诊断开关没开，或还没触发过相关 hook)\n"];
+    return out;
+}
+
+// 写到微信 Documents（Filza / 文件 App 可直接取），路径同步进剪贴板
+static NSString *DDJokerWriteDiagLog(void) {
+    NSString *text = DDJokerExportLogText();
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    if (!dir.length) return nil;
+    NSString *path = [dir stringByAppendingPathComponent:@"DDJokerDiag.log"];
+    NSError *err = nil;
+    [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
+    if (err) { NSLog(@"[DD小丑] 写诊断日志失败: %@", err); return nil; }
+    [[UIPasteboard generalPasteboard] setString:path];
+    return path;
 }
 
 // iOS 15+ 起 UIApplication.windows 已废弃，改用 UIWindowScene.windows（按 iOS 18 编译，不做低版本判断）
@@ -685,6 +957,9 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
     NSString *editorMessage = isTransfer ? @"请输入需要修改的金额\n留空还原" : @"请输入需要修改的文字\n留空还原";
     WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:editorTitle message:editorMessage];
     if (!alert) return;
+    DDJokerHit(isTransfer ? @"JokerPresentEditor:转账" : @"JokerPresentEditor:文字");
+    DDLOG(@"打开修改弹窗 cell=%s 转账=%d key=%@ 当前值=%@",
+          class_getName([cell class]), isTransfer, DDJokerMessageKey(msg), current);
     [alert showTextFieldWithMaxLen:1000];
     [alert setTextFieldDefaultText:current];
 
@@ -699,6 +974,7 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
         NSString *raw = blockAlert ? [blockAlert getTextFieldText] : nil;
         if (!raw.length) raw = inputField.text;
         NSString *newText = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        DDLOG(@"%@弹窗确定：输入=[%@] key=%@", isTransfer ? @"转账" : @"文字", newText, DDJokerMessageKey(msg));
         if (newText.length) {
             if ([newText isEqualToString:current]) { blockAlert = nil; return; }   // 没改动
             if (isTransfer) {
@@ -714,6 +990,7 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
             // 文字走数据层，DDJokerApplyTextOverride 会用 DDJokerTextOriginal 里的备份写回 m_nsContent。
             if (isTransfer) DDJokerSetCachedAmount(msg, nil);
             else DDJokerSetCachedText(msg, nil);
+            DDLOG(@"  → 留空还原，已清缓存 key=%@", DDJokerMessageKey(msg));
             JokerReloadCellAfterReplace(vc, msg, cell);
         }
         blockAlert = nil;   // 打破 alert -> handler -> alert 的保留环
@@ -756,11 +1033,16 @@ static void DDJokerApplyTextOverride(CMessageWrap *msg) {
     }
     NSString *cached = [DDGlobalConfig shared].textEnabled ? DDJokerCachedText(msg) : nil;
     NSString *target = cached ?: original;
-    if (target.length && ![target isEqualToString:msg.m_nsContent]) [msg setM_nsContent:target];
+    if (target.length && ![target isEqualToString:msg.m_nsContent]) {
+        DDLOG(@"文字数据层写入 key=%@ 有覆盖=%d : [%@] -> [%@]",
+              DDJokerMessageKey(msg), cached != nil, msg.m_nsContent, target);
+        [msg setM_nsContent:target];
+    }
 }
 
 %hook TextMessageViewModel
 - (NSString *)contentText {
+    DDJokerHit(@"TextMessageViewModel.contentText");
     DDJokerApplyTextOverride(self.messageWrap);   // 爱锋 @0xba15c：先改 model 再取 %orig
     NSString *origin = %orig;
     if (![DDGlobalConfig shared].textEnabled) return origin;
@@ -801,6 +1083,7 @@ static void JokerInvalidateAllLayout(void) {
     }
 }
 - (id)getTextString {
+    DDJokerHit(@"TextMessageCellView.getTextString");
     CMessageWrap *msg = JokerGetMessageWrapFromCell(self);
     DDJokerApplyTextOverride(msg);   // 爱锋 @0xbcb80：getTextString 里同样先改 model，复制/转发取到的是改后文本
     id origin = %orig;
@@ -884,12 +1167,16 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 // 命中的是金额正则段，文本里没有金额时原样返回。
 %hook WCPayTransferMessageViewModel
 - (NSString *)titleText {
+    DDJokerHit(@"WCPayTransferMessageViewModel.titleText");
     NSString *origin = %orig;
     if (![DDGlobalConfig shared].transferEnabled) return origin;
     NSString *cached = DDJokerCachedAmount(self.messageWrap);
-    return cached ? DDTransferReplaceAmountInText(origin, cached) : origin;
+    NSString *out = cached ? DDTransferReplaceAmountInText(origin, cached) : origin;
+    DDLOG(@"转账 titleText 原文=%@ 缓存=%@ 结果=%@", origin, cached ?: @"无", out);
+    return out;
 }
 - (NSString *)descText {
+    DDJokerHit(@"WCPayTransferMessageViewModel.descText");
     NSString *origin = %orig;
     if (![DDGlobalConfig shared].transferEnabled) return origin;
     NSString *cached = DDJokerCachedAmount(self.messageWrap);
@@ -1095,21 +1382,51 @@ static NSString *DDTimeStringForDisplay(double ts) {
 // 不再读微信 origin（避免相对时间 origin 让绝对日期丢失），与爱锋 timeText @0xba2d0 思路一致。
 %hook ChatTimeViewModel
 - (NSString *)timeText {
+    static long calls = 0;
+    static BOOL dumped = NO;
+    calls++;
+
+    gDDLastTimeVM = self;   // 供设置页导出日志时取"最近一条时间条"
+    DDJokerHit(@"ChatTimeViewModel.timeText");
+
+    if (!dumped) {
+        dumped = YES;
+        DDLOG(@"ChatTimeViewModel 首次出现，运行时结构:\n%@", DDJokerDescribeClassIvars([self class]));
+    }
+
     // 先取一次原始 showingTime：首次调用时它还没被改写，正好把 key 钉在原始值上
     double raw = DDRawShowingTimeOf(self);
+    double now = DDShowingTimeOf(self);
     NSNumber *ts = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(self) : nil;
+    BOOL verbose = (calls <= 3 || calls % 50 == 0);
+    if (verbose || ts) {
+        DDLOG(@"timeText vm=%p 开关=%d key=%@ 原始=%.3f 当前=%.3f 缓存=%@",
+              self, [DDGlobalConfig shared].timeEnabled, DDJokerTimeKey(self),
+              raw, now, ts ? [NSString stringWithFormat:@"%.3f", [ts doubleValue]] : @"无");
+    }
     if (!ts) {
         // 关开关 / 清过缓存：showingTime 还停在上一次的覆盖值上，不还原就回不到真实时间
-        if (raw > 0 && DDShowingTimeOf(self) != raw) DDSetShowingTime(self, raw);
-        return %orig;
+        if (raw > 0 && now != raw) DDSetShowingTime(self, raw);
+        NSString *o = %orig;
+        if (verbose) DDLOG(@"  → 走原始 timeText = %@", o);
+        return o;
     }
     NSString *s = DDTimeStringForDisplay([ts doubleValue]);
+    if (verbose) DDLOG(@"  → 走覆盖 timeText = %@", s);
     return s.length ? s : %orig;
+}
+// 改时间后微信重算时间条就走这里，打出来才能确认"改了没反应"到底卡在哪一步
+- (void)updateLayouts {
+    DDJokerHit(@"ChatTimeViewModel.updateLayouts");
+    DDLOG(@"updateLayouts vm=%p 前 showingTime=%@", self, DDTimeDesc(DDShowingTimeOf(self)));
+    %orig;
+    DDLOG(@"updateLayouts vm=%p 后 showingTime=%@", self, DDTimeDesc(DDShowingTimeOf(self)));
 }
 %end
 
 %hook ChatTimeCellView
 - (id)initWithViewModel:(id)vm {
+    DDJokerHit(@"ChatTimeCellView.initWithViewModel:");
     id r = %orig;
     // vm 先存起来：弹窗时要用它读 showingTime 和写缓存
     objc_setAssociatedObject(r, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1117,13 +1434,20 @@ static NSString *DDTimeStringForDisplay(double ts) {
     return r;
 }
 - (void)setViewModel:(id)vm {
+    DDJokerHit(@"ChatTimeCellView.setViewModel:");
     %orig;
     objc_setAssociatedObject(self, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [self dk_installTimeEditGesture];
 }
+// 时间条最终重画就走这里（ChatTimeCellView.h:9，返回值 void）。打出来才知道改完是否真的重画了
+- (void)layoutInternal {
+    DDJokerHit(@"ChatTimeCellView.layoutInternal");
+    %orig;
+}
 // 长按手势装在 label 上，而 label 可能晚于 init 才创建，cell 复用时也会换，
 // 所以 didMoveToWindow 里再补一次（爱锋同样 hook 了它，且实现是幂等的）
 - (void)didMoveToWindow {
+    DDJokerHit(@"ChatTimeCellView.didMoveToWindow");
     %orig;
     [self dk_installTimeEditGesture];
 }
@@ -1149,7 +1473,7 @@ static NSString *DDTimeStringForDisplay(double ts) {
 - (void)dk_installTimeEditGesture {
     if (![DDGlobalConfig shared].timeEnabled) return;
     UILabel *label = [self dk_timeLabel];
-    if (!label) return;
+    if (!label) { DDJokerHit(@"dk_installTimeEditGesture:找不到label"); return; }   // 找不到 label 长按就永远不弹窗
     for (UIGestureRecognizer *g in label.gestureRecognizers) {
         if ([g isKindOfClass:[UILongPressGestureRecognizer class]]) return;   // 幂等，不重复装
     }
@@ -1159,10 +1483,12 @@ static NSString *DDTimeStringForDisplay(double ts) {
     lp.allowableMovement = 24;
     lp.cancelsTouchesInView = NO;
     [label addGestureRecognizer:lp];
+    DDJokerHit(@"dk_installTimeEditGesture:已安装");
 }
 %new
 - (void)dk_handleTimeLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
+    DDJokerHit(@"dk_handleTimeLongPress");
     [self dk_showTimeInput];
 }
 %new
@@ -1175,6 +1501,10 @@ static NSString *DDTimeStringForDisplay(double ts) {
     double base = cached ? [cached doubleValue]
                          : DDShowingTimeOf(vm);
     NSString *defaultText = base > 0 ? [DDTimeInputFormatter() stringFromDate:[NSDate dateWithTimeIntervalSince1970:base]] : @"";
+    DDJokerHit(@"dk_showTimeInput");
+    DDLOG(@"打开时间弹窗 vm=%p 缓存=%@ 基准=%@ 预填=%@ 关联vm=%d",
+          vm, cached ?: @"无", DDTimeDesc(base), defaultText,
+          objc_getAssociatedObject(self, &kDDTimeVMKey) == vm);
 
     // 与爱锋一致：微信原生 WCUIAlertView，标题/提示文案都沿用它的（@0xbb174 / @0x6287e8 / @0x628828）
     WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:@"时间修改"
@@ -1190,6 +1520,7 @@ static NSString *DDTimeStringForDisplay(double ts) {
         NSString *raw = a ? [a getTextFieldText] : nil;
         NSString *t = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         double ts = DDTimeStampFromString(t);
+        DDLOG(@"时间弹窗确定：输入=[%@] 解析=%@ vm=%p", t, DDTimeDesc(ts), vm);
         if (ts > 0) {
             // 爱锋 changeTime @0xbb284 的收尾（反汇编实证）：
             //   DKWriteShowingTime @0xccfd8 把新时间戳直接写进 vm 的 showingTime ivar（str d8, [x19, x0]），
@@ -1209,6 +1540,9 @@ static NSString *DDTimeStringForDisplay(double ts) {
             [vm updateLayouts];
             [self layoutInternal];
             [self setNeedsLayout];
+            DDLOG(@"  → 改后 showingTime=%@", DDTimeDesc(DDShowingTimeOf(vm)));
+        } else {
+            DDLOG(@"  → 未改动（输入为空且没有缓存，或解析失败）");
         }
     }];
     [alert show];
@@ -1499,11 +1833,12 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     Class cellCls = %c(WCTableViewCellManager);
 
     WCTableViewSectionManager *chatSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"聊天设置"];
-    chatSection.attributedFooterTitle = [self dd_centeredFooterString:@"聊天文字 / 图片 / 时间 / 转账修改 为独立开关：长按消息弹窗菜单小丑按钮，文字改内容与引用标题、图片替换为相册所选图、时间改显示、转账改金额"];
+    chatSection.attributedFooterTitle = [self dd_centeredFooterString:@"聊天文字 / 图片 / 时间 / 转账修改 为独立开关：长按消息弹窗菜单小丑按钮，文字改内容与引用标题、图片替换为相册所选图、时间改显示、转账改金额。出问题先清空日志→复现→导出，日志里有时间条 ivar 列表与各 hook 命中次数"];
     [chatSection addCell:[cellCls switchCellForSel:@selector(textSwitchChanged:) target:self title:@"聊天文字修改" on:cfg.textEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(timeSwitchChanged:) target:self title:@"聊天时间修改" on:cfg.timeEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(transferSwitchChanged:) target:self title:@"聊天转账修改" on:cfg.transferEnabled]];
+    [chatSection addCell:[cellCls switchCellForSel:@selector(diagSwitchChanged:) target:self title:@"诊断日志" on:cfg.diagEnabled]];
     UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     clearBtn.frame = CGRectMake(0, 0, 52, 34);
     [clearBtn setTitle:@"清理" forState:UIControlStateNormal];
@@ -1515,6 +1850,27 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     UIView *clearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
     [clearRight addSubview:clearBtn];
     [chatSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清除修改缓存" rightView:clearRight]];
+
+    UIButton *exportBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    exportBtn.frame = CGRectMake(0, 0, 52, 34);
+    [exportBtn setTitle:@"导出" forState:UIControlStateNormal];
+    [exportBtn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
+    exportBtn.backgroundColor = [UIColor systemGray5Color];
+    exportBtn.layer.cornerRadius = 6.0;
+    exportBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
+    [exportBtn addTarget:self action:@selector(exportDiagLogTapped:) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *logClearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    logClearBtn.frame = CGRectMake(60, 0, 52, 34);
+    [logClearBtn setTitle:@"清空" forState:UIControlStateNormal];
+    [logClearBtn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
+    logClearBtn.backgroundColor = [UIColor systemGray5Color];
+    logClearBtn.layer.cornerRadius = 6.0;
+    logClearBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
+    [logClearBtn addTarget:self action:@selector(clearDiagLogTapped:) forControlEvents:UIControlEventTouchUpInside];
+    UIView *logRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 112, 34)];
+    [logRight addSubview:exportBtn];
+    [logRight addSubview:logClearBtn];
+    [chatSection addCell:[cellCls normalCellForSel:nil target:nil title:@"导出诊断日志" rightView:logRight]];
     [_tableViewManager addSection:chatSection];
 
     WCTableViewSectionManager *profileSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"资料设置"];
@@ -1630,6 +1986,33 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     JokerInvalidateAllLayout();       // 全量重绘所有聊天页（遍历全部 window 的 VC 树，不再只查单个导航栈）
     [self buildTable];
     [self dd_showDoneToast:@"已清理"];
+}
+
+- (void)diagSwitchChanged:(UISwitch *)sender {
+    [DDGlobalConfig shared].diagEnabled = sender.isOn;
+    [self buildTable];
+}
+
+- (void)clearDiagLogTapped:(id)sender {
+    DDJokerClearDiagLog();
+    [self dd_showDoneToast:@"日志已清空"];
+}
+
+- (void)exportDiagLogTapped:(id)sender {
+    NSString *path = DDJokerWriteDiagLog();
+    if (!path.length) { [self dd_showDoneToast:@"导出失败"]; return; }
+    NSURL *url = [NSURL fileURLWithPath:path];
+    UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    if (av.popoverPresentationController) {   // iPad 必须给一个锚点，否则 present 直接崩
+        UIView *anchor = [sender isKindOfClass:[UIView class]] ? (UIView *)sender : self.view;
+        av.popoverPresentationController.sourceView = anchor;
+        av.popoverPresentationController.sourceRect = anchor.bounds;
+    }
+    __weak DDJokerSettingsViewController *weakSelf = self;
+    av.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *error) {
+        [weakSelf dd_showDoneToast:completed ? @"日志已导出" : @"已取消"];
+    };
+    [self presentViewController:av animated:YES completion:nil];
 }
 
 - (void)dd_showDoneToast:(NSString *)text {
@@ -1787,6 +2170,8 @@ static unsigned long long DDClampFen(unsigned long long fen) {
         _balanceEnabled = [def boolForKey:kDDFeatureBalanceEnabled];
         _stepsEnabled = [def boolForKey:kDDFeatureStepsEnabled];
         _contactsEnabled = [def boolForKey:kDDFeatureContactsEnabled];
+        // 诊断日志默认开：没写过这个 key 时 boolForKey 会返回 NO，这里手动兜成 YES
+        _diagEnabled = [def objectForKey:kDDFeatureDiagEnabled] ? [def boolForKey:kDDFeatureDiagEnabled] : YES;
         _stepsValueString = [def stringForKey:kDDStepsValueStringKey];
         _contactsValue = [def stringForKey:kDDContactsCountValueKey];
         _balanceValue = [def stringForKey:kDDBalanceValueKey];
@@ -1834,6 +2219,12 @@ static unsigned long long DDClampFen(unsigned long long fen) {
 - (void)setContactsEnabled:(BOOL)enabled {
     _contactsEnabled = enabled;
     [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureContactsEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setDiagEnabled:(BOOL)enabled {
+    _diagEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureDiagEnabled];
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
@@ -1916,6 +2307,7 @@ static unsigned long long DDClampFen(unsigned long long fen) {
 
 %ctor {
     @autoreleasepool {
+        DDLOG(@"=== 插件加载 ===");
         WCPluginsMgr *mgr = [%c(WCPluginsMgr) sharedInstance];
         [mgr registerControllerWithTitle:@"DD小丑助手"
                                  version:@"1.0.0"
