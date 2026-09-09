@@ -201,10 +201,36 @@
 // （教训：之前 friendCount 修复就栽过一次，已补 ContactsViewController；这次不能再栽）。
 // ScrollNumber.h:140 / WCPayBalanceDetailViewController.h:140 viewWillAppear: 是 UIViewController 自带的方法，
 // 声明里一行空方法签名即可，重点是让编译器认得这两个类的存在。
+// WCPayBalanceDetailViewController.h 证据链：
+//   :14  -(id) balanceTitleLabel;          ← 我的零钱页顶部那个大数字，是 UILabel，不是 ScrollNumber
+//   :108 -(void) updateBalanceTitleLabel;  ← 刷新它的入口
+//   :71  -(void) refreshViewWithData:(id); ← 数据回来后整体重刷
+// ⚠️ 关键结论：整个 dump 里引用 ScrollNumber 的只有 TimeoutNumber.h（付款码倒计时控件），
+//    余额大数字从来不走 ScrollNumber —— 之前只强刷 ScrollNumber，对我的零钱/零钱通页完全无效。
+//    所以这两个详情页必须走「UILabel 文本改写」这条路。
 @interface WCPayBalanceDetailViewController : UIViewController
+- (id)balanceTitleLabel;              // :14
+- (void)updateBalanceTitleLabel;      // :108
+- (void)refreshViewWithData:(id)arg;  // :71
 @end
 
+// WCPayLQTDetailViewController.h:121 refreshViewWithData:、:166 viewWillAppear:
+// 零钱通详情页没暴露金额 label 属性（主内容由 :89 makeDetailMainContent: 现搭），
+// 所以只能靠视图树兜底 + 数据源层 hook 双管齐下。
 @interface WCPayLQTDetailViewController : UIViewController
+- (void)refreshViewWithData:(id)arg;  // :121
+@end
+
+// 零钱通数据源（此前完全没 hook，这是零钱通页一直显示真值的直接原因）
+// WCPayLQTInfo.h:16 -(unsigned long long)lqtAvailBalance;  :17 -(unsigned long long)lqtTotalBalance;
+@interface WCPayLQTInfo : NSObject
+- (unsigned long long)lqtAvailBalance;   // WCPayLQTInfo.h:16
+- (unsigned long long)lqtTotalBalance;   // WCPayLQTInfo.h:17
+@end
+
+// WCPayLQTDetailControlLogic.h:23 -(long long)lqtBalance;（详情页控制逻辑里另存的一份余额）
+@interface WCPayLQTDetailControlLogic : NSObject
+- (long long)lqtBalance;                 // WCPayLQTDetailControlLogic.h:23
 @end
 
 // WCPayBalanceInfo.h: 服务页顶部"钱包 ¥2.40"读 wallet_balance（getter L28），
@@ -224,6 +250,25 @@
 //    （CI 报过 "no visible @interface ... declares the selector 'view'"）。
 //    Logos 的 %hook 是按【类名】在运行时 hook 的，声明的父类不影响 hook 是否生效。
 @interface WCPayMainViewControllerV2 : UIViewController
+@end
+
+// ⚠️ 关键（用户实机视图层级截图）：名字叫 TimeoutNumber，实机却是【余额大数字的容器】。
+//   【我的零钱 ¥2.40】KindaUIView → TimeoutNumber("我的零钱, 2点4 0元") → ScrollNumber
+//   【零钱通 ¥0.10】KindaUIView("账户余额 0点1 0元") → TimeoutNumber(", 0点1 0元") → ScrollNumber
+// 它是 UIView 子类（:28 layoutSubviews 可证），并在 :18 -(id) scrollNumber; 持有那个 ScrollNumber。
+// 微信在数据回来后走它自己的填数方法把 ScrollNumber 写回真值，
+// 所以只 hook ScrollNumber 会被它二次覆盖 —— 必须把它这一层也接管。
+// 方法签名全部出自 dump 的 TimeoutNumber.h：
+//   :27 -(void) defaultNumber:(unsigned long long);
+//   :37 -(void) setNoAnimationStart:(unsigned long long);   ← "无动画起点"，就是初始显示值
+//   :52 -(void) updateNumber:(unsigned long long);
+//   :53 -(void) updateNumberInternal:(unsigned long long);  ← 内部更新数字
+@interface TimeoutNumber : UIView
+- (void)defaultNumber:(unsigned long long)a0;         // TimeoutNumber.h:27
+- (void)setNoAnimationStart:(unsigned long long)a0;   // TimeoutNumber.h:37
+- (void)updateNumber:(unsigned long long)a0;          // TimeoutNumber.h:52
+- (void)updateNumberInternal:(unsigned long long)a0;  // TimeoutNumber.h:53
+- (id)scrollNumber;                                   // TimeoutNumber.h:18
 @end
 
 // ScrollNumber.h 确认存在：-(void)updateNumber:(unsigned long long); -(void)defaultNumber:(unsigned long long);
@@ -1588,10 +1633,25 @@ static BOOL DDHasLQTBeside(id scrollNumber) {
     return NO;
 }
 
+// 余额/零钱通的判定。⚠️ 判定顺序来自用户实机视图层级截图，不是猜的：
+//   【我的零钱 ¥2.40】KindaUIView → TimeoutNumber("我的零钱, 2点4 0元") → ScrollNumber
+//   【零钱通 ¥0.10】KindaUIView("账户余额 0点1 0元") → TimeoutNumber(", 0点1 0元") → ScrollNumber
+// 两条结论：
+//   ① 余额大数字确实走 ScrollNumber，但被 TimeoutNumber 包着 —— 不能排除它；
+//   ② 零钱通页的 TimeoutNumber 上根本没"零钱通"字样（a11y label 是 ", 0点1 0元"），
+//      所以"旁边有没有零钱通文字"这个判定在详情页不可靠，必须【优先按 VC 类名】定。
 static DDBalancePageKind DDBalancePageKindOf(id obj) {
-    // 不在钱包页就一律不插手：ScrollNumber 是通用滚动数字控件（倒计时 TimeoutNumber 等都在用），
+    UIViewController *vc = DDViewControllerOfView(obj);
+    // 不在钱包页就一律不插手：ScrollNumber 是通用滚动数字控件，
     // 全局改会把无关控件的数值也改掉，这正是"开启余额小丑后闪退"的根因
-    if (!DDIsWalletBalancePage(DDViewControllerOfView(obj))) return DDBalancePageNone;
+    if (!DDIsWalletBalancePage(vc)) return DDBalancePageNone;
+
+    // ① VC 类名最可靠：我的零钱与零钱通是两个独立 VC
+    NSString *cls = NSStringFromClass([vc class]);
+    if ([cls rangeOfString:@"WCPayLQT"].location != NSNotFound) return DDBalancePageLQT;
+    if ([cls rangeOfString:@"WCPayBalanceDetail"].location != NSNotFound) return DDBalancePageBalance;
+
+    // ② 钱包主页 / 服务页上零钱与零钱通是并排两个控件，只能靠旁边的文字区分
     return DDHasLQTBeside(obj) ? DDBalancePageLQT : DDBalancePageBalance;
 }
 
@@ -1601,6 +1661,7 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     const unsigned long long kMaxFen = 99999999999ULL;
     return fen > kMaxFen ? kMaxFen : fen;
 }
+
 
 %hook ScrollNumber
 // 与爱锋一致：isLQT 是自己加的判定方法（爱锋 hooks 里同样标记 "new"），
@@ -1672,50 +1733,242 @@ static unsigned long long DDClampFen(unsigned long long fen) {
 }
 %end
 
-#pragma mark - ④.2 详情页 viewWillAppear 兜底强制刷新
+#pragma mark - ④.1b TimeoutNumber：余额大数字真正的刷新入口（本次核心修复）
 
-// 兜底理由：dump 头文件只列公开方法，抓不到 ScrollNumber 内部 setCurrentNumber→updateNumber 的调用链，
-// 之前只 hook defaultNumber:/updateNumber: 会让详情页走漏。setCurrentNumber: hook 已补上之后自动接管，
-// 这里再加一道保险：进详情页时主动遍历视图树找 ScrollNumber 实例，强制 setCurrentNumber + updateNumber
-// —— 两条路径都走我们的 hook，按 cfg 自动替换；用户看到的视觉效果就是"打开详情页时数字从真值滚到自定义值"。
-static void DDWalkForceScrollNumber(UIView *root, unsigned long long target) {
-    if (!root || target == 0) return;
-    Class snCls = NSClassFromString(@"ScrollNumber");
-    if (!snCls) return;
-    if ([root isKindOfClass:snCls]) {
-        if ([root respondsToSelector:@selector(setCurrentNumber:)]) [(id)root setCurrentNumber:target];
-        if ([root respondsToSelector:@selector(updateNumber:)]) [(id)root updateNumber:target];
-    }
-    if (![root isKindOfClass:[UIView class]]) return;
-    for (UIView *s in ((UIView *)root).subviews) {
-        DDWalkForceScrollNumber(s, target);
+// 证据（用户实机视图层级截图）：
+//   【我的零钱 ¥2.40】KindaUIView → TimeoutNumber("我的零钱, 2点4 0元") → ScrollNumber
+//   【零钱通 ¥0.10】KindaUIView("账户余额 0点1 0元") → TimeoutNumber(", 0点1 0元") → ScrollNumber
+// 名字叫 TimeoutNumber，实机却是余额显示控件 —— 只 hook 子级 ScrollNumber 会被它二次覆盖回真值。
+// 把它的四个填数字入口全部接管（签名全部出自 dump 的 TimeoutNumber.h，见上方前向声明）。
+// 判定复用 DDBalancePageKindOf（白名单 VC 内才动手），开关关掉一律 %orig 走真实值。
+static BOOL DDTimeoutReplacedValue(id tn, unsigned long long *out) {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (!cfg.balanceEnabled) return NO;
+        DDBalancePageKind kind = DDBalancePageKindOf(tn);
+        if (kind == DDBalancePageNone) return NO;
+        if (kind == DDBalancePageLQT) {
+            if (![cfg hasLingtongValue]) return NO;
+            *out = DDClampFen(DDLingtongFenValue());
+        } else {
+            if (![cfg hasBalanceValue]) return NO;
+            *out = DDClampFen(DDBalanceFenValue());
+        }
+        return YES;
+    } @catch (NSException *e) { return NO; }
+}
+
+%hook TimeoutNumber
+// :27 初始化时设的数字
+- (void)defaultNumber:(unsigned long long)original {
+    unsigned long long v = 0;
+    if (DDTimeoutReplacedValue(self, &v)) {
+        DDJokerHit(@"余额.TimeoutNumber.defaultNumber");
+        DDLOG(@"TimeoutNumber.defaultNumber → %llu 分", v);
+        %orig(v);
+    } else {
+        %orig(original);
     }
 }
 
-%hook WCPayBalanceDetailViewController
-// 头文件证据：WCPayBalanceDetailViewController.h:140 viewWillAppear:、:108 updateBalanceTitleLabel
-// 我们的 hook 走 viewWillAppear: 末尾：VC 布局已完成、ScrollNumber 已挂上、真实数字已显示，
-// 此时再强刷一次，把数字替换为自定义值，避免"返回页面看到的是上一次缓存的真值"。
-- (void)viewWillAppear:(BOOL)animated {
-    %orig;
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (!cfg.balanceEnabled || ![cfg hasBalanceValue]) return;
-    unsigned long long target = DDClampFen(DDBalanceFenValue());
-    DDWalkForceScrollNumber([self view], target);
-    DDLOG(@"BalanceDetail.viewWillAppear 强刷 ScrollNumber → %llu 分", target);
+// :37 "无动画起点" —— 微信拿它当初始显示值，数据回来后很可能走这条路把真值写回来
+- (void)setNoAnimationStart:(unsigned long long)original {
+    unsigned long long v = 0;
+    if (DDTimeoutReplacedValue(self, &v)) {
+        DDJokerHit(@"余额.TimeoutNumber.setNoAnimationStart");
+        DDLOG(@"TimeoutNumber.setNoAnimationStart → %llu 分", v);
+        %orig(v);
+    } else {
+        %orig(original);
+    }
+}
+
+// :52 公开更新入口
+- (void)updateNumber:(unsigned long long)original {
+    unsigned long long v = 0;
+    if (DDTimeoutReplacedValue(self, &v)) {
+        DDJokerHit(@"余额.TimeoutNumber.updateNumber");
+        DDLOG(@"TimeoutNumber.updateNumber → %llu 分", v);
+        %orig(v);
+    } else {
+        %orig(original);
+    }
+}
+
+// :53 内部更新入口 —— 上面 updateNumber: 最终会调到这里，单独再拦一道
+- (void)updateNumberInternal:(unsigned long long)original {
+    unsigned long long v = 0;
+    if (DDTimeoutReplacedValue(self, &v)) {
+        DDJokerHit(@"余额.TimeoutNumber.updateNumberInternal");
+        DDLOG(@"TimeoutNumber.updateNumberInternal → %llu 分", v);
+        %orig(v);
+    } else {
+        %orig(original);
+    }
 }
 %end
 
-%hook WCPayLQTDetailViewController
-// 头文件证据：WCPayLQTDetailViewController.h:166 viewWillAppear:、:121 refreshViewWithData:
-// LQT 详情页与 Balance 详情页分属不同 VC，各自 viewWillAppear: 各 hook 一次，不能合并。
+#pragma mark - ④.2 强制刷新（TimeoutNumber 才是余额大数字真正的刷新入口）
+
+// ⚠️ 方向修正，依据用户实机视图层级截图（不是猜的）：
+//   【我的零钱 ¥2.40】KindaUIView → TimeoutNumber("我的零钱, 2点4 0元") → ScrollNumber
+//   【零钱通 ¥0.10】KindaUIView("账户余额 0点1 0元") → TimeoutNumber(", 0点1 0元") → ScrollNumber
+// 结论：余额大数字确实走 ScrollNumber，但它的父控件 TimeoutNumber 才是刷新入口。
+// 微信在数据回来后走 TimeoutNumber 自己的 setNoAnimationStart:/updateNumberInternal:
+// 把 ScrollNumber 的数字重新写回真值 —— 只改 ScrollNumber 会被它二次覆盖，等于白改。
+// 所以这里【父控件与子控件两个层级都刷】，TimeoutNumber 用的方法签名全部取自 dump 的 TimeoutNumber.h：
+//   :27 -(void) defaultNumber:(unsigned long long);
+//   :37 -(void) setNoAnimationStart:(unsigned long long);
+//   :52 -(void) updateNumber:(unsigned long long);
+//   :53 -(void) updateNumberInternal:(unsigned long long);
+static void DDForceOneTimeoutNumber(id tn, unsigned long long target) {
+    if (!tn || target == 0) return;
+    if ([tn respondsToSelector:@selector(setNoAnimationStart:)])  [(id)tn setNoAnimationStart:target];
+    if ([tn respondsToSelector:@selector(defaultNumber:)])        [(id)tn defaultNumber:target];
+    if ([tn respondsToSelector:@selector(updateNumber:)])         [(id)tn updateNumber:target];
+    if ([tn respondsToSelector:@selector(updateNumberInternal:)]) [(id)tn updateNumberInternal:target];
+}
+
+static void DDWalkForceMoneyViews(UIView *root, unsigned long long target, NSInteger depth) {
+    if (!root || target == 0 || depth > 14) return;
+    Class tnCls = NSClassFromString(@"TimeoutNumber");
+    Class snCls = NSClassFromString(@"ScrollNumber");
+    if (tnCls && [root isKindOfClass:tnCls]) {
+        DDForceOneTimeoutNumber(root, target);            // 父控件：真正的刷新入口（之前漏掉的就是它）
+    } else if (snCls && [root isKindOfClass:snCls]) {
+        if ([root respondsToSelector:@selector(setCurrentNumber:)]) [(id)root setCurrentNumber:target];
+        if ([root respondsToSelector:@selector(updateNumber:)])     [(id)root updateNumber:target];
+    }
+    for (UIView *s in root.subviews) {                    // 双向保险：继续往下钻，把子级 ScrollNumber 也刷一遍
+        DDWalkForceMoneyViews(s, target, depth + 1);
+    }
+}
+
+// 我的零钱 / 零钱通的统一强刷入口。
+// ⚠️ 必须定义在 %hook 块【外面】：Logos 的 %hook 会把方法展开成 C 函数，
+//    在里面写 static 函数会变成非法嵌套定义。
+static void DDMoneyPatch(UIViewController *vc, DDBalancePageKind kind, const char *from) {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (!cfg.balanceEnabled) return;
+        unsigned long long fen = 0;
+        if (kind == DDBalancePageLQT) {
+            if (![cfg hasLingtongValue]) return;
+            fen = DDClampFen(DDLingtongFenValue());
+        } else {
+            if (![cfg hasBalanceValue]) return;
+            fen = DDClampFen(DDBalanceFenValue());
+        }
+        if (!fen) return;
+
+        // 页名直接取 VC 类名：服务页（WCPayMainViewControllerV2）也复用这个函数，
+        // 写死 "BalanceDetail" 会让日志骗人，下次排查又被误导。
+        NSString *pageName = NSStringFromClass([vc class]) ?: @"(nil)";
+        DDWalkForceMoneyViews([vc view], fen, 0);
+        DDJokerHit(kind == DDBalancePageLQT ? @"余额.强刷零钱通" : @"余额.强刷零钱");
+        DDLOG(@"%@.%s 强刷 TimeoutNumber+ScrollNumber → %llu 分", pageName, from, fen);
+
+        // 延迟重试：微信常在 viewWillAppear 之后才把数据补上，第一遍控件可能还没挂好。
+        // 强刷是幂等的（已经是目标值就再刷一遍同一个值），无条件重试没有副作用。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                DDWalkForceMoneyViews([vc view], fen, 0);
+                DDLOG(@"%@.%s 延迟重试", pageName, from);
+            } @catch (NSException *e) {}
+        });
+    } @catch (NSException *e) {}
+}
+
+static void DDBalanceDetailPatch(WCPayBalanceDetailViewController *vc, const char *from) {
+    DDMoneyPatch(vc, DDBalancePageBalance, from);
+}
+
+static void DDLQTDetailPatch(WCPayLQTDetailViewController *vc, const char *from) {
+    DDMoneyPatch(vc, DDBalancePageLQT, from);
+}
+
+%hook WCPayBalanceDetailViewController
+// 三道入口覆盖"初始布局 / 数据回来 / 手动刷新"三条时序（头文件证据）：
+//   :140 viewWillAppear:          进页
+//   :71  refreshViewWithData:     网络数据回来后整体重刷（会覆盖我们之前刷进去的值，所以必须再刷）
+//   :108 updateBalanceTitleLabel  专门刷余额标题
+// 每道都先 %orig 让微信按真值画完，我们再强刷；开关关掉时一行都不执行，零侵入。
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (!cfg.balanceEnabled || ![cfg hasLingtongValue]) return;
-    unsigned long long target = DDClampFen(DDLingtongFenValue());
-    DDWalkForceScrollNumber([self view], target);
-    DDLOG(@"LQTDetail.viewWillAppear 强刷 ScrollNumber → %llu 分", target);
+    DDBalanceDetailPatch(self, "viewWillAppear");
+}
+
+- (void)refreshViewWithData:(id)data {
+    %orig;
+    DDBalanceDetailPatch(self, "refreshViewWithData");
+}
+
+- (void)updateBalanceTitleLabel {
+    %orig;
+    DDBalanceDetailPatch(self, "updateBalanceTitleLabel");
+}
+%end
+
+// 零钱通（WCPayLQTDetailViewController.h:121 refreshViewWithData:、:166 viewWillAppear:）
+// 与我的零钱页同套路，但用的是零钱通自己的自定义值。
+%hook WCPayLQTDetailViewController
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    DDLQTDetailPatch(self, "viewWillAppear");
+}
+
+- (void)refreshViewWithData:(id)data {
+    %orig;
+    DDLQTDetailPatch(self, "refreshViewWithData");
+}
+%end
+
+#pragma mark - ④.2b 零钱通数据源层（此前完全没 hook，这是零钱通显示真值的直接原因）
+
+// WCPayLQTInfo.h:16 lqtAvailBalance / :17 lqtTotalBalance —— 零钱通自己的余额数据对象，
+// 和零钱的 WCPayBalanceInfo 是两套完全独立的数据。之前只 hook 了 WCPayBalanceInfo，
+// 而且三个 getter 全返回【零钱】的值，零钱通一分钱都没被碰到，所以 ¥0.10 一直是真值。
+%hook WCPayLQTInfo
+- (unsigned long long)lqtAvailBalance {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled && [cfg hasLingtongValue]) {
+            unsigned long long v = DDClampFen(DDLingtongFenValue());
+            DDJokerHit(@"WCPayLQTInfo.lqtAvailBalance");
+            DDLOG(@"WCPayLQTInfo.lqtAvailBalance → %llu 分（零钱通可用余额数字源）", v);
+            return v;
+        }
+    } @catch (NSException *e) {}
+    return %orig;
+}
+
+- (unsigned long long)lqtTotalBalance {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled && [cfg hasLingtongValue]) {
+            unsigned long long v = DDClampFen(DDLingtongFenValue());
+            DDJokerHit(@"WCPayLQTInfo.lqtTotalBalance");
+            return v;
+        }
+    } @catch (NSException *e) {}
+    return %orig;
+}
+%end
+
+// WCPayLQTDetailControlLogic.h:23 -(long long)lqtBalance;（详情页控制逻辑里另存的一份余额）
+%hook WCPayLQTDetailControlLogic
+- (long long)lqtBalance {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled && [cfg hasLingtongValue]) {
+            unsigned long long v = DDClampFen(DDLingtongFenValue());
+            DDJokerHit(@"WCPayLQTDetailControlLogic.lqtBalance");
+            return (long long)v;
+        }
+    } @catch (NSException *e) {}
+    return %orig;
 }
 %end
 
@@ -1778,16 +2031,12 @@ static void DDWalkForceScrollNumber(UIView *root, unsigned long long target) {
 #pragma mark - ④.4 服务页兜底：WCPayMainViewControllerV2 viewWillAppear 强刷
 
 // 服务页（"我"→ 服务 tab）的 viewWillAppear:，dump 头文件 WCPayMainViewControllerV2.h:115 已确认存在。
-// 与详情页同套路：进页时遍历视图树主动找 ScrollNumber 强刷一次，把数字从 ¥2.40 滚到自定义值。
-// 即使 ScrollNumber hook 已经覆盖（白名单已加），这里再加一道保险，且日志能精确打出"哪一页、刷了什么"。
+// 与详情页同套路：进页时遍历视图树主动强刷一次。走 DDMoneyPatch 复用同一套逻辑
+// （TimeoutNumber + ScrollNumber 两个层级都刷，外加 0.35s 幂等延迟重试）。
 %hook WCPayMainViewControllerV2
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (!cfg.balanceEnabled || ![cfg hasBalanceValue]) return;
-    unsigned long long target = DDClampFen(DDBalanceFenValue());
-    DDLOG(@"WCPayMainViewControllerV2.viewWillAppear 进服务页，强刷 ScrollNumber → %llu 分", target);
-    DDWalkForceScrollNumber([self view], target);
+    DDMoneyPatch(self, DDBalancePageBalance, "viewWillAppear");
 }
 %end
 
@@ -1892,6 +2141,32 @@ static NSString *DDJokerExportLogText(void) {
     // 类名不再写死：默认 dump 上面那条时间条的类，拿不到才退回 ChatTimeViewModel
     [out appendString:@"\n----- 该类运行时结构 -----\n"];
     [out appendString:DDJokerDescribeClassIvars([gDDLastTimeVM class] ?: NSClassFromString(@"ChatTimeViewModel"))];
+
+    // 余额相关类运行时存在性：dump 头文件来自某个微信版本，类名一换 hook 就全部静默失效。
+    // 这段直接把"当前微信里到底有没有这个类、有没有目标方法"打出来，避免继续对着不存在的类名排查。
+    [out appendString:@"\n----- 余额相关类运行时存在性 -----\n"];
+    {
+        NSDictionary *checks = @{
+            @"WCPayBalanceDetailViewController" : @[@"balanceTitleLabel", @"updateBalanceTitleLabel", @"refreshViewWithData:"],
+            @"WCPayLQTDetailViewController"     : @[@"refreshViewWithData:", @"viewWillAppear:"],
+            @"WCPayBalanceInfo"                 : @[@"wallet_balance", @"m_uiAvailableBalance", @"m_uiTotalBalance"],
+            @"WCPayLQTInfo"                     : @[@"lqtAvailBalance", @"lqtTotalBalance"],
+            @"WCPayLQTDetailControlLogic"       : @[@"lqtBalance"],
+            @"WCPayMainViewControllerV2"        : @[@"viewWillAppear:"],
+            @"ScrollNumber"                     : @[@"defaultNumber:", @"updateNumber:", @"setCurrentNumber:"],
+            @"TimeoutNumber"                    : @[@"defaultNumber:", @"setNoAnimationStart:", @"updateNumber:", @"updateNumberInternal:", @"scrollNumber"],
+        };
+        for (NSString *clsName in checks) {
+            Class cls = NSClassFromString(clsName);
+            if (!cls) { [out appendFormat:@"  %-34s : ❌ 类不存在（hook 无效）\n", clsName.UTF8String]; continue; }
+            NSMutableArray *miss = [NSMutableArray array];
+            for (NSString *selName in checks[clsName]) {
+                if (![cls instancesRespondToSelector:NSSelectorFromString(selName)]) [miss addObject:selName];
+            }
+            [out appendFormat:@"  %-34s : ✅ 存在%@\n", clsName.UTF8String,
+             miss.count ? [NSString stringWithFormat:@"，但缺方法 %@", [miss componentsJoinedByString:@"/"]] : @""];
+        }
+    }
 
     [out appendString:@"\n----- 日志正文 -----\n"];
     NSMutableString *buf = DDLogBuffer();
