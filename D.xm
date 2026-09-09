@@ -1684,13 +1684,15 @@ static unsigned long long DDClampFen(unsigned long long fen) {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         DDBalancePageKind kind = cfg.balanceEnabled ? DDBalancePageKindOf(self) : DDBalancePageNone;
         if (kind == DDBalancePageNone) { %orig(original); return; }   // 非钱包页，不插手
+        // 先算出"真正会注入的值"，日志与 %orig 共用同一份 —— 之前日志恒打余额值
+        // （DDClampFen(DDBalanceFenValue())），导致零钱通也显示"→ 600 分"，曾误判 LQT 被改错；
+        // 现在日志如实反映本次注入值（余额=600 / 零钱通=300）。
+        unsigned long long injected = (kind == DDBalancePageLQT)
+            ? ([cfg hasLingtongValue] ? DDClampFen(DDLingtongFenValue()) : original)
+            : ([cfg hasBalanceValue] ? DDClampFen(DDBalanceFenValue()) : original);
         DDJokerHit(@"余额.defaultNumber:");
-        DDLOG(@"余额.defaultNumber: kind=%ld → %llu 分", (long)kind, DDClampFen(DDBalanceFenValue()));
-        if (kind == DDBalancePageLQT) {
-            %orig([cfg hasLingtongValue] ? DDClampFen(DDLingtongFenValue()) : original);
-        } else {
-            %orig([cfg hasBalanceValue] ? DDClampFen(DDBalanceFenValue()) : original);
-        }
+        DDLOG(@"余额.defaultNumber: kind=%ld 注入 %llu 分（原 %llu）", (long)kind, injected, original);
+        %orig(injected);
     } @catch (NSException *exception) {
         %orig(original);   // 任何异常都退回原值，绝不让微信崩
     }
@@ -1765,6 +1767,20 @@ static BOOL DDTimeoutReplacedValue(id tn, unsigned long long *out) {
     if (DDTimeoutReplacedValue(self, &v)) {
         DDJokerHit(@"余额.TimeoutNumber.defaultNumber");
         DDLOG(@"TimeoutNumber.defaultNumber → %llu 分", v);
+        // 一次性定位：这个金额 TimeoutNumber 究竟属于哪个 VC ——
+        // 用于解释"详情页 VC 级强刷没触发"：若打出来不是 WCPayLQT*/WCPayBalanceDetail*，
+        // 说明详情页在运行时是别的类（或靠旁边文字判零钱通），VC 级 hook 自然接不上。
+        static BOOL gLoggedBalanceTN = NO, gLoggedLQTTN = NO;
+        DDBalancePageKind k = DDBalancePageKindOf(self);
+        if (k == DDBalancePageLQT && !gLoggedLQTTN) {
+            gLoggedLQTTN = YES;
+            UIViewController *o = DDViewControllerOfView(self);
+            DDLOG(@"余额.定位 零钱通TimeoutNumber 所属VC=%@", o ? NSStringFromClass([o class]) : @"(nil)");
+        } else if (k == DDBalancePageBalance && !gLoggedBalanceTN) {
+            gLoggedBalanceTN = YES;
+            UIViewController *o = DDViewControllerOfView(self);
+            DDLOG(@"余额.定位 零钱TimeoutNumber 所属VC=%@", o ? NSStringFromClass([o class]) : @"(nil)");
+        }
         %orig(v);
     } else {
         %orig(original);
