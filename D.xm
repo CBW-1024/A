@@ -1537,6 +1537,11 @@ static double DDTimeStampFromString(NSString *s) {
     if (cfg.contactsEnabled && [cfg hasContactsValue]) {
         self.title = [NSString stringWithFormat:@"通讯录(%@)", cfg.contactsValue];
     }
+    // 好友数量改完返回通讯录页须即时刷新“X个朋友”文案：数据层 m_uiNormalContact 已被 hook 成自定义值
+    // （ContactsDataLogic.h:58），但微信把该数字缓存在列表 UI 上，viewWillAppear 默认不会重读，
+    // 必须显式调 updateCount（ContactsViewController.h:126）重算并刷新计数显示；否则只有重启微信、
+    // 重建 ContactsDataLogic 才生效。关掉开关时同样靠它走 %orig 把“X个朋友”还原成真实值。
+    if ([self respondsToSelector:@selector(updateCount)]) [self updateCount];
 }
 %end
 
