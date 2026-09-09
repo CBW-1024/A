@@ -802,8 +802,7 @@ static void JokerInvalidateAllLayout(void) {
 // 与下方实现一致，故回退到这条被证实可用的路径（原生 MMImagePickerController 直接 present 会闪退）。
 @interface DDWeChatImagePickerDelegate : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 @property (nonatomic, assign) unsigned int mesLocalID;
-@property (nonatomic, weak) id viewController;
-- (void)dd_saveImage:(UIImage *)image;
+@property (nonatomic, weak) id cellView;   // 对齐爱锋：[self cell] 直接持有要替换的 ImageMessageCellView
 @end
 
 static NSString *DDImageReplacementPath(unsigned int mesLocalID) {
@@ -888,7 +887,7 @@ static void DDImageApplyReplacementToCell(id cell) {
     picker.allowsEditing = NO;
     DDWeChatImagePickerDelegate *delegate = [[DDWeChatImagePickerDelegate alloc] init];
     delegate.mesLocalID = msg.m_uiMesLocalID;
-    delegate.viewController = vc;
+    delegate.cellView = self;   // 对齐爱锋：delegate 直接持有 cell，dismiss 后无需递归查找
     picker.delegate = delegate;
     // 强引用 delegate：picker 不持有外部 delegate，避免回调时已被释放
     objc_setAssociatedObject(picker, "dd_picker_delegate", delegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -927,46 +926,20 @@ static void DDImageApplyReplacementToCell(id cell) {
     if (!data) { [picker dismissViewControllerAnimated:YES completion:nil]; return; }
     [data writeToFile:path atomically:YES];
 
-    // 选完图 picker 以动画消失，用户点"选取"的那个 tap 会在过渡窗口被重投到底层 ImageMessageCellView，
-    // 触发微信图片预览（全屏浏览器）打开。dismiss 前屏蔽 keyWindow 交互，吞掉这次误触（iOS 18 专用）。
-    UIWindow *kw = nil;
-    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-        if ([s isKindOfClass:[UIWindowScene class]] && ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *w in ((UIWindowScene *)s).windows) {
-                if (w.isKeyWindow) { kw = w; break; }
-            }
-        }
-        if (kw) break;
+    // 对齐爱锋 DKChatImagePickerDelegate（@0xa59cc）：delegate 直接持有 cell（[self cell]），
+    // 在 dismiss 之前【同步】刷新，dismiss 的 completion 为 nil，不屏蔽交互、不调 showImage
+    // （showImage 的 %orig 会打开微信图片预览——之前"选完图预览被打开"正是这里触发；
+    //  爱锋用 updateLayouts+setNeedsLayout 刷新，从不调 showImage）。
+    // DD 的替换图应用集中在 DDImageApplyReplacementToCell（直接 setImage 到内部 imageView），
+    // 等价于爱锋 updateLayouts 做的事；setNeedsLayout 对齐爱锋的 cell 级刷新。
+    id cellView = self.cellView;
+    if ([cellView isKindOfClass:%c(ImageMessageCellView)]) {
+        DDImageApplyReplacementToCell(cellView);
+        [(UIView *)cellView setNeedsLayout];
+    } else {
+        JokerInvalidateAllLayout();
     }
-    BOOL wasEnabled = kw.userInteractionEnabled;
-    if (wasEnabled) kw.userInteractionEnabled = NO;
-
-    [picker dismissViewControllerAnimated:YES completion:^{
-        dispatch_async(dispatch_get_main_queue(), ^{
-            id vc = self.viewController;
-            UITableView *tv = nil;
-            if ([vc isKindOfClass:%c(BaseMsgContentViewController)]) {
-                tv = [(BaseMsgContentViewController *)vc getMsgTableView];
-            }
-            BOOL hit = NO;
-            if ([tv isKindOfClass:[UITableView class]]) {
-                // visibleCells 出来的是 UITableViewCell，ImageMessageCellView 是它 contentView 里的子 view，
-                // 直接判类型永远命中不了 —— 必须用递归查找（这就是"改完图要重进才生效"的真因）
-                for (ImageMessageCellView *cellView in DDVisibleCellViewsOfClass(tv, %c(ImageMessageCellView))) {
-                    CMessageWrap *m = JokerGetMessageWrapFromCell((CommonMessageCellView *)cellView);
-                    if (m.m_uiMesLocalID == self.mesLocalID) {
-                        if ([cellView respondsToSelector:@selector(showImage)]) [cellView showImage];
-                        hit = YES;
-                    }
-                }
-            }
-            if (!hit) JokerInvalidateAllLayout();
-            // 过渡动画约 0.35s，多等一会再恢复交互，确保误触已被吞掉
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (!wasEnabled && kw.userInteractionEnabled == NO) kw.userInteractionEnabled = YES;
-            });
-        });
-    }];
+    [picker dismissViewControllerAnimated:YES completion:nil];
 }
 @end
 
