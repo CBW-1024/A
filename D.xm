@@ -268,6 +268,8 @@
 - (void)setNoAnimationStart:(unsigned long long)a0;   // TimeoutNumber.h:37
 - (void)updateNumber:(unsigned long long)a0;          // TimeoutNumber.h:52
 - (void)updateNumberInternal:(unsigned long long)a0;  // TimeoutNumber.h:53
+- (void)updateScrollNumber;                           // TimeoutNumber.h:54 最终落笔：把内部数字同步到 ScrollNumber
+- (void)layoutSubviews;                               // TimeoutNumber.h:28 布局时兜底重绘
 - (id)scrollNumber;                                   // TimeoutNumber.h:18
 @end
 
@@ -1822,6 +1824,55 @@ static BOOL DDTimeoutReplacedValue(id tn, unsigned long long *out) {
         %orig(original);
     }
 }
+
+// :54 把内部数字同步到 ScrollNumber 的"最终落笔"方法。微信在 layout / 数据刷新后都会调它，
+// 用内部真实值把 ScrollNumber 重绘一遍，把我们在上面各 setter 里注入的值覆盖掉
+// —— 与时间修复同一性质：系统在最后一步又用真实值画上去了。
+// 策略：%orig 让它先按内部状态画完，再强制把 ScrollNumber 设回自定义值，确保屏幕上看到的就是我们的值。
+// 仅对钱包页（DDBalancePageKindOf 白名单）生效，倒计时等非钱包 TimeoutNumber 一律跳过。
+- (void)updateScrollNumber {
+    %orig;
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (!cfg.balanceEnabled) return;
+        DDBalancePageKind kind = DDBalancePageKindOf(self);
+        if (kind == DDBalancePageNone) return;
+        unsigned long long fen = (kind == DDBalancePageLQT)
+            ? ([cfg hasLingtongValue] ? DDClampFen(DDLingtongFenValue()) : 0)
+            : ([cfg hasBalanceValue] ? DDClampFen(DDBalanceFenValue()) : 0);
+        if (!fen) return;
+        id sn = [self scrollNumber];
+        if (sn && [sn respondsToSelector:@selector(currentNumber)] && [sn currentNumber] != fen) {
+            if ([sn respondsToSelector:@selector(setCurrentNumber:)]) [(id)sn setCurrentNumber:fen];
+            if ([sn respondsToSelector:@selector(updateNumber:)])     [(id)sn updateNumber:fen];
+            DDJokerHit(@"余额.TimeoutNumber.updateScrollNumber");
+            DDLOG(@"余额.TimeoutNumber.updateScrollNumber 强改 → %llu 分", fen);
+        }
+    } @catch (NSException *e) {}
+}
+
+// :28 每次布局都会调，是"最后一次落笔"之前的兜底。若微信没走 updateScrollNumber，
+// 这里也能在布局阶段把真实值覆盖成自定义值。currentNumber 比对避免每帧无谓重写（也防止动画被反复打断）。
+- (void)layoutSubviews {
+    %orig;
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (!cfg.balanceEnabled) return;
+        DDBalancePageKind kind = DDBalancePageKindOf(self);
+        if (kind == DDBalancePageNone) return;
+        unsigned long long fen = (kind == DDBalancePageLQT)
+            ? ([cfg hasLingtongValue] ? DDClampFen(DDLingtongFenValue()) : 0)
+            : ([cfg hasBalanceValue] ? DDClampFen(DDBalanceFenValue()) : 0);
+        if (!fen) return;
+        id sn = [self scrollNumber];
+        if (sn && [sn respondsToSelector:@selector(currentNumber)] && [sn currentNumber] != fen) {
+            if ([sn respondsToSelector:@selector(setCurrentNumber:)]) [(id)sn setCurrentNumber:fen];
+            if ([sn respondsToSelector:@selector(updateNumber:)])     [(id)sn updateNumber:fen];
+            DDJokerHit(@"余额.TimeoutNumber.layoutSubviews");
+            DDLOG(@"余额.TimeoutNumber.layoutSubviews 强改 → %llu 分", fen);
+        }
+    } @catch (NSException *e) {}
+}
 %end
 
 #pragma mark - ④.2 强制刷新（TimeoutNumber 才是余额大数字真正的刷新入口）
@@ -2170,7 +2221,7 @@ static NSString *DDJokerExportLogText(void) {
             @"WCPayLQTDetailControlLogic"       : @[@"lqtBalance"],
             @"WCPayMainViewControllerV2"        : @[@"viewWillAppear:"],
             @"ScrollNumber"                     : @[@"defaultNumber:", @"updateNumber:", @"setCurrentNumber:"],
-            @"TimeoutNumber"                    : @[@"defaultNumber:", @"setNoAnimationStart:", @"updateNumber:", @"updateNumberInternal:", @"scrollNumber"],
+            @"TimeoutNumber"                    : @[@"defaultNumber:", @"setNoAnimationStart:", @"updateNumber:", @"updateNumberInternal:", @"updateScrollNumber", @"layoutSubviews", @"scrollNumber"],
         };
         for (NSString *clsName in checks) {
             Class cls = NSClassFromString(clsName);
