@@ -1333,6 +1333,27 @@ static double DDTimeStampFromString(NSString *s) {
     }
     [self dk_installTimeEditGesture];
 }
+// 覆盖落点（决定性）：写在 layoutInternal 的 %orig 之前。
+// 证据（DDJokerDiag.log 01:25:00）：重进聊天页新建的 vm，即便 timeText 钩子把 showingTime 改成修改值、
+// 且 updateLayouts 跑在 modified showingTime 上，timeText 仍吐真实串——因为微信在【首帧 layout】
+// 用真实 showingTime 把 m_timeText 算死；而 updateLayouts 在 cell「尚未已布局/可见」时不会重算 m_timeText
+// （编辑路径之所以生效，是用户在屏上点确定后强制定 deferred relayout，那时 cell 已可见，updateLayouts 才重算）。
+// ChatTimeCellView.h 确认有 - (void)layoutInternal，其内部会调 vm.updateLayouts 用当前 showingTime 算 m_timeText。
+// 我们在 %orig 之前把 showingTime 改成修改值，首帧 m_timeText 就直接是修改时间，短/长两种格式同步修正。
+// 比 didMoveToWindow 可靠：ChatTimeCellView 实为 NSObject（dump 头文件佐证），didMoveToWindow 未必按预期触发；
+// 而 layoutInternal 是微信正常 layout 通路、必走，且早到 m_timeText 算之前。
+- (void)layoutInternal {
+    DDJokerHit(@"ChatTimeCellView.layoutInternal");
+    id vm = objc_getAssociatedObject(self, &kDDTimeVMKey);
+    if (vm) {
+        NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(vm) : nil;
+        if (cached && DDShowingTimeOf(vm) != [cached doubleValue]) {
+            DDSetShowingTime(vm, [cached doubleValue]);
+            DDLOG(@"layoutInternal 应用覆盖 vm=%p → %@", vm, DDTimeDesc([cached doubleValue]));
+        }
+    }
+    %orig;
+}
 // 微信时间条有第二种显示：点一下时间条会切出带日期的完整时间（ChatTimeCellView.h:11 onClickTimeLabel）。
 // 这里只做取证、不改行为：把点击前后的 vm.timeText 和 label 实际文本都打出来，
 // 下次导出日志就能判断它是跟着 showingTime 走（那我们改了它就自动跟着变），
@@ -1349,8 +1370,11 @@ static double DDTimeStampFromString(NSString *s) {
           vm ? DDTimeDesc(DDShowingTimeOf(vm)) : @"无");
 }
 // 长按手势装在 label 上，而 label 可能晚于 init 才创建，cell 复用时也会换，
-// 所以 didMoveToWindow 里再补一次（爱锋同样 hook 了它，且实现是幂等的）
+// 所以 didMoveToWindow 里再补一次（爱锋同样 hook 了它，且实现是幂等的）。
+// 注意：ChatTimeCellView 实为 NSObject（dump 佐证），didMoveToWindow 未必触发，
+// 主覆盖逻辑已迁到 layoutInternal（微信正常 layout 通路、必走）。这里仅作兜底 + 取证。
 - (void)didMoveToWindow {
+    DDJokerHit(@"ChatTimeCellView.didMoveToWindow");
     %orig;
     [self dk_installTimeEditGesture];
     // 兜底：cell 上屏时若这条时间有覆盖值，确保 showingTime 已是修改值并强制重排，
