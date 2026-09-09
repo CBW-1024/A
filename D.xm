@@ -1293,10 +1293,6 @@ static double DDTimeStampFromString(NSString *s) {
 // 改时间后微信重算时间条就走这里，打出来才能确认"改了没反应"到底卡在哪一步
 - (void)updateLayouts {
     DDJokerHit(@"ChatTimeViewModel.updateLayouts");
-    // 覆盖写进 showingTime：兜底用。决定性修复在 ChatTimeCellView.didMoveToWindow 的 dispatch_async
-    // （布局通路之外）里——那里才真正让微信按新值重算 m_timeText。这里 %orig 前先写好 showingTime，
-    // 万一有路径在首帧 layout 之前走到 updateLayouts，也能直接拿到修改值。
-    DDApplyTimeOverride(self);
     DDLOG(@"updateLayouts vm=%p 前 showingTime=%@", self, DDTimeDesc(DDShowingTimeOf(self)));
     %orig;
     DDLOG(@"updateLayouts vm=%p 后 showingTime=%@", self, DDTimeDesc(DDShowingTimeOf(self)));
@@ -1309,30 +1305,16 @@ static double DDTimeStampFromString(NSString *s) {
     id r = %orig;
     // vm 先存起来：弹窗时要用它读 showingTime 和写缓存
     objc_setAssociatedObject(r, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    // 兜底：cell 创建时先把缓存的修改时间写进 showingTime。决定性修复在 didMoveToWindow 的 dispatch_async。
-    DDApplyTimeOverride(vm);
     [(ChatTimeCellView *)r dk_installTimeEditGesture];
     return r;
 }
 - (void)setViewModel:(id)vm {
     %orig;
     objc_setAssociatedObject(self, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    DDApplyTimeOverride(vm);
     [self dk_installTimeEditGesture];
 }
-    // 兜底：布局通路内调用只把修改时间写进 showingTime ivar，但【不会】触发 m_timeText 重算
-    // （日志实证：微信首帧 layout 用真实 showingTime 把 m_timeText 算死，布局通路内的 updateLayouts 不重算）。
-    // 真正让"重进首帧即显示修改时间"的修复在 didMoveToWindow 的 dispatch_async（布局通路之外）。
-    // 这里仍保留：一是 %orig 前写好 showingTime 作兜底，二是日志打出每帧的缓存/showingTime 状态便于诊断。
 - (void)layoutInternal {
     DDJokerHit(@"ChatTimeCellView.layoutInternal");
-    id vm = objc_getAssociatedObject(self, &kDDTimeVMKey);
-    NSNumber *cached = vm ? ([DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(vm) : nil) : nil;
-    if (cached) {
-        DDLOG(@"layoutInternal cell=%p vm=%p 缓存=%@ showingTime=%@ 关联vm=%@",
-              self, vm, DDTimeDesc([cached doubleValue]), DDTimeDesc(DDShowingTimeOf(vm)), vm ? @"有" : @"无");
-    }
-    DDApplyTimeOverride(vm);
     %orig;
 }
 // 微信时间条有第二种显示：点一下时间条会切出带日期的完整时间（ChatTimeCellView.h:11 onClickTimeLabel）。
