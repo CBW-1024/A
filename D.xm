@@ -1220,6 +1220,7 @@ static void DDImageApplyReplacementToCell(id cell) {
 #pragma mark - ①c 聊天时间修改
 
 static char kDDTimeVMKey;
+static char kDDTimeLabelCell;   // 时间 label → 所属 ChatTimeCellView 的反向关联（渲染层替换用）
 
 // 时间条的显示格式一律由微信原生 timeText 决定，本插件不再自创任何格式串
 // （曾经自己拼过"今天 HH:mm"，而微信当天只显示"15:56"，与原生不一致 —— 已彻底移除）。
@@ -1433,6 +1434,8 @@ static double DDTimeStampFromString(NSString *s) {
     if (![DDGlobalConfig shared].timeEnabled) return;
     UILabel *label = [self dk_timeLabel];
     if (!label) { DDJokerHit(@"dk_installTimeEditGesture:找不到label"); return; }   // 找不到 label 长按就永远不弹窗
+    // 反向标记：让时间 label 能直接找到所属 cell（从而拿到 vm），渲染层替换时无需遍历 superview。
+    objc_setAssociatedObject(label, &kDDTimeLabelCell, self, OBJC_ASSOCIATION_ASSIGN);
     for (UIGestureRecognizer *g in label.gestureRecognizers) {
         if ([g isKindOfClass:[UILongPressGestureRecognizer class]]) return;   // 幂等，不重复装
     }
@@ -2402,6 +2405,59 @@ static NSString *DDJokerWriteDiagLog(void) {
 }
 
 @end
+
+// —— 渲染层最终兜底（决定性修复）——
+// 前 7 轮在 timeText/updateLayouts/layoutInternal/didMoveToWindow 里改 showingTime，重进聊天页仍显示真实时间：
+// 日志实证微信把 m_timeText 在首帧 layout 算一次就缓存，之后无论我们怎么改 showingTime、怎么强制重排，
+// 都不再重算（DDJokerDiag.log 02:00:44 段：showingTime 已是修改值、layoutInternal 也跑在修改值上，
+// timeText 仍吐 00:20 真实串）。唯有在 label 真正 setText/setAttributedText 这一最后环节替换文本才稳。
+// 这里用微信自己的 [vm timeText]（当前 showingTime 已被 timeText 钩子改成修改值）替换上屏文本，
+// 格式完全由微信决定（短/长两格式都跟 showingTime 走），不自创任何格式（符合"不要自创的"要求）。
+static UIView *DDTimeCellOfLabel(id label) {
+    UIView *cell = objc_getAssociatedObject(label, &kDDTimeLabelCell);
+    if (cell) return cell;
+    UIView *v = label;   // 兜底：标记还没就绪时（首帧）向上找 ChatTimeCellView
+    Class timeCellCls = objc_getClass("ChatTimeCellView");
+    while (v) {
+        if (timeCellCls && [v isKindOfClass:timeCellCls]) return v;
+        v = v.superview;
+    }
+    return nil;
+}
+%hook UILabel
+- (void)setAttributedText:(NSAttributedString *)text {
+    UIView *cell = DDTimeCellOfLabel(self);
+    if (cell) {
+        id vm = objc_getAssociatedObject(cell, &kDDTimeVMKey);
+        NSNumber *cached = vm ? ([DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(vm) : nil) : nil;
+        if (cached && text.length) {
+            NSString *t = [vm timeText];   // 微信原生格式（基于已改写的 showingTime）
+            if (t.length && ![text.string isEqualToString:t]) {
+                NSMutableAttributedString *m = [text mutableCopy];
+                [m replaceCharactersInRange:NSMakeRange(0, m.length) withString:t];
+                text = m;
+                DDLOG(@"渲染层替换时间label(attributed) → %@ vm=%p", t, vm);
+            }
+        }
+    }
+    %orig;
+}
+- (void)setText:(NSString *)text {
+    UIView *cell = DDTimeCellOfLabel(self);
+    if (cell) {
+        id vm = objc_getAssociatedObject(cell, &kDDTimeVMKey);
+        NSNumber *cached = vm ? ([DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(vm) : nil) : nil;
+        if (cached && text.length) {
+            NSString *t = [vm timeText];
+            if (t.length && ![text isEqualToString:t]) {
+                text = t;
+                DDLOG(@"渲染层替换时间label(plain) → %@ vm=%p", t, vm);
+            }
+        }
+    }
+    %orig;
+}
+%end
 
 #pragma mark - 插件注册
 
