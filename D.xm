@@ -193,6 +193,7 @@
 - (unsigned int)m_uiNormalContact;
 @end
 @interface ContactsViewController : UIViewController
+- (void)updateCount;   // ContactsViewController.h:126，重算并刷新“X个朋友”计数显示
 @end
 
 // ScrollNumber.h 确认存在：-(void)updateNumber:(unsigned long long); -(void)defaultNumber:(unsigned long long);
