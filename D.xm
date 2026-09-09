@@ -514,8 +514,14 @@ static void JokerRefreshVisibleImageCells(void) {
 
 // 输入框回填要显示"当前正在显示的内容"，所以优先取缓存值。
 // 转账金额不再从 WCPayInfoItem 读（新版本拿不到），直接用缓存值回填
+static NSString *DDTransferFeedescAmount(NSString *xml);  // 前向声明：从 m_nsContent 解析原始转账金额
 static NSString *JokerGetDisplayText(CMessageWrap *msg, BOOL isTransfer) {
-    if (isTransfer) return DDJokerCachedAmount(msg) ?: @"";
+    if (isTransfer) {
+        NSString *cached = DDJokerCachedAmount(msg);
+        if (cached.length) return cached;                            // 已修改 → 显示修改后的金额
+        NSString *raw = DDTransferFeedescAmount([msg m_nsContent]);  // 未修改 → 真实金额
+        return JokerNormalizeAmount(raw) ?: @"";                     // 去掉 ¥，与缓存格式统一
+    }
     NSString *cached = DDJokerCachedText(msg);
     if (cached) return cached;
     // 引用消息的 GetDisplayContent 是原始 XML 碎片（像正则），回填输入框会一团乱，
@@ -742,6 +748,18 @@ static void JokerInvalidateAllLayout(void) {
 // setM_nsContent 在 CMessageWrap.h:676 确认存在）。微信自己用新 m_nsContent 渲染 titleText/descText，
 // 不再在显示层替换文本里的数字段（会把 888.88 整个当一段数字替换，丢失小数且错位）。
 static NSMutableDictionary *gDDOriginalTransferXML;
+// 从转账 m_nsContent 的 <feedesc><![CDATA[金额]]></feedesc> 里解析出原始金额（如 ¥888.88）
+static NSString *DDTransferFeedescAmount(NSString *xml) {
+    if (!xml.length) return nil;
+    NSString *open = @"<feedesc><![CDATA[";
+    NSString *close = @"]]></feedesc>";
+    NSRange ro = [xml rangeOfString:open];
+    if (ro.location == NSNotFound) return nil;
+    NSUInteger start = ro.location + ro.length;
+    NSRange rc = [xml rangeOfString:close options:0 range:NSMakeRange(start, xml.length - start)];
+    if (rc.location == NSNotFound) return nil;
+    return [xml substringWithRange:NSMakeRange(start, rc.location - start)];
+}
 static NSString *DDTransferFormatAmount(NSString *override, NSString *originalAmount) {
     // 对齐爱锋 formatString @0xb8094：保留原金额的货币符号前缀（如 ¥）
     if ([originalAmount hasPrefix:@"¥"] && ![override hasPrefix:@"¥"]) {
@@ -752,14 +770,8 @@ static NSString *DDTransferFormatAmount(NSString *override, NSString *originalAm
 static NSString *DDTransferOverrideContent(NSString *xml, NSString *override) {
     // 对齐爱锋 changeJinE @0xb7c88：定位 <feedesc><![CDATA[旧金额]]></feedesc>，替换成新金额
     if (!xml.length || !override.length) return nil;
-    NSString *open = @"<feedesc><![CDATA[";
-    NSString *close = @"]]></feedesc>";
-    NSRange ro = [xml rangeOfString:open];
-    if (ro.location == NSNotFound) return nil;
-    NSUInteger start = ro.location + ro.length;
-    NSRange rc = [xml rangeOfString:close options:0 range:NSMakeRange(start, xml.length - start)];
-    if (rc.location == NSNotFound) return nil;
-    NSString *old = [xml substringWithRange:NSMakeRange(start, rc.location - start)];
+    NSString *old = DDTransferFeedescAmount(xml);
+    if (!old.length) return nil;
     NSString *newer = DDTransferFormatAmount(override, old);
     return [xml stringByReplacingOccurrencesOfString:old withString:newer];
 }
