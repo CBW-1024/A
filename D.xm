@@ -345,7 +345,13 @@ static NSString *JokerNormalizeAmount(NSString *amount) {
             [filtered appendFormat:@"%C", c];
         }
     }
-    return filtered.length ? filtered : nil;
+    if (!filtered.length) return nil;
+    // 转账金额：不带小数点的纯数字，自动补 .00（如 666 -> 666.00）；
+    // 含小数点（666.5 / 666.）的保持原样，由微信按原始精度渲染
+    if ([filtered rangeOfString:@"."].location == NSNotFound) {
+        [filtered appendString:@".00"];
+    }
+    return filtered;
 }
 
 static NSString * const kDDJokerTextCacheKey = @"DDJokerTextCache";
@@ -1408,7 +1414,7 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     [profileSection addCell:[cellCls switchCellForSel:@selector(balanceSwitchChanged:) target:self title:@"零钱余额修改" on:cfg.balanceEnabled]];
     if (cfg.balanceEnabled) {
         self.balanceField = [[UITextField alloc] init];
-        [self.balanceField addTarget:self action:@selector(balanceDidEndEditing:) forControlEvents:UIControlEventEditingDidEnd];
+        [self.balanceField addTarget:self action:@selector(balanceChanged:) forControlEvents:UIControlEventEditingChanged];
         NSString *currentBalance = [cfg hasBalanceValue] ? cfg.balanceValue : @"";
         UIView *balanceRight = [self inputRowWithField:self.balanceField
                                                 action:@selector(balanceConfirm:)
@@ -1419,7 +1425,7 @@ static unsigned long long DDClampFen(unsigned long long fen) {
         [profileSection addCell:balanceSubCell];
 
         self.lingtongField = [[UITextField alloc] init];
-        [self.lingtongField addTarget:self action:@selector(lingtongDidEndEditing:) forControlEvents:UIControlEventEditingDidEnd];
+        [self.lingtongField addTarget:self action:@selector(lingtongChanged:) forControlEvents:UIControlEventEditingChanged];
         NSString *currentLingtong = [cfg hasLingtongValue] ? cfg.lingtongValue : @"";
         UIView *lingtongRight = [self inputRowWithField:self.lingtongField
                                                  action:@selector(lingtongConfirm:)
@@ -1433,7 +1439,7 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     [profileSection addCell:[cellCls switchCellForSel:@selector(stepsSwitchChanged:) target:self title:@"运动步数修改" on:cfg.stepsEnabled]];
     if (cfg.stepsEnabled) {
         self.stepsField = [[UITextField alloc] init];
-        [self.stepsField addTarget:self action:@selector(stepsDidEndEditing:) forControlEvents:UIControlEventEditingDidEnd];
+        [self.stepsField addTarget:self action:@selector(stepsChanged:) forControlEvents:UIControlEventEditingChanged];
         NSString *currentSteps = [cfg hasStepsValue] ? cfg.stepsValueString : @"";
         UIView *rightView = [self inputRowWithField:self.stepsField
                                              action:@selector(stepsConfirm:)
@@ -1447,7 +1453,7 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     [profileSection addCell:[cellCls switchCellForSel:@selector(contactsSwitchChanged:) target:self title:@"好友数量修改" on:cfg.contactsEnabled]];
     if (cfg.contactsEnabled) {
         self.contactsField = [[UITextField alloc] init];
-        [self.contactsField addTarget:self action:@selector(contactsDidEndEditing:) forControlEvents:UIControlEventEditingDidEnd];
+        [self.contactsField addTarget:self action:@selector(contactsChanged:) forControlEvents:UIControlEventEditingChanged];
         NSString *currentContacts = [cfg hasContactsValue] ? cfg.contactsValue : @"";
         UIView *rightView = [self inputRowWithField:self.contactsField
                                              action:@selector(contactsConfirm:)
@@ -1566,19 +1572,19 @@ static unsigned long long DDClampFen(unsigned long long fen) {
 
 // 实时回调：边打边存，不重建 table（重建会销毁正在编辑的 textField、丢焦点并让键盘抖动）。
 // 键盘回收仍交给"确认"按钮的 buildTable 完成。
-- (void)balanceDidEndEditing:(id)sender {
+- (void)balanceChanged:(id)sender {
     [self saveBalanceInput:self.balanceField.text];
 }
 
-- (void)lingtongDidEndEditing:(id)sender {
+- (void)lingtongChanged:(id)sender {
     [self saveLingtongInput:self.lingtongField.text];
 }
 
-- (void)stepsDidEndEditing:(id)sender {
+- (void)stepsChanged:(id)sender {
     [self saveStepsInput:self.stepsField.text];
 }
 
-- (void)contactsDidEndEditing:(id)sender {
+- (void)contactsChanged:(id)sender {
     [self saveContactsInput:self.contactsField.text];
 }
 
