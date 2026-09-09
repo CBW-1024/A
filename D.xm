@@ -1391,13 +1391,20 @@ static double DDTimeStampFromString(NSString *s) {
           cached ? DDTimeDesc([cached doubleValue]) : @"无",
           vm ? DDTimeDesc(DDShowingTimeOf(vm)) : @"无");
     if (!self.window) return;
-    if (vm) {
-        if (cached && DDShowingTimeOf(vm) != [cached doubleValue]) {
+    if (vm && cached) {
+        // 先确保 showingTime 已是修改值（重进时 timeText 钩子多半已写好，这里兜底）。
+        if (DDShowingTimeOf(vm) != [cached doubleValue]) {
             DDSetShowingTime(vm, [cached doubleValue]);
-            DDLOG(@"didMoveToWindow 应用覆盖 vm=%p → %@", vm, DDTimeDesc([cached doubleValue]));
-            [(ChatTimeCellView *)self layoutInternal];
-            [self setNeedsLayout];
+            DDLOG(@"didMoveToWindow 修正 showingTime vm=%p → %@", vm, DDTimeDesc([cached doubleValue]));
         }
+        // 关键：光改 showingTime 不够。日志实证（DDJokerDiag.log 01:51）重进后即便 showingTime 已是修改值、
+        // updateLayouts/layoutInternal 的 %orig 也跑在修改值上，timeText 仍吐真实串——
+        // 微信在首帧 layout 把 m_timeText 算一次就缓存，之后被微信自己调用 updateLayouts/layoutInternal 时不再重算。
+        // 唯有像编辑路径那样在 cell 已上屏（window=有）时主动 layoutInternal+setNeedsLayout 才触发重算。
+        // 这一步是「离开再进聊天页、普通时间条直接显示修改时间」能生效的决定性动作。
+        [(ChatTimeCellView *)self layoutInternal];
+        [self setNeedsLayout];
+        DDLOG(@"didMoveToWindow 强制重排（编辑路径同款）cell=%p vm=%p", self, vm);
     }
 }
 %new
