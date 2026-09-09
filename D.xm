@@ -1402,10 +1402,11 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     [_tableViewManager addSection:chatSection];
 
     WCTableViewSectionManager *profileSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"资料设置"];
-    profileSection.attributedFooterTitle = [self dd_centeredFooterString:@"零钱余额修改开启后可自定义余额与零钱通金额。步数和好友数量修改后需重启微信生效"];
+    profileSection.attributedFooterTitle = [self dd_centeredFooterString:@"零钱余额修改开启后可自定义余额与零钱通金额。步数与好友数量修改后返回对应页面即生效（重新进入微信运动或通讯录、或下拉刷新），无需重启微信"];
     [profileSection addCell:[cellCls switchCellForSel:@selector(balanceSwitchChanged:) target:self title:@"零钱余额修改" on:cfg.balanceEnabled]];
     if (cfg.balanceEnabled) {
         self.balanceField = [[UITextField alloc] init];
+        [self.balanceField addTarget:self action:@selector(balanceDidEndEditing:) forControlEvents:UIControlEventEditingDidEnd];
         NSString *currentBalance = [cfg hasBalanceValue] ? cfg.balanceValue : @"";
         UIView *balanceRight = [self inputRowWithField:self.balanceField
                                                 action:@selector(balanceConfirm:)
@@ -1416,6 +1417,7 @@ static unsigned long long DDClampFen(unsigned long long fen) {
         [profileSection addCell:balanceSubCell];
 
         self.lingtongField = [[UITextField alloc] init];
+        [self.lingtongField addTarget:self action:@selector(lingtongDidEndEditing:) forControlEvents:UIControlEventEditingDidEnd];
         NSString *currentLingtong = [cfg hasLingtongValue] ? cfg.lingtongValue : @"";
         UIView *lingtongRight = [self inputRowWithField:self.lingtongField
                                                  action:@selector(lingtongConfirm:)
@@ -1429,6 +1431,7 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     [profileSection addCell:[cellCls switchCellForSel:@selector(stepsSwitchChanged:) target:self title:@"运动步数修改" on:cfg.stepsEnabled]];
     if (cfg.stepsEnabled) {
         self.stepsField = [[UITextField alloc] init];
+        [self.stepsField addTarget:self action:@selector(stepsDidEndEditing:) forControlEvents:UIControlEventEditingDidEnd];
         NSString *currentSteps = [cfg hasStepsValue] ? cfg.stepsValueString : @"";
         UIView *rightView = [self inputRowWithField:self.stepsField
                                              action:@selector(stepsConfirm:)
@@ -1442,6 +1445,7 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     [profileSection addCell:[cellCls switchCellForSel:@selector(contactsSwitchChanged:) target:self title:@"好友数量修改" on:cfg.contactsEnabled]];
     if (cfg.contactsEnabled) {
         self.contactsField = [[UITextField alloc] init];
+        [self.contactsField addTarget:self action:@selector(contactsDidEndEditing:) forControlEvents:UIControlEventEditingDidEnd];
         NSString *currentContacts = [cfg hasContactsValue] ? cfg.contactsValue : @"";
         UIView *rightView = [self inputRowWithField:self.contactsField
                                              action:@selector(contactsConfirm:)
@@ -1556,6 +1560,24 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     NSString *input = self.lingtongField.text;
     [self saveLingtongInput:input];
     [self buildTable];
+}
+
+// 实时回调：边打边存，不重建 table（重建会销毁正在编辑的 textField、丢焦点并让键盘抖动）。
+// 键盘回收仍交给"确认"按钮的 buildTable 完成。
+- (void)balanceDidEndEditing:(id)sender {
+    [self saveBalanceInput:self.balanceField.text];
+}
+
+- (void)lingtongDidEndEditing:(id)sender {
+    [self saveLingtongInput:self.lingtongField.text];
+}
+
+- (void)stepsDidEndEditing:(id)sender {
+    [self saveStepsInput:self.stepsField.text];
+}
+
+- (void)contactsDidEndEditing:(id)sender {
+    [self saveContactsInput:self.contactsField.text];
 }
 
 - (void)saveStepsInput:(NSString *)input {
