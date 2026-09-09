@@ -1105,9 +1105,9 @@ static NSString *DDTimeStringForDisplay(double ts) {
         NSString *t = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         double ts = DDTimeStampFromString(t);
         if (ts > 0) {
+            // 精准方案：不调 setShowingTime:（否则污染 showingTime → 缓存 key 漂移到 ts_覆盖值，读不到）。
+            // showingTime 保持真实 T0，key=真实 T0 单点精准命中；updateLayouts 触发重绘重读 timeText
             DDJokerSetCachedTime(vm, ts);
-            // 直接把 viewModel 的时间改掉并让它重算布局，比 reload 整个 tableView 快且可靠
-            [vm setShowingTime:ts];
             [vm updateLayouts];
             [self layoutInternal];
             [self setNeedsLayout];
