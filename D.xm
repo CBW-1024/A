@@ -562,17 +562,12 @@ static void DDSetShowingTime(id vm, double ts) {
           vm, ivar_getName(iv), ivar_getOffset(iv), old, ts);
 }
 
-// 微信的 timeText 是懒加载缓存（m_timeText ivar —— 导出日志实测 offset=88，类型 @"NSString"）。
-// 改完 showingTime 必须让它失效，否则 %orig 仍吐旧串，"改了不生效"就卡在这一步。
-static void DDInvalidateTimeText(id vm) {
-    Ivar iv = class_getInstanceVariable([vm class], "m_timeText");
-    if (iv) {
-        const char *ty = ivar_getTypeEncoding(iv) ?: "";
-        if (ty[0] == '@' && object_getIvar(vm, iv)) {
-            object_setIvar(vm, iv, nil);   // strong ivar，置 nil 会释放旧串
-        }
-    }
-    [(ChatTimeViewModel *)vm updateLayouts];   // ChatTimeViewModel.h:20，让微信按新的 showingTime 重算
+// 改完 showingTime 让微信重算：updateLayouts 会按新的 showingTime 重新生成 m_timeText
+// （导出日志实证：写 ivar → updateLayouts → timeText 立刻返回新时间的文本）。
+// 千万不要手动把 m_timeText 置 nil：日志里出现过清掉后微信补不上、timeText 返回 (null)
+// 导致时间条空白 20 秒的情况；而 updateLayouts 本身就会重算，清缓存属于多余且有风险。
+static void DDRefreshTimeText(id vm) {
+    [(ChatTimeViewModel *)vm updateLayouts];   // ChatTimeViewModel.h:20
 }
 
 // 时间条没有消息身份时，只能用 showingTime 当 key。但我们改时间会直接改写这个 ivar，
@@ -1249,17 +1244,24 @@ static double DDTimeStampFromString(NSString *s) {
               raw, target, cached ? [NSString stringWithFormat:@"%.3f", target] : @"无");
     }
 
-    // showingTime 不是目标值就写进去，并让 m_timeText 缓存失效。
+    // showingTime 不是目标值就写进去，再让微信按新值重算 m_timeText。
     // 关开关 / 清缓存时 target 就是原始值，同一段逻辑顺带把显示还原回真实时间。
     if (target > 0 && DDShowingTimeOf(self) != target) {
         DDSetShowingTime(self, target);
-        DDInvalidateTimeText(self);
+        DDRefreshTimeText(self);
     }
 
     // 格式完全交给微信原生实现：今天只显示"15:56"、昨天"昨天 15:56"、更早带日期，
     // 全都由微信自己的分档规则决定。之前自己拼"今天 HH:mm"与原生不一致，现已不再自创格式。
     NSString *o = %orig;
     if (verbose || cached) DDLOG(@"  → 微信原生 timeText = %@", o);
+    if (!o && cached) {
+        // 日志实证（DDJokerDiag-2.log 00:20:45）：新建的 vm 上 updateLayouts 没能把 m_timeText 算出来，
+        // 微信就返回 nil，界面上表现为时间条空白。这里不自创文本填补（避免和原生日历口径不一致），
+        // 只留一条醒目标记，下次导出日志一眼能看出是"微信没算出来"还是"我们没写进去"。
+        DDLOG(@"  !! 微信原生 timeText 返回 nil vm=%p showingTime=%@ 目标=%@ —— 时间条可能空白（微信自身未重算）",
+              self, DDTimeDesc(DDShowingTimeOf(self)), DDTimeDesc(target));
+    }
     return o;
 }
 // 改时间后微信重算时间条就走这里，打出来才能确认"改了没反应"到底卡在哪一步
@@ -1285,6 +1287,21 @@ static double DDTimeStampFromString(NSString *s) {
     objc_setAssociatedObject(self, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [self dk_installTimeEditGesture];
 }
+// 微信时间条有第二种显示：点一下时间条会切出带日期的完整时间（ChatTimeCellView.h:11 onClickTimeLabel）。
+// 这里只做取证、不改行为：把点击前后的 vm.timeText 和 label 实际文本都打出来，
+// 下次导出日志就能判断它是跟着 showingTime 走（那我们改了它就自动跟着变），
+// 还是走了另一套取 CMessageWrap.m_uiCreateTime 的逻辑（那要单独处理）。不猜。
+- (void)onClickTimeLabel {
+    id vm = objc_getAssociatedObject(self, &kDDTimeVMKey);
+    UILabel *lb = [self dk_timeLabel];
+    DDLOG(@"点击时间条 cell=%p vm=%p 点击前 timeText=[%@] label.attributed=[%@]",
+          self, vm, [vm respondsToSelector:@selector(timeText)] ? [vm timeText] : nil, lb.attributedText.string);
+    %orig;
+    DDLOG(@"  → 点击后 timeText=[%@] label.attributed=[%@] showingTime=%@",
+          [vm respondsToSelector:@selector(timeText)] ? [vm timeText] : nil,
+          [self dk_timeLabel].attributedText.string,
+          vm ? DDTimeDesc(DDShowingTimeOf(vm)) : @"无");
+}
 // 长按手势装在 label 上，而 label 可能晚于 init 才创建，cell 复用时也会换，
 // 所以 didMoveToWindow 里再补一次（爱锋同样 hook 了它，且实现是幂等的）
 - (void)didMoveToWindow {
@@ -1302,7 +1319,10 @@ static double DDTimeStampFromString(NSString *s) {
     NSMutableArray *q = [NSMutableArray arrayWithObject:self];
     for (NSUInteger i = 0; i < q.count && i < 40; i++) {
         UIView *v = q[i];
-        if (v != (UIView *)self && [v isKindOfClass:[UILabel class]] && ((UILabel *)v).text.length) {
+        // 日志实证（DDJokerDiag-2.log）：m_timeLabel 的 text 恒为 nil，微信时间条走的是 attributedText。
+        // 所以这里不能只看 text，否则退化遍历时会把真正的时间 label 漏掉、手势装到别的 label 上。
+        if (v != (UIView *)self && [v isKindOfClass:[UILabel class]] &&
+            (((UILabel *)v).text.length || ((UILabel *)v).attributedText.length)) {
             return (UILabel *)v;
         }
         for (UIView *s in v.subviews) [q addObject:s];
@@ -1376,7 +1396,7 @@ static double DDTimeStampFromString(NSString *s) {
             // 顺序不能反：先写缓存（此时 showingTime 还是原始值，key 才钉得住），再改 showingTime。
             DDJokerSetCachedTime(vm, ts);
             DDSetShowingTime(vm, ts);    // 直接写 _showingTime ivar，爱锋 @0xccfd8 同款
-            DDInvalidateTimeText(vm);    // 清 m_timeText 缓存 + updateLayouts，否则微信还吐旧串
+            DDRefreshTimeText(vm);       // updateLayouts 按新的 showingTime 重算 m_timeText
             [self layoutInternal];       // ChatTimeCellView.h:9，用重算后的 timeText 重画
             [self setNeedsLayout];
             DDLOG(@"  → 已写入：目标 ts=%@ 写后 showingTime=%@", DDTimeDesc(ts), DDTimeDesc(DDShowingTimeOf(vm)));
@@ -1385,7 +1405,7 @@ static double DDTimeStampFromString(NSString *s) {
             DDJokerSetCachedTime(vm, 0);
             double rawTime = DDRawShowingTimeOf(vm);
             if (rawTime > 0) DDSetShowingTime(vm, rawTime);
-            DDInvalidateTimeText(vm);
+            DDRefreshTimeText(vm);
             [self layoutInternal];
             [self setNeedsLayout];
             DDLOG(@"  → 改后 showingTime=%@", DDTimeDesc(DDShowingTimeOf(vm)));
@@ -1393,9 +1413,12 @@ static double DDTimeStampFromString(NSString *s) {
             DDLOG(@"  → 未改动（输入为空且没有缓存，或解析失败）");
         }
         // 关键验收点：0.3 秒后把时间条上真正显示的文字打出来。
-        // 如果这里还是真实时间，说明 cell 根本没用 timeText 的返回值，日志会直接指出下一步排查方向
+        // 如果这里还是真实时间，说明 cell 根本没用 timeText 的返回值，日志会直接指出下一步排查方向。
+        // text 与 attributedText 都要打：日志实证微信时间条用的是 attributedText，只看 text 永远是 (null)。
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            DDLOG(@"  → 0.3 秒后时间条实际文本 = [%@]", [self dk_timeLabel].text);
+            UILabel *lb = [self dk_timeLabel];
+            DDLOG(@"  → 0.3 秒后时间条实际文本 = text[%@] attributed[%@]",
+                  lb.text, lb.attributedText.string);
         });
         blockAlert = nil;   // 打破 alert -> handler -> alert 的保留环
     }];
