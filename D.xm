@@ -275,24 +275,38 @@ static BOOL JokerIsReferMessage(CMessageWrap *msg) {
 // 引用消息（type 57 appmsg）的 GetDisplayContent 返回的是原始 XML 碎片
 // （<msg><appmsg><title>...</title><refermsg>...），直接回填输入框会全是 < > " 这类像正则的字符。
 // 真正显示在气泡里的回复正文其实是 <appmsg><title>，这里把它解析出来作为预填/还原文本。
+// 还原 XML/HTML 实体（引用标题里偶尔会被编码，例如回复正文含 < > & 等字符）
+static NSString *JokerUnescapeXML(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || !s.length) return s;
+    NSDictionary *map = @{@"&lt;":@"<", @"&gt;":@">", @"&amp;":@"&",
+                          @"&quot;":@"\"", @"&apos;":@"'"};
+    NSMutableString *m = [s mutableCopy];
+    for (NSString *key in map) {
+        [m replaceOccurrencesOfString:key withString:map[key]
+                               options:NSLiteralSearch range:NSMakeRange(0, m.length)];
+    }
+    return m;
+}
+
+// 引用消息（type 57 appmsg）的 GetDisplayContent 返回原始 XML 碎片，回填输入框会一团乱；
+// 真正显示在气泡里的回复正文就是 <appmsg><title>。引用消息 XML 里 <title> 只此一处
+// （被引用内容在 <refermsg> 里用的是 <content>/<msgtitle>，不是 <title>，见上传样本），
+// 所以用一条正则一次性精确捕获 <title ...>内容</title ...>，无需一堆 if 兜底。
 static NSString *JokerReferMessageTitle(CMessageWrap *msg) {
     NSString *xml = [msg m_nsContent];
     if (![xml isKindOfClass:[NSString class]] || !xml.length) return nil;
-    NSString *open = @"<title>";
-    NSRange ro = [xml rangeOfString:open options:NSCaseInsensitiveSearch];
-    if (ro.location == NSNotFound) return nil;
-    NSUInteger start = ro.location + ro.length;
-    NSRange rc = [xml rangeOfString:@"</title>" options:NSCaseInsensitiveSearch range:NSMakeRange(start, xml.length - start)];
-    if (rc.location == NSNotFound) return nil;
-    NSString *t = [xml substringWithRange:NSMakeRange(start, rc.location - start)];
-    // 引用标题里可能带 HTML 实体，简单还原最常见的几个
-    t = [t stringByReplacingOccurrencesOfString:@"&lt;" withString:@"<"];
-    t = [t stringByReplacingOccurrencesOfString:@"&gt;" withString:@">"];
-    t = [t stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
-    t = [t stringByReplacingOccurrencesOfString:@"&quot;" withString:@"\""];
-    t = [t stringByReplacingOccurrencesOfString:@"&apos;" withString:@"'"];
-    // 去掉首尾空白，避免预填出现空行
+    static NSRegularExpression *re;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:@"<title\\s*>(.*?)</title\\s*>"
+                                                        options:NSRegularExpressionCaseInsensitive | NSRegularExpressionDotMatchesLineSeparators
+                                                          error:nil];
+    });
+    NSTextCheckingResult *r = [re firstMatchInString:xml options:0 range:NSMakeRange(0, xml.length)];
+    if (!r || r.numberOfRanges < 2) return nil;
+    NSString *t = [xml substringWithRange:[r rangeAtIndex:1]];
     t = [t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    t = JokerUnescapeXML(t);
     return t.length ? t : nil;
 }
 
@@ -537,19 +551,17 @@ static UITableView *JokerFindTableView(UIView *view) {
 // 必须显式 setContent: + forceDisplayInSync，否则要等 cell 复用/重进页面才看得到变化。
 static void JokerApplyTextToRichView(id richView, NSString *text) {
     if (!richView || !text) return;
-    if (![richView respondsToSelector:@selector(setContent:)]) return;
     [richView setContent:text];
-    if ([richView respondsToSelector:@selector(calculateAndUpdateFrame)]) [richView calculateAndUpdateFrame];
-    if ([richView respondsToSelector:@selector(forceDisplayInSync)]) [richView forceDisplayInSync];
-    if ([richView isKindOfClass:[UIView class]]) [richView setNeedsDisplay];
+    [richView calculateAndUpdateFrame];
+    [richView forceDisplayInSync];
+    [richView setNeedsDisplay];
 }
 
 // TextMessageViewModel 把 contentText 懒加载缓存进 ivar，不清就一直返回旧值，
 // 这正是"改完要退出重进才生效"的根因（resetLayoutCache 见 BaseMessageViewModel.h:78）
 static void JokerResetViewModelCache(CommonMessageCellView *cell) {
-    if (![cell respondsToSelector:@selector(viewModel)]) return;
     id vm = cell.viewModel;
-    if ([vm respondsToSelector:@selector(resetLayoutCache)]) [vm resetLayoutCache];
+    [vm resetLayoutCache];
 }
 
 // 与爱锋一致：不依赖 tableView reload，而是直接触发 cell 自身的显示/布局流程
@@ -568,15 +580,13 @@ static void JokerRefreshCellDirectly(CommonMessageCellView *cell) {
                 cached = [msg GetDisplayContent];
             }
         }
-        if ([cell respondsToSelector:@selector(getRichTextView)]) {
-            JokerApplyTextToRichView([(TextMessageCellView *)cell getRichTextView], cached);
-        }
+        JokerApplyTextToRichView([(TextMessageCellView *)cell getRichTextView], cached);
         [(TextMessageCellView *)cell layoutContentView];
     } else if ([cell isKindOfClass:%c(WCPayTransferMessageCellView)]) {
         [(WCPayTransferMessageCellView *)cell layoutContentView];
         // 金额是在这两个方法里落到 label 上的，只 layout 不够
-        if ([cell respondsToSelector:@selector(updateTitleLabel)]) [(WCPayTransferMessageCellView *)cell updateTitleLabel];
-        if ([cell respondsToSelector:@selector(updateDescLabel)]) [(WCPayTransferMessageCellView *)cell updateDescLabel];
+        [(WCPayTransferMessageCellView *)cell updateTitleLabel];
+        [(WCPayTransferMessageCellView *)cell updateDescLabel];
     } else if ([cell isKindOfClass:%c(ImageMessageCellView)]) {
         [(ImageMessageCellView *)cell showImage];
     }
@@ -664,8 +674,6 @@ static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *origin
     // 用 msg 判定会让转账消息既拿不到菜单、也弹不出修改框
     if (!JokerEnabledForCell(cell)) return original;
     if (!JokerIsSupportedCell(cell)) return original;
-
-    if (!%c(MMMenuItem)) return original;
 
     UIImage *icon = [[UIImage systemImageNamed:@"face.smiling.fill"] imageWithTintColor:[UIColor whiteColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
     MMMenuItem *newItem = [(MMMenuItem *)[%c(MMMenuItem) alloc] initWithTitle:@"小丑" icon:icon target:cell action:@selector(joker_handleMenuItem:)];
@@ -789,8 +797,8 @@ static void JokerInvalidateAllLayout(void) {
     // 那个函数恒为 NO，会把整个转账替换挡掉 —— "金额改了没反应"就是这么来的。
     // 本方法只挂在 WCPayTransferMessageCellView 上，调用方本身就是转账 cell。
     if (!DDJokerCachedAmount(msg) && !gJokerNeedsResetLayout) return;
-    if ([self respondsToSelector:@selector(updateTitleLabel)]) [self updateTitleLabel];
-    if ([self respondsToSelector:@selector(updateDescLabel)]) [self updateDescLabel];
+    [self updateTitleLabel];
+    [self updateDescLabel];
 }
 %end
 
@@ -860,7 +868,6 @@ static void DDImageApplyReplacementToCell(id cell) {
     if (!cfg.imageEnabled) return original;
     CMessageWrap *msg = self.viewModel.messageWrap;
     if (![msg IsImgMsg]) return original;
-    if (!%c(MMMenuItem)) return original;
     UIImage *icon = [[UIImage systemImageNamed:@"face.smiling.fill"] imageWithTintColor:[UIColor whiteColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
     MMMenuItem *newItem = [(MMMenuItem *)[%c(MMMenuItem) alloc] initWithTitle:@"小丑" icon:icon target:self action:@selector(dk_changeChatImage)];
     NSMutableArray *newItems = [NSMutableArray arrayWithArray:original];
@@ -1065,7 +1072,7 @@ static NSString *DDTimeStringForDisplay(NSString *originText, double ts) {
 
     NSNumber *cached = DDJokerCachedTime(vm);
     double base = cached ? [cached doubleValue]
-                         : ([vm respondsToSelector:@selector(showingTime)] ? [vm showingTime] : 0);
+                         : vm.showingTime;
     NSString *defaultText = base > 0 ? [DDTimeInputFormatter() stringFromDate:[NSDate dateWithTimeIntervalSince1970:base]] : @"";
 
     // 与爱锋一致：微信原生 WCUIAlertView，标题/提示文案都沿用它的（@0xbb174 / @0x6287e8 / @0x628828）
@@ -1085,8 +1092,8 @@ static NSString *DDTimeStringForDisplay(NSString *originText, double ts) {
         if (ts > 0) {
             DDJokerSetCachedTime(vm, ts);
             // 直接把 viewModel 的时间改掉并让它重算布局，比 reload 整个 tableView 快且可靠
-            if ([vm respondsToSelector:@selector(setShowingTime:)]) [vm setShowingTime:ts];
-            if ([vm respondsToSelector:@selector(updateLayouts)]) [vm updateLayouts];
+            [vm setShowingTime:ts];
+            [vm updateLayouts];
             [self layoutInternal];
             [self setNeedsLayout];
         }
