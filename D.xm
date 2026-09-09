@@ -796,10 +796,20 @@ static void JokerInvalidateAllLayout(void) {
 
 #pragma mark - ①b 聊天图片修改
 
-@interface DDImagePickerDelegate : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
+// 微信原生相册回调代理
+// 协议方法选择器取自爱锋 DKLaunchViewController 符号：
+//   MMImagePickerController:didFinishPickingImageWithEditImageAttr:
+//   MMImagePickerControllerDidCancel: / MMImagePickerControllerDidSkip:
+@protocol DDMMImagePickerControllerDelegate <NSObject>
+- (void)MMImagePickerController:(id)picker didFinishPickingImageWithEditImageAttr:(id)attr;
+- (void)MMImagePickerControllerDidCancel:(id)picker;
+- (void)MMImagePickerControllerDidSkip:(id)picker;
+@end
+
+@interface DDWeChatImagePickerDelegate : NSObject <DDMMImagePickerControllerDelegate>
 @property (nonatomic, assign) unsigned int mesLocalID;
 @property (nonatomic, weak) id viewController;
-- (void)dd_saveImage:(UIImage *)image dismissPicker:(UIImagePickerController *)picker;
+- (void)dd_saveImage:(UIImage *)image;
 @end
 
 static NSString *DDImageReplacementPath(unsigned int mesLocalID) {
@@ -879,15 +889,25 @@ static void DDImageApplyReplacementToCell(id cell) {
     if (![msg IsImgMsg]) return;
     id vc = JokerGetViewControllerFromView((UIView *)(id)self);
     if (!vc) return;
-    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
-    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    picker.allowsEditing = NO;
-    DDImagePickerDelegate *delegate = [[DDImagePickerDelegate alloc] init];
+    // 微信原生相册 MMImagePickerController（MMImagePickerController.h:80 只返回单个 asset；
+    // :84 photoPicker 返回要 present 的 VC；:81/197 m_delegate/setM_delegate:）
+    if (!%c(MMImagePickerController)) return;
+    id picker = [[%c(MMImagePickerController) alloc] initForJustReturnMMAsset:YES
+                                                             withAdjustRevertIndex:0
+                                                          withDirectToFirstAlbum:YES
+                                                       withOnlyShowVideoMessage:NO
+                                                    withNotShowVideoSizeAlertView:YES
+                                                         withPickerVCForceFullScrenn:NO];
+    if (!picker) return;
+    DDWeChatImagePickerDelegate *delegate = [[DDWeChatImagePickerDelegate alloc] init];
     delegate.mesLocalID = msg.m_uiMesLocalID;
     delegate.viewController = vc;
-    picker.delegate = delegate;
+    [picker setM_delegate:delegate];
+    // 强引用 delegate：picker 不持有外部 delegate，避免回调时已被释放
     objc_setAssociatedObject(picker, "dd_picker_delegate", delegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [vc presentViewController:picker animated:YES completion:nil];
+    id pickerVC = [picker photoPicker];
+    if (!pickerVC) pickerVC = picker;
+    [vc presentViewController:pickerVC animated:YES completion:nil];
 }
 - (void)showImage {
     %orig;
@@ -904,60 +924,73 @@ static void DDImageApplyReplacementToCell(id cell) {
 }
 %end
 
-@implementation DDImagePickerDelegate
-- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<NSString *,id> *)info {
-    UIImage *image = info[UIImagePickerControllerOriginalImage];
-    if (image) {
-        [self dd_saveImage:image dismissPicker:picker];
-    } else {
-        [picker dismissViewControllerAnimated:YES completion:nil];
-    }
+@implementation DDWeChatImagePickerDelegate
+
+#pragma mark - 微信原生相册 MMImagePickerController
+- (void)MMImagePickerControllerDidCancel:(__unused id)picker { }
+- (void)MMImagePickerControllerDidSkip:(__unused id)picker { }
+- (void)MMImagePickerController:(id)picker didFinishPickingImageWithEditImageAttr:(id)attr {
+    // 取选中 asset 列表里的第一个，导出原图 NSData
+    // 头文件证据：MMAsset.h:67 -(void)asyncImageOriginData:(BOOL)completion:(id)errorBlock:(id);
+    NSArray *assets = nil;
+    if ([picker respondsToSelector:@selector(selectedImageAssets)]) assets = [picker selectedImageAssets];
+    id asset = assets.firstObject;
+    if (!asset && [attr respondsToSelector:@selector(asyncImageOriginData:completion:errorBlock:)]) asset = attr;
+    if (!asset) return;
+    [asset asyncImageOriginData:YES completion:^(id data) {
+        if ([data isKindOfClass:[NSData class]]) {
+            UIImage *img = [UIImage imageWithData:data];
+            if (img) [self dd_saveImage:img];
+        }
+    } errorBlock:^(id) { }];
 }
-- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
-    [picker dismissViewControllerAnimated:YES completion:nil];
-}
-- (void)dd_saveImage:(UIImage *)image dismissPicker:(UIImagePickerController *)picker {
+
+- (void)dd_saveImage:(UIImage *)image {
     NSString *path = DDImageReplacementPath(self.mesLocalID);
     NSData *data = UIImagePNGRepresentation(image);
-    if (data) [data writeToFile:path atomically:YES];
+    if (!data) return;
+    [data writeToFile:path atomically:YES];
 
     // 选完图后 picker 以动画消失，用户点"选取"的那个 tap 会在过渡窗口被投递到
     // 已经露出来的 ImageMessageCellView，触发微信的图片预览（全屏浏览器）打开。
-    // 在 dismiss 期间屏蔽全窗交互，吞掉这次误触，过渡结束后再恢复。
-    BOOL wasIgnoring = [[UIApplication sharedApplication] isIgnoringInteractionEvents];
-    if (!wasIgnoring) [[UIApplication sharedApplication] beginIgnoringInteractionEvents];
-
-    [picker dismissViewControllerAnimated:YES completion:^{
-        // 之前这里要求 viewController 必须是 BaseMsgContentViewController，否则直接 return，
-        // 刷新根本没执行 —— 这就是"改完图要退出重进才生效"的原因
-        dispatch_async(dispatch_get_main_queue(), ^{
-            id vc = self.viewController;
-            UITableView *tv = nil;
-            if ([vc isKindOfClass:%c(BaseMsgContentViewController)]) {
-                tv = [(BaseMsgContentViewController *)vc getMsgTableView];
+    // 过渡期间屏蔽 keyWindow 交互，吞掉这次误触（iOS 18 专用，不兼容旧系统）。
+    UIWindow *kw = nil;
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]] && ((UIWindowScene *)s).activationState == UISceneActivationStateForegroundActive) {
+            for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                if (w.isKeyWindow) { kw = w; break; }
             }
-            BOOL hit = NO;
-            if ([tv isKindOfClass:[UITableView class]]) {
-                // visibleCells 出来的是 UITableViewCell，ImageMessageCellView 是它 contentView 里的子 view，
-                // 直接判类型永远命中不了 —— 必须用递归查找（这就是"改完图要重进才生效"的真因）
-                for (ImageMessageCellView *cellView in DDVisibleCellViewsOfClass(tv, %c(ImageMessageCellView))) {
-                    CMessageWrap *m = JokerGetMessageWrapFromCell((CommonMessageCellView *)cellView);
-                    if (m.m_uiMesLocalID == self.mesLocalID) {
-                        if ([cellView respondsToSelector:@selector(showImage)]) [cellView showImage];
-                        hit = YES;
-                    }
+        }
+        if (kw) break;
+    }
+    BOOL wasEnabled = kw.userInteractionEnabled;
+    if (wasEnabled) kw.userInteractionEnabled = NO;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id vc = self.viewController;
+        UITableView *tv = nil;
+        if ([vc isKindOfClass:%c(BaseMsgContentViewController)]) {
+            tv = [(BaseMsgContentViewController *)vc getMsgTableView];
+        }
+        BOOL hit = NO;
+        if ([tv isKindOfClass:[UITableView class]]) {
+            // visibleCells 出来的是 UITableViewCell，ImageMessageCellView 是它 contentView 里的子 view，
+            // 直接判类型永远命中不了 —— 必须用递归查找（这就是"改完图要重进才生效"的真因）
+            for (ImageMessageCellView *cellView in DDVisibleCellViewsOfClass(tv, %c(ImageMessageCellView))) {
+                CMessageWrap *m = JokerGetMessageWrapFromCell((CommonMessageCellView *)cellView);
+                if (m.m_uiMesLocalID == self.mesLocalID) {
+                    if ([cellView respondsToSelector:@selector(showImage)]) [cellView showImage];
+                    hit = YES;
                 }
             }
-            if (!hit) JokerInvalidateAllLayout();
+        }
+        if (!hit) JokerInvalidateAllLayout();
 
-            // 过渡动画约 0.35s，多等一会再恢复交互，确保误触已被吞掉
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (!wasIgnoring && [[UIApplication sharedApplication] isIgnoringInteractionEvents]) {
-                    [[UIApplication sharedApplication] endIgnoringInteractionEvents];
-                }
-            });
+        // 过渡动画约 0.35s，多等一会再恢复交互，确保误触已被吞掉
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!wasEnabled && kw.userInteractionEnabled == NO) kw.userInteractionEnabled = YES;
         });
-    }];
+    });
 }
 @end
 
