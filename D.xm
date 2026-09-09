@@ -1615,9 +1615,26 @@ static UIViewController *DDViewControllerOfView(id view) {
 static UIViewController *DDTopViewController(void) {
     @try {
         UIWindow *win = nil;
-        NSArray *wins = [[UIApplication sharedApplication] windows];
-        for (UIWindow *w in wins) { if ([w isKeyWindow]) { win = w; break; } }
-        if (!win) win = wins.firstObject;
+        // iOS 13+ 标准写法：从 connectedScenes 取 UIWindowScene 的 windows。
+        // [UIApplication windows] 自 iOS 15 起弃用，越狱真机 iOS 18 不该再用。
+        NSArray *scenes = [[[UIApplication sharedApplication] connectedScenes] allObjects];
+        for (id scene in scenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            for (UIWindow *w in ws.windows) {
+                if (w.isKeyWindow) { win = w; break; }
+            }
+            if (win) break;
+        }
+        if (!win) {
+            // 极端情况（keyWindow 为空）：取第一个 windowScene 的首个 window 兜底
+            for (id scene in scenes) {
+                if ([scene isKindOfClass:[UIWindowScene class]]) {
+                    win = ((UIWindowScene *)scene).windows.firstObject;
+                    if (win) break;
+                }
+            }
+        }
         UIViewController *vc = win.rootViewController;
         NSInteger guard = 0;
         while (vc && guard++ < 32) {
