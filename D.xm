@@ -196,6 +196,34 @@
 - (void)updateCount;   // ContactsViewController.h:126，重算并刷新“X个朋友”计数显示
 @end
 
+// 余额/零钱通详情页的前向声明：每加一个新 %hook 类，都要补一行 @interface 让编译器把 self 视作该类，
+// 否则 Logos %hook 会因“no visible @interface ... declares the selector 'viewWillAppear:'”编译失败
+// （教训：之前 friendCount 修复就栽过一次，已补 ContactsViewController；这次不能再栽）。
+// ScrollNumber.h:140 / WCPayBalanceDetailViewController.h:140 viewWillAppear: 是 UIViewController 自带的方法，
+// 声明里一行空方法签名即可，重点是让编译器认得这两个类的存在。
+@interface WCPayBalanceDetailViewController : UIViewController
+@end
+
+@interface WCPayLQTDetailViewController : UIViewController
+@end
+
+// WCPayBalanceInfo.h: 服务页顶部"钱包 ¥2.40"读 wallet_balance（getter L28），
+// 主页/详情页显示 m_uiAvailableBalance（getter L23）。之前 ScrollNumber 白名单不含服务页，
+// 数据源又没 hook，所以服务入口的 ¥2.40 永远显示真实值。这里把数据层 getter 也接管，
+// 作为 ScrollNumber hook 的正交双保险 —— 任何视图、任何 VC 读 WCPayBalanceInfo 拿到的都是修改值。
+@interface WCPayBalanceInfo : NSObject
+- (unsigned long long)wallet_balance;          // WCPayBalanceInfo.h:28  服务入口读这个
+- (unsigned long long)m_uiAvailableBalance;    // WCPayBalanceInfo.h:23  主页/详情页读这个
+- (unsigned long long)m_uiTotalBalance;        // WCPayBalanceInfo.h:27  备份
+@end
+
+// WCPayMainViewControllerV2 服务页（"我"→ 服务 tab）顶层 VC，
+// dump 头文件 WCPayMainViewControllerV2.h:1（继承 NSObject，可能是 NewPay 的 MM 容器）和 :115 viewWillAppear:
+// 直接声明方法让编译器认得，运行时再走 viewWillAppear: 兜底刷新 ScrollNumber
+@interface WCPayMainViewControllerV2 : NSObject
+- (void)viewWillAppear:(BOOL)animated;
+@end
+
 // ScrollNumber.h 确认存在：-(void)updateNumber:(unsigned long long); -(void)defaultNumber:(unsigned long long);
 //                          -(unsigned long long)currentNumber; -(unsigned long long)getNumber;
 // 注意 isLQT：爱锋 hooks_final.json 里它标记为 "new"，说明那本来就不是微信的 API，
@@ -206,6 +234,7 @@
 - (BOOL)isLQT;                                 // 本插件 %new 实现，见下方 hook
 - (void)updateNumber:(unsigned long long)a0;
 - (void)defaultNumber:(unsigned long long)a0;
+- (void)setCurrentNumber:(unsigned long long)a0;   // ScrollNumber.h:39，详情页设数字的入口（之前漏掉，导致我的零钱/零钱通详情页只走 %orig 真值）
 - (unsigned long long)currentNumber;
 @end
 
@@ -1602,6 +1631,10 @@ static BOOL DDIsWalletBalancePage(UIViewController *vc) {
     // 余额详情页 / 零钱通详情页
     if ([cls rangeOfString:@"WCPayBalanceDetail"].location != NSNotFound) return YES;
     if ([cls rangeOfString:@"WCPayLQT"].location != NSNotFound) return YES;
+    // 服务页（"我"→ 服务 tab）：顶部的"钱包 ¥2.40"入口卡片就在这里。
+    // WCPayMainViewControllerV2 是服务页 VC（dump 头文件 WCPayMainViewControllerV2.h:1），
+    // 把这条加进白名单后，这页里所有 ScrollNumber 也会被 defaultNumber:/updateNumber:/setCurrentNumber: 接管。
+    if ([cls rangeOfString:@"WCPayMainViewControllerV2"].location != NSNotFound) return YES;
     return NO;
 }
 
@@ -1664,6 +1697,8 @@ static unsigned long long DDClampFen(unsigned long long fen) {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         DDBalancePageKind kind = cfg.balanceEnabled ? DDBalancePageKindOf(self) : DDBalancePageNone;
         if (kind == DDBalancePageNone) { %orig(original); return; }   // 非钱包页，不插手
+        DDJokerHit(@"余额.defaultNumber:");
+        DDLOG(@"余额.defaultNumber: kind=%ld → %llu 分", (long)kind, DDClampFen(DDBalanceFenValue()));
         if (kind == DDBalancePageLQT) {
             %orig([cfg hasLingtongValue] ? DDClampFen(DDLingtongFenValue()) : original);
         } else {
@@ -1688,6 +1723,145 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     } @catch (NSException *exception) {
         %orig(original);
     }
+}
+
+// 详情页（我的零钱 WCPayBalanceDetailViewController、零钱通 WCPayLQTDetailViewController）
+// 设置 ScrollNumber 数字时走的入口是 setCurrentNumber:（ScrollNumber.h:39），不是 defaultNumber:/updateNumber:。
+// 之前只 hook 那两个，导致详情页显示真实 ¥2.40/¥0.10 —— 这次补上 setter hook，拦下"任何设置数字"路径。
+// 和上面两条 hook 共用 DDIsWalletBalancePage + DDBalancePageKindOf 判定，非钱包页（倒计时等）一律走 %orig。
+- (void)setCurrentNumber:(unsigned long long)original {
+    @try {
+        DDJokerHit(@"余额.setCurrentNumber:");
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        DDBalancePageKind kind = cfg.balanceEnabled ? DDBalancePageKindOf(self) : DDBalancePageNone;
+        if (kind == DDBalancePageNone) { %orig(original); return; }
+        if (kind == DDBalancePageLQT) {
+            %orig([cfg hasLingtongValue] ? DDClampFen(DDLingtongFenValue()) : original);
+        } else {
+            %orig([cfg hasBalanceValue] ? DDClampFen(DDBalanceFenValue()) : original);
+        }
+    } @catch (NSException *exception) {
+        %orig(original);
+    }
+}
+%end
+
+#pragma mark - ④.2 详情页 viewWillAppear 兜底强制刷新
+
+// 兜底理由：dump 头文件只列公开方法，抓不到 ScrollNumber 内部 setCurrentNumber→updateNumber 的调用链，
+// 之前只 hook defaultNumber:/updateNumber: 会让详情页走漏。setCurrentNumber: hook 已补上之后自动接管，
+// 这里再加一道保险：进详情页时主动遍历视图树找 ScrollNumber 实例，强制 setCurrentNumber + updateNumber
+// —— 两条路径都走我们的 hook，按 cfg 自动替换；用户看到的视觉效果就是"打开详情页时数字从真值滚到自定义值"。
+static void DDWalkForceScrollNumber(UIView *root, unsigned long long target) {
+    if (!root || target == 0) return;
+    Class snCls = NSClassFromString(@"ScrollNumber");
+    if (!snCls) return;
+    if ([root isKindOfClass:snCls]) {
+        if ([root respondsToSelector:@selector(setCurrentNumber:)]) [(id)root setCurrentNumber:target];
+        if ([root respondsToSelector:@selector(updateNumber:)]) [(id)root updateNumber:target];
+    }
+    if (![root isKindOfClass:[UIView class]]) return;
+    for (UIView *s in ((UIView *)root).subviews) {
+        DDWalkForceScrollNumber(s, target);
+    }
+}
+
+%hook WCPayBalanceDetailViewController
+// 头文件证据：WCPayBalanceDetailViewController.h:140 viewWillAppear:、:108 updateBalanceTitleLabel
+// 我们的 hook 走 viewWillAppear: 末尾：VC 布局已完成、ScrollNumber 已挂上、真实数字已显示，
+// 此时再强刷一次，把数字替换为自定义值，避免"返回页面看到的是上一次缓存的真值"。
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (!cfg.balanceEnabled || ![cfg hasBalanceValue]) return;
+    unsigned long long target = DDClampFen(DDBalanceFenValue());
+    DDWalkForceScrollNumber([self view], target);
+    DDLOG(@"BalanceDetail.viewWillAppear 强刷 ScrollNumber → %llu 分", target);
+}
+%end
+
+%hook WCPayLQTDetailViewController
+// 头文件证据：WCPayLQTDetailViewController.h:166 viewWillAppear:、:121 refreshViewWithData:
+// LQT 详情页与 Balance 详情页分属不同 VC，各自 viewWillAppear: 各 hook 一次，不能合并。
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (!cfg.balanceEnabled || ![cfg hasLingtongValue]) return;
+    unsigned long long target = DDClampFen(DDLingtongFenValue());
+    DDWalkForceScrollNumber([self view], target);
+    DDLOG(@"LQTDetail.viewWillAppear 强刷 ScrollNumber → %llu 分", target);
+}
+%end
+
+#pragma mark - ④.3 数据源层兜底：WCPayBalanceInfo getter hook
+
+// 为什么需要：服务端首页/服务页/账单页/资产页可能直接用 UILabel 显示余额文本，而不是 ScrollNumber；
+// ScrollNumber hook 仅对"在白名单 VC 里且通过 setter 设置数字的控件"生效，
+// 直接读 WCPayBalanceInfo.wallet_balance / m_uiAvailableBalance 的代码完全漏过。
+// 把数据层 getter 也接管：任何视图、任何 VC 读这两个字段拿到的就是修改值。
+// 与 ScrollNumber hook 是正交双保险 —— 一个修了另一个不漏。
+//
+// 开关处理：cfg.balanceEnabled 关掉时一律 %orig 返回真实值，零侵入；
+// 没设置自定义值（!hasBalanceValue）也走 %orig，行为完全等价于没装插件。
+%hook WCPayBalanceInfo
+- (unsigned long long)wallet_balance {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled && [cfg hasBalanceValue]) {
+            unsigned long long v = DDClampFen(DDBalanceFenValue());
+            DDJokerHit(@"WCPayBalanceInfo.wallet_balance");
+            DDLOG(@"WCPayBalanceInfo.wallet_balance → %llu 分（这是服务页\"钱包\"入口的数字源）", v);
+            return v;
+        }
+    } @catch (NSException *e) {}
+    unsigned long long r = %orig;
+    DDLOG(@"WCPayBalanceInfo.wallet_balance → %llu 分（未替换）", r);
+    return r;
+}
+
+- (unsigned long long)m_uiAvailableBalance {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled && [cfg hasBalanceValue]) {
+            unsigned long long v = DDClampFen(DDBalanceFenValue());
+            DDJokerHit(@"WCPayBalanceInfo.m_uiAvailableBalance");
+            DDLOG(@"WCPayBalanceInfo.m_uiAvailableBalance → %llu 分（主页/详情页余额数字源）", v);
+            return v;
+        }
+    } @catch (NSException *e) {}
+    unsigned long long r = %orig;
+    DDLOG(@"WCPayBalanceInfo.m_uiAvailableBalance → %llu 分（未替换）", r);
+    return r;
+}
+
+- (unsigned long long)m_uiTotalBalance {
+    // 备份：部分页面（如账单摘要、零钱通总额）可能读这个。这里同样在开启自定义时返回我们的值，
+    // 不开 / 没设置都 %orig 自然走真实值。
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled && [cfg hasBalanceValue]) {
+            unsigned long long v = DDClampFen(DDBalanceFenValue());
+            DDJokerHit(@"WCPayBalanceInfo.m_uiTotalBalance");
+            return v;
+        }
+    } @catch (NSException *e) {}
+    return %orig;
+}
+%end
+
+#pragma mark - ④.4 服务页兜底：WCPayMainViewControllerV2 viewWillAppear 强刷
+
+// 服务页（"我"→ 服务 tab）的 viewWillAppear:，dump 头文件 WCPayMainViewControllerV2.h:115 已确认存在。
+// 与详情页同套路：进页时遍历视图树主动找 ScrollNumber 强刷一次，把数字从 ¥2.40 滚到自定义值。
+// 即使 ScrollNumber hook 已经覆盖（白名单已加），这里再加一道保险，且日志能精确打出"哪一页、刷了什么"。
+%hook WCPayMainViewControllerV2
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (!cfg.balanceEnabled || ![cfg hasBalanceValue]) return;
+    unsigned long long target = DDClampFen(DDBalanceFenValue());
+    DDLOG(@"WCPayMainViewControllerV2.viewWillAppear 进服务页，强刷 ScrollNumber → %llu 分", target);
+    DDWalkForceScrollNumber([self view], target);
 }
 %end
 
