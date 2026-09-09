@@ -1595,8 +1595,9 @@ typedef NS_ENUM(NSInteger, DDBalancePageKind) {
     DDBalancePageLQT           // 零钱通
 };
 
-// 沿 UIResponder 响应链找所属 VC。ScrollNumber 实际是 UIView 子类（有 container/clipView 等视觉属性）
-// 所以一定有 superview，能沿响应链上钻到 VC；上限 128 防成环。view 不是 UIResponder 时返 nil 不报错。
+// 沿 UIResponder 响应链找所属 VC（备用：DDTopViewController 拿不到时兜底用）。
+// ⚠️ 已确认这是之前"详情页反转"的根因：详情页 push/modal 出来后，ScrollNumber 的响应链有时
+// 会指到容器 VC / 主页 VC，而不详情页自身 VC —— 导致详情页被当成主页、再用附近字样误判。
 static UIViewController *DDViewControllerOfView(id view) {
     if (!view || ![view isKindOfClass:[UIResponder class]]) return nil;
     UIResponder *r = (UIResponder *)view;
@@ -1608,65 +1609,83 @@ static UIViewController *DDViewControllerOfView(id view) {
     return nil;
 }
 
+// 对齐爱锋 isLQT：用【最上层 presented VC】判定当前页（DKHelper.currentViewController 同款）。
+// 顶层 VC 恒为当前可见页：主页是 WCPayMainViewControllerV2、进详情后是 WCPayLQTDetail/WCPayBalanceDetail，
+// 不会像响应链那样指错。这是修好"两页都反"的关键。
+static UIViewController *DDTopViewController(void) {
+    @try {
+        UIWindow *win = nil;
+        NSArray *wins = [[UIApplication sharedApplication] windows];
+        for (UIWindow *w in wins) { if ([w isKeyWindow]) { win = w; break; } }
+        if (!win) win = wins.firstObject;
+        UIViewController *vc = win.rootViewController;
+        NSInteger guard = 0;
+        while (vc && guard++ < 32) {
+            if ([vc isKindOfClass:[UINavigationController class]] && ((UINavigationController *)vc).visibleViewController)
+                vc = ((UINavigationController *)vc).visibleViewController;
+            else if ([vc isKindOfClass:[UITabBarController class]] && ((UITabBarController *)vc).selectedViewController)
+                vc = ((UITabBarController *)vc).selectedViewController;
+            else if (vc.presentedViewController)
+                vc = vc.presentedViewController;
+            else break;
+        }
+        return vc ?: DDViewControllerOfView(nil);
+    } @catch (NSException *e) { return nil; }
+}
+
+// 在 sn 的祖先链 + 兄弟/一层子视图里找 UILabel，text 按 exact/hasPrefix 匹配 key。
+// 主页卡标题就在 ScrollNumber 附近（爱锋 isLQT 主分支：self.superview×3.subviews[0].subviews[1].text）。
+static BOOL DDAncestorSiblingsHasText(id sn, NSString *key, BOOL exact) {
+    @try {
+        UIView *v = (UIView *)sn;
+        for (int depth = 0; depth < 10 && v; depth++) {
+            UIView *parent = v.superview;
+            if (parent) {
+                for (UIView *sib in parent.subviews) {
+                    if (sib == v) continue;
+                    if ([sib isKindOfClass:[UILabel class]]) {
+                        NSString *t = ((UILabel *)sib).text;
+                        if (t.length && (exact ? [t isEqualToString:key] : [t hasPrefix:key])) return YES;
+                    }
+                    for (UIView *sub in sib.subviews) {
+                        if ([sub isKindOfClass:[UILabel class]]) {
+                            NSString *t = ((UILabel *)sub).text;
+                            if (t.length && (exact ? [t isEqualToString:key] : [t hasPrefix:key])) return YES;
+                        }
+                    }
+                }
+            }
+            v = parent;
+        }
+    } @catch (NSException *e) {}
+    return NO;
+}
+
 static DDBalancePageKind DDBalancePageKindOf(id sn) {
     @try {
-        UIViewController *vc = DDViewControllerOfView(sn);
+        // ① 用顶层 presented VC 判定当前页（对齐爱锋 currentViewController，修详情页反转的根因）
+        UIViewController *vc = DDTopViewController();
         if (!vc) return DDBalancePageNone;
         NSString *cls = NSStringFromClass([vc class]);
-        // 详情页：VC 类名最可靠
+
+        // ② 详情页：VC 类名最稳（诊断日志已确认 WCPayLQTDetailViewController /
+        //    WCPayBalanceDetailViewController 在当前微信存在）。顶层 VC 正确后，这条必然命中。
         if ([cls rangeOfString:@"WCPayLQTDetailViewController"].location != NSNotFound) return DDBalancePageLQT;
         if ([cls rangeOfString:@"WCPayBalanceDetailViewController"].location != NSNotFound) return DDBalancePageBalance;
-        // 主页：钱包主页 VC 是 WCPayMainViewControllerV2（WCPayMainViewControllerV2.h:1，诊断日志已确认存在），
-        //   可能被 KindaViewController 包装（爱锋反汇编里见 KindaViewController + 标题"钱包"），
-        //   两个类名都匹配。
-        //   主页结构是 WCPayMainViewControllerV2 的 list（每个 cell = WCPayWalletViewCell，
-        //   cell.dataView = WCPayTableCellViewDataView），ScrollNumber 在 dataView.m_numberView 里，
-        //   卡标题在 dataView.m_title 里（"零钱"/"零钱通"/"银行卡"）。
-        //   上一版视图树搜"零钱通"字样在主页零钱通卡扑空（label 在更远层级），
-        //   改用爱锋式结构定位的现代化替身：沿 superview 上钻找 WCPayTableCellViewDataView，读 m_title 判定。
-        BOOL isWalletHome = ([cls rangeOfString:@"WCPayMainViewControllerV2"].location != NSNotFound) ||
-                            ([cls rangeOfString:@"KindaViewController"].location != NSNotFound);
+
+        // ③ 钱包主页（爱锋 isLQT 主分支：KindaViewController + title"钱包"）：
+        //   用【精确匹配】"零钱通"判定 LQT（爱锋详情页支是 isEqual: 精确，正好避开"转入零钱通"小字误判）；
+        //   找不到精确"零钱通"的卡 → 余额（零钱卡标题正好是"零钱"，不会命中"零钱通"精确匹配）。
+        //   找不到"零钱"也说明不是金额入口卡（银行卡等）→ 不动，防误伤。
+        BOOL isWalletHome = (([cls rangeOfString:@"KindaViewController"].location != NSNotFound &&
+                              [[vc title] isEqualToString:@"钱包"]) ||
+                             ([cls rangeOfString:@"WCPayMainViewControllerV2"].location != NSNotFound));
         if (isWalletHome) {
-            // ① 优先读承载该数字的 cell 自己的标题（最稳）
-            UIView *v = (UIView *)sn;
-            Class dataViewCls = NSClassFromString(@"WCPayTableCellViewDataView");
-            for (int depth = 0; depth < 8 && v; depth++) {
-                if (dataViewCls && [v isKindOfClass:dataViewCls]) {
-                    id title = [v performSelector:@selector(m_title)];
-                    if ([title isKindOfClass:[UILabel class]]) {
-                        NSString *t = ((UILabel *)title).text;
-                        if (t.length && [t rangeOfString:@"零钱通"].location != NSNotFound) return DDBalancePageLQT;
-                        if (t.length && [t rangeOfString:@"零钱"].location != NSNotFound) return DDBalancePageBalance;
-                        // m_title 是"银行卡"等非金额入口 → 不动，防误伤
-                    }
-                    return DDBalancePageNone;
-                }
-                v = v.superview;
-            }
-            // ② 兜底：视图树搜"零钱通"字样（爱锋 isLQT 支，应对 WCPayTableCellViewDataView 找不到的情况，
-            //   比如 ScrollNumber 在 WCPayWalletEntryHeaderView 这条非 cell 路径上）
-            v = (UIView *)sn;
-            for (int depth = 0; depth < 4 && v; depth++) {
-                UIView *parent = v.superview;
-                if (parent) {
-                    for (UIView *sib in parent.subviews) {
-                        if (sib == v) continue;
-                        if ([sib isKindOfClass:[UILabel class]]) {
-                            NSString *t = ((UILabel *)sib).text;
-                            if (t.length && [t rangeOfString:@"零钱通"].location != NSNotFound) return DDBalancePageLQT;
-                        }
-                        for (UIView *sub in sib.subviews) {
-                            if ([sub isKindOfClass:[UILabel class]]) {
-                                NSString *t = ((UILabel *)sub).text;
-                                if (t.length && [t rangeOfString:@"零钱通"].location != NSNotFound) return DDBalancePageLQT;
-                            }
-                        }
-                    }
-                }
-                v = parent;
-            }
-            // ③ 兜底兜底：什么都没找到 → 视作余额（保守，比误判为 LQT 安全）
-            return DDBalancePageBalance;
+            if (DDAncestorSiblingsHasText(sn, @"零钱通", YES)) return DDBalancePageLQT;  // 精确，避开"转入零钱通"
+            if (DDAncestorSiblingsHasText(sn, @"零钱",   YES)) return DDBalancePageBalance;
+            if (DDAncestorSiblingsHasText(sn, @"零钱通", NO)) return DDBalancePageLQT;    // hasPrefix 兜底（标题带后缀）
+            if (DDAncestorSiblingsHasText(sn, @"零钱",   NO)) return DDBalancePageBalance; // 注：hasPrefix"零钱"也含"零钱通"，但 LQT 已先查
+            return DDBalancePageNone;  // 银行卡等无关卡不插手
         }
     } @catch (NSException *e) {}
     return DDBalancePageNone;  // 其它页一律不动
@@ -1765,22 +1784,28 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
 //   于是详情页只看到 %orig 真值。之前还加了"只详情页生效"的白名单（DDIsWalletBalancePage），但 hook 的类错了，
 //   缩窄白名单也没用 —— 真问题是"插在写路径、且插错了类"。
 //
-//   上一版（DDScrollNumberIsLQT 只靠视图树搜"零钱通"字样）有两个致命问题：
-//     ① "我的零钱"详情页里有"转入零钱通，能赚又能花"小字文案，搜到 → 误判为 LQT
-//     ② "零钱通"详情页里"零钱通"是 navigationItem.title（不在 view 树），搜不到 → 误判为余额
-//     ③ 主页零钱通卡的"零钱通"label 离 ScrollNumber 超过 4 层 superview，搜不到 → 误判为余额
-//   实测四页恰好全部反（HIT 统计 defaultNumber.LQT=2 / defaultNumber.余额=26）。
+//   上两版的根因（已用 2026-09-10 日志 + 爱锋反汇编坐实）：
+//     ① 详情页"两页都反"的真凶是【判定当前页的方式错】：之前用 DDViewControllerOfView（沿 ScrollNumber
+//        响应链找 VC），详情页 push/modal 后响应链常指到容器/主页 VC，于是详情页被当成主页、再用附近
+//        字样误判——"我的零钱"详情页附近有"转入零钱通"小字 → 误判 LQT（显示 3）；"零钱通"详情页标题
+//        在 nav bar 不在 view 树 → 搜不到 → 误判余额（显示 6）。两条恰好全反。
+//     ② 主页零钱通卡扑空是【模糊匹配】的锅：之前用 rangeOfString 搜"零钱通"，层级一变就搜不到。
 //
-//   修正：判定函数改为 DDBalancePageKindOf —— 先沿响应链拿所属 VC，按 VC 类名分流（爱锋详情页用
-//   "WCPayWebImageView 旁 label"结构定位，我们用类名更稳；爱锋主页支用结构下标定位，微信改版易坏，
-//   我们用"沿 ScrollNumber superview 找 WCPayTableCellViewDataView，读 m_title"——直接看承载该数字的
-//   cell 标题，最稳且不依赖硬编码下标）：
-//     WCPayLQTDetailViewController         → LQT
-//     WCPayBalanceDetailViewController     → 余额
-//     WCPayMainViewControllerV2 / KindaViewController（钱包主页） → 沿 superview 找入口卡 cell
-//       m_title 含"零钱通" → LQT；含"零钱" → 余额；"银行卡"等 → 不动（防误伤）
-//     其它页                              → 不动（防 ScrollNumber/TimeoutNumber 通用控件被误伤闪退）
-//   因此主页三张入口卡（零钱/零钱通/银行卡）和两个详情页全都精确分流；getter 读路径不闪。
+//   修正（彻底对齐爱锋 isLQT @0xbe820 反汇编）：
+//     A. 判定当前页改用 DDTopViewController（最上层 presented VC，与爱锋 currentViewController 同款）：
+//        顶层 VC 恒为当前可见页，主页=WCPayMainViewControllerV2、进详情后=WCPayLQTDetail/WCPayBalanceDetail，
+//        不会再指错 —— 这是修好"两页都反"的关键。
+//     B. 详情页按 VC 类名分流（爱锋详情页支用 WCPayWebImageView 旁 label 结构定位，我们用类名更稳）：
+//        WCPayLQTDetailViewController     → LQT
+//        WCPayBalanceDetailViewController → 余额
+//     C. 主页按附近"零钱通"【精确匹配】(isEqual，对齐爱锋 0xbeb80 的 isEqual:) 分流 —— 正好避开"转入零钱通"
+//        小字（它不等于"零钱通"，不会被精确匹配命中）；hasPrefix 仅作标题带后缀的兜底：
+//        WCPayMainViewControllerV2 / KindaViewController（钱包主页，title=="钱包"） →
+//          附近精确"零钱通" → LQT；精确"零钱" → 余额；都不是（银行卡等无关卡）→ 不动（防误伤）
+//     D. 其它页 → 不动（防 ScrollNumber/TimeoutNumber 通用控件被误伤闪退）
+//   因此主页零钱/零钱通两张卡 + 我的零钱/零钱通两个详情页全部精确分流；getter 读路径不闪。
+//   写入口 HIT 标签已带顶层 VC 类名（如 余额.SN.defaultNumber.LQT.WCPayLQTDetailViewController），下一版日志
+//   即可直接看出"哪个页被判成了哪种"，无需再猜测。
 //
 //   ⚠️ getter 每帧都会调，绝不能打日志/计数（会刷屏+掉帧），计数只放在写入口 hook 里。
 
@@ -1790,8 +1815,8 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (!cfg.balanceEnabled) return orig;
-        // VC 类名分流：详情页按 WCPayBalanceDetail/WCPayLQTDetail 类名（最稳），主页 KindaViewController 退回
-        // 爱锋支"附近搜零钱通字样"——详情页不能靠字样（"转入零钱通"小字 + 标题在 nav bar 会误判）。
+        // 判定用 DDTopViewController（最上层 presented VC，对齐爱锋 currentViewController）+ 精确"零钱通"匹配：
+        //   详情页按 WCPayBalanceDetail/WCPayLQTDetail 类名（最稳）；主页按附近"零钱通"精确字样（避开"转入零钱通"误判）。
         DDBalancePageKind kind = DDBalancePageKindOf(self);
         if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) return DDClampFen(DDLingtongFenValue());
         if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) return DDClampFen(DDBalanceFenValue());
@@ -1806,8 +1831,9 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalancePageKindOf(self);
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { DDJokerHit(@"余额.ScrollNumber.updateNumber.LQT"); %orig(DDClampFen(DDLingtongFenValue())); return; }
-            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { DDJokerHit(@"余额.ScrollNumber.updateNumber.余额"); %orig(DDClampFen(DDBalanceFenValue())); return; }
+            NSString *vcCls = NSStringFromClass([DDTopViewController() class]);  // 诊断：标签带顶层 VC 类，定位"哪页被判成哪种"
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { DDJokerHit([NSString stringWithFormat:@"余额.SN.updateNumber.LQT.%@", vcCls]); %orig(DDClampFen(DDLingtongFenValue())); return; }
+            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { DDJokerHit([NSString stringWithFormat:@"余额.SN.updateNumber.余额.%@", vcCls]); %orig(DDClampFen(DDBalanceFenValue())); return; }
         }
     } @catch (NSException *e) {}
     %orig(original);
@@ -1817,8 +1843,9 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalancePageKindOf(self);
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { DDJokerHit(@"余额.ScrollNumber.defaultNumber.LQT"); %orig(DDClampFen(DDLingtongFenValue())); return; }
-            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { DDJokerHit(@"余额.ScrollNumber.defaultNumber.余额"); %orig(DDClampFen(DDBalanceFenValue())); return; }
+            NSString *vcCls = NSStringFromClass([DDTopViewController() class]);
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { DDJokerHit([NSString stringWithFormat:@"余额.SN.defaultNumber.LQT.%@", vcCls]); %orig(DDClampFen(DDLingtongFenValue())); return; }
+            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { DDJokerHit([NSString stringWithFormat:@"余额.SN.defaultNumber.余额.%@", vcCls]); %orig(DDClampFen(DDBalanceFenValue())); return; }
         }
     } @catch (NSException *e) {}
     %orig(original);
@@ -1828,8 +1855,9 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalancePageKindOf(self);
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { DDJokerHit(@"余额.ScrollNumber.setCurrentNumber.LQT"); %orig(DDClampFen(DDLingtongFenValue())); return; }
-            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { DDJokerHit(@"余额.ScrollNumber.setCurrentNumber.余额"); %orig(DDClampFen(DDBalanceFenValue())); return; }
+            NSString *vcCls = NSStringFromClass([DDTopViewController() class]);
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { DDJokerHit([NSString stringWithFormat:@"余额.SN.setCurrentNumber.LQT.%@", vcCls]); %orig(DDClampFen(DDLingtongFenValue())); return; }
+            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { DDJokerHit([NSString stringWithFormat:@"余额.SN.setCurrentNumber.余额.%@", vcCls]); %orig(DDClampFen(DDBalanceFenValue())); return; }
         }
     } @catch (NSException *e) {}
     %orig(original);
