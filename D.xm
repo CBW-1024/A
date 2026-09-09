@@ -460,28 +460,53 @@ static NSString *DDJokerMessageKey(CMessageWrap *msg) {
     return [NSString stringWithFormat:@"%u", msg.m_uiMesLocalID];
 }
 
+// —— 自定义 plist 持久化层（替代 NSUserDefaults）——
+// 越狱 tweak 注入 dylib 后，[NSUserDefaults standardUserDefaults] 的默认域在微信重启后常常落空/被微信
+// 自身初始化清空，导致"重启后改过的时间/文字/金额全变回真实值"。日志实证：同一会话内 cache 命中正常
+// （timeText 打印 缓存=1757347260），但重新打开微信后首屏 00:41:44 三条时间条全是 缓存=无。
+// 改成自己管理 plist 文件（写在微信沙盒 Library/Caches/DDJoker/ 下），绕开 NSUserDefaults 的不确定性，
+// 重启后照样在磁盘上，下次进来能恢复。
+static NSString *DDJokerCacheDir(void) {
+    NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/DDJoker"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+static NSString *DDJokerCacheFile(NSString *name) {
+    return [DDJokerCacheDir() stringByAppendingPathComponent:[name stringByAppendingString:@".plist"]];
+}
+static NSMutableDictionary *DDJokerLoadCache(NSString *name) {
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:DDJokerCacheFile(name)];
+    return d ?: [NSMutableDictionary dictionary];
+}
+static void DDJokerSaveCache(NSString *name, NSDictionary *d) {
+    [d writeToFile:DDJokerCacheFile(name) atomically:YES];
+}
+static NSString *DDJokerImagesDir(void) {
+    NSString *dir = [DDJokerCacheDir() stringByAppendingPathComponent:@"DDJokerImages"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
 
 static NSString *DDJokerCachedText(CMessageWrap *msg) {
     if (!msg) return nil;
-    NSDictionary *d = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kDDJokerTextCacheKey];
+    NSDictionary *d = DDJokerLoadCache(kDDJokerTextCacheKey);
     NSString *v = d[DDJokerMessageKey(msg)];
     return v.length ? v : nil;
 }
 
 static void DDJokerSetCachedText(CMessageWrap *msg, NSString *text) {
     if (!msg) return;
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[def dictionaryForKey:kDDJokerTextCacheKey] ?: @{}];
+    NSMutableDictionary *d = DDJokerLoadCache(kDDJokerTextCacheKey);
     if (text.length) d[DDJokerMessageKey(msg)] = text;
     else [d removeObjectForKey:DDJokerMessageKey(msg)];
-    [def setObject:d forKey:kDDJokerTextCacheKey];
-    [def synchronize];
+    DDJokerSaveCache(kDDJokerTextCacheKey, d);
 }
 
 // 原始文案备份：只在第一次见到这条消息时记录（那时 m_nsContent 还没被改写）
 static NSString *DDJokerOriginalText(CMessageWrap *msg) {
     if (!msg) return nil;
-    NSDictionary *d = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kDDJokerTextOriginalKey];
+    NSDictionary *d = DDJokerLoadCache(kDDJokerTextOriginalKey);
     NSString *v = d[DDJokerMessageKey(msg)];
     return v.length ? v : nil;
 }
@@ -489,28 +514,24 @@ static NSString *DDJokerOriginalText(CMessageWrap *msg) {
 static void DDJokerSetOriginalText(CMessageWrap *msg, NSString *text) {
     if (!msg || !text.length) return;
     if (DDJokerOriginalText(msg)) return;   // 已备份过就不再更新，否则会把改后的内容当成原始
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[def dictionaryForKey:kDDJokerTextOriginalKey] ?: @{}];
+    NSMutableDictionary *d = DDJokerLoadCache(kDDJokerTextOriginalKey);
     d[DDJokerMessageKey(msg)] = text;
-    [def setObject:d forKey:kDDJokerTextOriginalKey];
-    [def synchronize];
+    DDJokerSaveCache(kDDJokerTextOriginalKey, d);
 }
 
 static NSString *DDJokerCachedAmount(CMessageWrap *msg) {
     if (!msg) return nil;
-    NSDictionary *d = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kDDJokerAmountCacheKey];
+    NSDictionary *d = DDJokerLoadCache(kDDJokerAmountCacheKey);
     NSString *v = d[DDJokerMessageKey(msg)];
     return v.length ? v : nil;
 }
 
 static void DDJokerSetCachedAmount(CMessageWrap *msg, NSString *amount) {
     if (!msg) return;
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[def dictionaryForKey:kDDJokerAmountCacheKey] ?: @{}];
+    NSMutableDictionary *d = DDJokerLoadCache(kDDJokerAmountCacheKey);
     if (amount.length) d[DDJokerMessageKey(msg)] = amount;
     else [d removeObjectForKey:DDJokerMessageKey(msg)];
-    [def setObject:d forKey:kDDJokerAmountCacheKey];
-    [def synchronize];
+    DDJokerSaveCache(kDDJokerAmountCacheKey, d);
 }
 
 #pragma mark - ①c 聊天时间修改缓存
@@ -599,32 +620,28 @@ static NSString *DDJokerTimeKey(id vm) {
 
 static NSNumber *DDJokerCachedTime(id vm) {
     if (!vm) return nil;
-    NSDictionary *d = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kDDJokerTimeCacheKey];
+    NSDictionary *d = DDJokerLoadCache(kDDJokerTimeCacheKey);
     id v = d[DDJokerTimeKey(vm)];
     return [v isKindOfClass:[NSNumber class]] ? v : nil;
 }
 
 static void DDJokerSetCachedTime(id vm, double timestamp) {
     if (!vm) return;
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[def dictionaryForKey:kDDJokerTimeCacheKey] ?: @{}];
+    NSMutableDictionary *d = DDJokerLoadCache(kDDJokerTimeCacheKey);
     if (timestamp > 0) d[DDJokerTimeKey(vm)] = @(timestamp);
     else [d removeObjectForKey:DDJokerTimeKey(vm)];
-    [def setObject:d forKey:kDDJokerTimeCacheKey];
-    [def synchronize];
+    DDJokerSaveCache(kDDJokerTimeCacheKey, d);
 }
 
 static void DDJokerClearAllMessageCache(void) {
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    [def removeObjectForKey:kDDJokerTextCacheKey];
-    [def removeObjectForKey:kDDJokerAmountCacheKey];
-    [def removeObjectForKey:kDDJokerTimeCacheKey];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    // 文字/金额/时间覆盖值：随聊天内容刷新，清掉无妨
+    [fm removeItemAtPath:DDJokerCacheFile(kDDJokerTextCacheKey) error:nil];
+    [fm removeItemAtPath:DDJokerCacheFile(kDDJokerAmountCacheKey) error:nil];
+    [fm removeItemAtPath:DDJokerCacheFile(kDDJokerTimeCacheKey) error:nil];
     // kDDJokerTextOriginalKey 故意保留：文字走数据层后 m_nsContent 已被改写，
     // 清掉覆盖值后要靠这份原始备份才能写回还原（爱锋的 originalText 同样是持久化的）。
-    [def synchronize];
-    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *folder = [dir stringByAppendingPathComponent:@"DDJokerImages"];
-    [[NSFileManager defaultManager] removeItemAtPath:folder error:nil];
+    [fm removeItemAtPath:DDJokerImagesDir() error:nil];
 }
 
 // 导出日志时用的"最近一条时间条"：弱引用，vm 被释放自动置 nil，不会延长生命周期
@@ -1065,9 +1082,7 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 @end
 
 static NSString *DDImageReplacementPath(unsigned int mesLocalID) {
-    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *folder = [dir stringByAppendingPathComponent:@"DDJokerImages"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:folder withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *folder = DDJokerImagesDir();
     return [folder stringByAppendingPathComponent:[NSString stringWithFormat:@"%u.png", mesLocalID]];
 }
 
@@ -1267,6 +1282,18 @@ static double DDTimeStampFromString(NSString *s) {
 // 改时间后微信重算时间条就走这里，打出来才能确认"改了没反应"到底卡在哪一步
 - (void)updateLayouts {
     DDJokerHit(@"ChatTimeViewModel.updateLayouts");
+    // 覆盖必须在这里、%orig 之前写进 showingTime：
+    // 微信在【首次布局】时就用 showingTime 算出 m_timeText 直接画到 collapsed（普通）时间条，
+    // 这一步早于 timeText getter 被调用。若只把覆盖写在 timeText 里，离开聊天页重新进入后
+    // 新建 vm 先被 updateLayouts 用真实时间画出来、之后又不再触发 timeText 重查，
+    // 普通时间条就会显示真实时间，要等点一下时间条（微信重跑 updateLayouts+timeText）才修正。
+    // 这就是"重新进入显示真实时间、点一下才变回修改时间"的根因（DDJokerDiag.log 00:56 段佐证：
+    // 两种显示格式都由同一 showingTime 推导，故只要首帧就用修改值算 m_timeText 即可两格式同步修正）。
+    NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(self) : nil;
+    if (cached && DDShowingTimeOf(self) != [cached doubleValue]) {
+        DDSetShowingTime(self, [cached doubleValue]);
+        DDLOG(@"updateLayouts 应用覆盖 vm=%p → %@", self, DDTimeDesc([cached doubleValue]));
+    }
     DDLOG(@"updateLayouts vm=%p 前 showingTime=%@", self, DDTimeDesc(DDShowingTimeOf(self)));
     %orig;
     DDLOG(@"updateLayouts vm=%p 后 showingTime=%@", self, DDTimeDesc(DDShowingTimeOf(self)));
@@ -1688,18 +1715,16 @@ static NSString *DDJokerDescribeTimeVM(id vm) {
 
 // 缓存盘点：顺带回答"清理之后到底有没有残留"
 static NSString *DDJokerDescribeCaches(void) {
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
     NSMutableString *s = [NSMutableString string];
-    NSDictionary *time = [def dictionaryForKey:kDDJokerTimeCacheKey];
-    NSDictionary *text = [def dictionaryForKey:kDDJokerTextCacheKey];
-    NSDictionary *amount = [def dictionaryForKey:kDDJokerAmountCacheKey];
-    NSDictionary *origin = [def dictionaryForKey:kDDJokerTextOriginalKey];
+    NSDictionary *time = DDJokerLoadCache(kDDJokerTimeCacheKey);
+    NSDictionary *text = DDJokerLoadCache(kDDJokerTextCacheKey);
+    NSDictionary *amount = DDJokerLoadCache(kDDJokerAmountCacheKey);
+    NSDictionary *origin = DDJokerLoadCache(kDDJokerTextOriginalKey);
     [s appendFormat:@"  时间缓存 %lu 条 : %@\n", (unsigned long)time.count, time ?: @{}];
     [s appendFormat:@"  文字缓存 %lu 条\n", (unsigned long)text.count];
     [s appendFormat:@"  金额缓存 %lu 条\n", (unsigned long)amount.count];
     [s appendFormat:@"  原文备份 %lu 条（清理缓存时刻意保留，用于文字还原）\n", (unsigned long)origin.count];
-    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *folder = [dir stringByAppendingPathComponent:@"DDJokerImages"];
+    NSString *folder = DDJokerImagesDir();
     NSArray *imgs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:folder error:nil];
     [s appendFormat:@"  替换图片目录 %@ : %lu 个文件\n", folder, (unsigned long)imgs.count];
     return s;
