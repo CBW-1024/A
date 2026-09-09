@@ -133,12 +133,17 @@
 // layoutInternal 由父类提供（CommonMessageCellView.h:78），爱锋就是 hook 它
 @end
 
-// 转账：金额在 layoutContentView 里落到 label，改完要主动触发 updateTitleLabel/updateDescLabel
+// 转账：金额走 viewModel 的 titleText/descText（WCPayTransferMessageViewModel.h:29 / :20），
+// 改完要主动触发 cell 的 updateTitleLabel/updateDescLabel 才会重画
+@interface WCPayTransferMessageViewModel : NSObject
+- (CMessageWrap *)messageWrap;   // 继承自 BaseMessageViewModel（BaseMessageViewModel.h -(id) messageWrap;）
+- (NSString *)titleText;         // WCPayTransferMessageViewModel.h:29
+- (NSString *)descText;          // WCPayTransferMessageViewModel.h:20
+@end
+
 @interface WCPayTransferMessageCellView : CommonMessageCellView
-- (void)layoutContentView;
-- (void)updateTitleLabel;
-- (void)updateDescLabel;
-- (void)dd_applyTransferAmount;   // 本插件 %new 出来的方法，先声明以便 layoutContentView 内直接调用
+- (void)updateTitleLabel;        // WCPayTransferMessageCellView.h:25
+- (void)updateDescLabel;         // WCPayTransferMessageCellView.h:23
 @end
 
 @interface ImageMessageCellView : CommonMessageCellView
@@ -350,6 +355,9 @@ static NSString *JokerNormalizeAmount(NSString *amount) {
 static NSString * const kDDJokerTextCacheKey = @"DDJokerTextCache";
 static NSString * const kDDJokerAmountCacheKey = @"DDJokerAmountCache";
 static NSString * const kDDJokerTimeCacheKey = @"DDJokerTimeCache";
+// 文本/引用消息的原始 m_nsContent 备份（对齐爱锋 entry 里的 originalText，@0xccbb8）。
+// 改文字会写回 CMessageWrap，没有这份备份就还原不回去 —— 清理缓存时它必须保留。
+static NSString * const kDDJokerTextOriginalKey = @"DDJokerTextOriginal";
 
 static NSString *DDJokerMessageKey(CMessageWrap *msg) {
     return [NSString stringWithFormat:@"%u", msg.m_uiMesLocalID];
@@ -370,6 +378,24 @@ static void DDJokerSetCachedText(CMessageWrap *msg, NSString *text) {
     if (text.length) d[DDJokerMessageKey(msg)] = text;
     else [d removeObjectForKey:DDJokerMessageKey(msg)];
     [def setObject:d forKey:kDDJokerTextCacheKey];
+    [def synchronize];
+}
+
+// 原始文案备份：只在第一次见到这条消息时记录（那时 m_nsContent 还没被改写）
+static NSString *DDJokerOriginalText(CMessageWrap *msg) {
+    if (!msg) return nil;
+    NSDictionary *d = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kDDJokerTextOriginalKey];
+    NSString *v = d[DDJokerMessageKey(msg)];
+    return v.length ? v : nil;
+}
+
+static void DDJokerSetOriginalText(CMessageWrap *msg, NSString *text) {
+    if (!msg || !text.length) return;
+    if (DDJokerOriginalText(msg)) return;   // 已备份过就不再更新，否则会把改后的内容当成原始
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:[def dictionaryForKey:kDDJokerTextOriginalKey] ?: @{}];
+    d[DDJokerMessageKey(msg)] = text;
+    [def setObject:d forKey:kDDJokerTextOriginalKey];
     [def synchronize];
 }
 
@@ -428,6 +454,8 @@ static void DDJokerClearAllMessageCache(void) {
     [def removeObjectForKey:kDDJokerTextCacheKey];
     [def removeObjectForKey:kDDJokerAmountCacheKey];
     [def removeObjectForKey:kDDJokerTimeCacheKey];
+    // kDDJokerTextOriginalKey 故意保留：文字走数据层后 m_nsContent 已被改写，
+    // 清掉覆盖值后要靠这份原始备份才能写回还原（爱锋的 originalText 同样是持久化的）。
     [def synchronize];
     NSString *dir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
     NSString *folder = [dir stringByAppendingPathComponent:@"DDJokerImages"];
@@ -671,10 +699,29 @@ static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *origin
     return newItems;
 }
 
-// 真正决定文本显示的是 viewModel 的 contentText（TextMessageViewModel.h:23），
-// 只在 setViewModel: 里改 m_nsContent 不生效，且会污染 CMessageWrap 导致清理后无法还原
+// 真正决定文本显示的是 viewModel 的 contentText（TextMessageViewModel.h:23）。
+// 现在按爱锋 DKApplyTextOverrideToModel @0xccb08 的做法叠加数据层：
+//   ① 在 contentText 取值那一刻改 m_nsContent（@0xccbfc setM_nsContent:），再让微信按新值自己算；
+//   ② 缓存里有值就直接返回（爱锋 @0xba1b4~0xba1f0 读 entry[@"text"] 后直接返回），气泡显示不依赖 XML；
+//   ③ 没覆盖值（关开关 / 清过缓存）就用 originalText 备份写回（@0xccbb8），保证还原得回去。
+// 与爱锋一致不区分消息类型：引用消息的 m_nsContent 是 XML，也会被整段换成纯文本。
+// 注意时序——只在 getter 里改才生效；之前在 cell 的 setViewModel: 里改，文本早算完了，白改还污染 model。
+static void DDJokerApplyTextOverride(CMessageWrap *msg) {
+    if (!msg) return;
+    if (!JokerIsTextMessage(msg) && !JokerIsReferMessage(msg)) return;
+    NSString *original = DDJokerOriginalText(msg);
+    if (!original.length) {
+        DDJokerSetOriginalText(msg, msg.m_nsContent);   // 首次见到：此时还没被改写，存下来当原始
+        original = msg.m_nsContent;
+    }
+    NSString *cached = [DDGlobalConfig shared].textEnabled ? DDJokerCachedText(msg) : nil;
+    NSString *target = cached ?: original;
+    if (target.length && ![target isEqualToString:msg.m_nsContent]) [msg setM_nsContent:target];
+}
+
 %hook TextMessageViewModel
 - (NSString *)contentText {
+    DDJokerApplyTextOverride(self.messageWrap);   // 爱锋 @0xba15c：先改 model 再取 %orig
     NSString *origin = %orig;
     if (![DDGlobalConfig shared].textEnabled) return origin;
     CMessageWrap *msg = self.messageWrap;
@@ -689,7 +736,7 @@ static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *origin
 static BOOL gJokerNeedsResetLayout = NO;
 
 // 开关切换、清理缓存都走这里：置位 → 全量重绘 → 稍后复位。
-// 置位期间 dd_applyTransferAmount / setViewModel: 才会主动重算，金额和文字才还原得回去。
+// 置位期间 TextMessageCellView 的 setViewModel: 才主动清懒加载缓存，文字才还原得回去。
 static void JokerInvalidateAllLayout(void) {
     gJokerNeedsResetLayout = YES;
     JokerReloadAllMsgContent();
@@ -714,9 +761,10 @@ static void JokerInvalidateAllLayout(void) {
     }
 }
 - (id)getTextString {
+    CMessageWrap *msg = JokerGetMessageWrapFromCell(self);
+    DDJokerApplyTextOverride(msg);   // 爱锋 @0xbcb80：getTextString 里同样先改 model，复制/转发取到的是改后文本
     id origin = %orig;
     if (![DDGlobalConfig shared].textEnabled) return origin;
-    CMessageWrap *msg = JokerGetMessageWrapFromCell(self);
     if (!JokerIsTextMessage(msg) && !JokerIsReferMessage(msg)) return origin;
     NSString *cached = DDJokerCachedText(msg);
     return cached ?: origin;
@@ -736,12 +784,13 @@ static void JokerInvalidateAllLayout(void) {
 }
 %end
 
-// 转账金额改为数据层：把覆盖金额写回 CMessageWrap.m_nsContent（对齐爱锋 changeJinE @0xb7c88——
-// 金额在 <feedesc><![CDATA[...]]></feedesc> 里，用 stringByReplacingOccurrences 替换后 setM_nsContent:，
-// setM_nsContent 在 CMessageWrap.h:676 确认存在）。微信自己用新 m_nsContent 渲染 titleText/descText，
-// 不再在显示层替换文本里的数字段（会把 888.88 整个当一段数字替换，丢失小数且错位）。
-static NSMutableDictionary *gDDOriginalTransferXML;
-// 从转账 m_nsContent 的 <feedesc><![CDATA[金额]]></feedesc> 里解析出原始金额（如 ¥888.88）
+// 转账金额走显示层覆盖：只改 viewModel 吐给 label 的文本，绝不回写 m_nsContent。
+// 之前的数据层方案（把覆盖金额写回 CMessageWrap.m_nsContent，CMessageWrap.h:676 setM_nsContent:）
+// 会被微信持久化进消息 DB，表现为"清理缓存后重启微信，金额仍是修改后的、还原不回去"。
+// 与文字修改同一套路：hook WCPayTransferMessageViewModel 的 titleText/descText（头文件 :29 / :20），
+// 只在文本里精准替换金额那一段，CMessageWrap 保持原样 —— 清理缓存后重算即还原真实金额。
+// 从转账 m_nsContent 的 <feedesc><![CDATA[金额]]></feedesc> 里解析出真实金额（如 ¥888.88），
+// 仅用于弹窗预填（未修改时显示真实金额），不参与渲染。
 static NSString *DDTransferFeedescAmount(NSString *xml) {
     if (!xml.length) return nil;
     NSString *open = @"<feedesc><![CDATA[";
@@ -753,33 +802,24 @@ static NSString *DDTransferFeedescAmount(NSString *xml) {
     if (rc.location == NSNotFound) return nil;
     return [xml substringWithRange:NSMakeRange(start, rc.location - start)];
 }
-static NSString *DDTransferFormatAmount(NSString *override, NSString *originalAmount) {
-    // 对齐爱锋 formatString @0xb8094：保留原金额的货币符号前缀（如 ¥）
-    if ([originalAmount hasPrefix:@"¥"] && ![override hasPrefix:@"¥"]) {
-        return [@"¥" stringByAppendingString:override];
-    }
-    return override;
-}
-static NSString *DDTransferOverrideContent(NSString *xml, NSString *override) {
-    // 对齐爱锋 changeJinE @0xb7c88：定位 <feedesc><![CDATA[旧金额]]></feedesc>，替换成新金额
-    if (!xml.length || !override.length) return nil;
-    NSString *old = DDTransferFeedescAmount(xml);
-    if (!old.length) return nil;
-    NSString *newer = DDTransferFormatAmount(override, old);
-    return [xml stringByReplacingOccurrencesOfString:old withString:newer];
+// 金额在标题/描述文本里就是一段"¥数字"（可能带小数），正则一次命中整段替换，其余字符原样保留。
+// 缓存里的金额已由 JokerNormalizeAmount 归一为纯数字（补 .00、去 ¥），这里统一补回 ¥ 前缀。
+static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *override) {
+    if (!text.length || !override.length) return text;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"¥?\\d+(?:\\.\\d+)?"
+                                                                        options:0
+                                                                          error:nil];
+    if (!re) return text;
+    NSString *newAmount = [@"¥" stringByAppendingString:override];
+    return [re stringByReplacingMatchesInString:text
+                                       options:0
+                                         range:NSMakeRange(0, text.length)
+                                  withTemplate:newAmount];
 }
 
 %hook WCPayTransferMessageCellView
-- (void)setViewModel:(id)vm {
-    // 对齐爱锋 setViewModel @0xb7938：先改 m_nsContent 再 %orig（微信用新值渲染）
-    [self dd_applyTransferAmount];
-    %orig;
-}
-- (void)layoutContentView {
-    // 对齐爱锋 layoutContentView @0xb79a4：先改 m_nsContent 再 %orig
-    [self dd_applyTransferAmount];
-    %orig;
-}
+// 渲染时不需要在这里做任何事：金额由 WCPayTransferMessageViewModel 的 titleText/descText 覆盖，
+// 这里只负责把"小丑"菜单注入转账气泡。
 - (NSArray *)operationMenuItems {
     return JokerInjectMenuItem(self, %orig);
 }
@@ -794,18 +834,26 @@ static NSString *DDTransferOverrideContent(NSString *xml, NSString *override) {
 - (void)joker_handleMenuItem:(id)sender {
     JokerPresentEditor(self);
 }
-%new
-// 对齐爱锋 DKApplyTransferOverrideToModel @0xcb3ec：把覆盖金额写回 messageWrap.m_nsContent。
-// 首次见到该消息时存原始 m_nsContent，清理缓存时写回原始即可还原（进入聊天页 messageWrap 从 DB 重新加载原始）。
-- (void)dd_applyTransferAmount {
-    if (!gDDOriginalTransferXML) gDDOriginalTransferXML = [NSMutableDictionary dictionary];
-    CMessageWrap *msg = JokerGetMessageWrapFromCell(self);
-    if (!msg) return;
-    unsigned int lid = msg.m_uiMesLocalID;
-    if (!gDDOriginalTransferXML[@(lid)]) gDDOriginalTransferXML[@(lid)] = msg.m_nsContent;
-    NSString *override = DDJokerCachedAmount(msg);
-    NSString *newXML = override ? DDTransferOverrideContent(gDDOriginalTransferXML[@(lid)], override) : gDDOriginalTransferXML[@(lid)];
-    if (newXML && ![newXML isEqualToString:msg.m_nsContent]) [msg setM_nsContent:newXML];
+%end
+
+// 转账金额显示层覆盖（对齐文字修改的 contentText hook 套路）：
+// titleText 是气泡上的金额大字（WCPayTransferMessageViewModel.h:29），
+// descText 是"已收款/已退款"等说明（同文件 :20，退款类文案同样带金额）。
+// vm 继承自 BaseMessageViewModel，messageWrap 可用（BaseMessageViewModel.h 的 -(id) messageWrap;）——
+// 现有 JokerGetMessageWrapFromCell 在转账 cell 上已实测拿到 msg，即 runtime 证据。
+// 命中的是金额正则段，文本里没有金额时原样返回。
+%hook WCPayTransferMessageViewModel
+- (NSString *)titleText {
+    NSString *origin = %orig;
+    if (![DDGlobalConfig shared].transferEnabled) return origin;
+    NSString *cached = DDJokerCachedAmount(self.messageWrap);
+    return cached ? DDTransferReplaceAmountInText(origin, cached) : origin;
+}
+- (NSString *)descText {
+    NSString *origin = %orig;
+    if (![DDGlobalConfig shared].transferEnabled) return origin;
+    NSString *cached = DDJokerCachedAmount(self.messageWrap);
+    return cached ? DDTransferReplaceAmountInText(origin, cached) : origin;
 }
 %end
 
@@ -1098,11 +1146,14 @@ static NSString *DDTimeStringForDisplay(double ts) {
         NSString *t = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         double ts = DDTimeStampFromString(t);
         if (ts > 0) {
-            // 精准方案：不调 setShowingTime:（否则污染 showingTime → 缓存 key 漂移到 ts_覆盖值，读不到）。
-            // showingTime 保持真实 T0，key=真实 T0 单点精准命中；updateLayouts 触发重绘重读 timeText
+            // 爱锋 changeTime @0xbb284 的收尾三步（反汇编实证）：
+            //   写覆盖 → [vm updateLayouts] (@0xbb500，让 vm 重算 timeText)
+            //   → [cell layoutInternal] (@0xbb590) → setNeedsLayout (@0xbb598)。
+            // 之前少了 updateLayouts，vm 里已算好的 timeText 不会重算，cell 重画又把它写回 label，
+            // 于是改完立刻弹回真实时间 —— 这就是"时间修改不生效"的根因。
             DDJokerSetCachedTime(vm, ts);
-            [vm updateLayouts];
-            [self layoutInternal];
+            [vm updateLayouts];          // ChatTimeViewModel.h:20
+            [self layoutInternal];       // ChatTimeCellView.h:9，用重算后的 timeText 重画
             [self setNeedsLayout];
         }
     }];
@@ -1110,8 +1161,6 @@ static NSString *DDTimeStringForDisplay(double ts) {
     objc_setAssociatedObject(self, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 %end
-
-#pragma mark - ② 运动步数修改
 
 #pragma mark - ② 运动步数修改
 // 对齐爱锋：WCDeviceStepObject.m7StepCount / hkStepCount 直接返回自定义步数
@@ -1517,7 +1566,7 @@ static unsigned long long DDClampFen(unsigned long long fen) {
 
 - (void)transferSwitchChanged:(UISwitch *)sender {
     [DDGlobalConfig shared].transferEnabled = sender.isOn;
-    // 关开关时也必须置位，否则 dd_applyTransferAmount 认为"没改动"而跳过，金额还原不回去
+    // 关开关时也必须走全量重绘：vm 里已算好的 titleText 是懒加载缓存，不清就一直显示旧金额
     JokerInvalidateAllLayout();
     [self buildTable];
 }
