@@ -1244,16 +1244,10 @@ static NSString *DDTimeStringForDisplay(double ts) {
 %hook ChatTimeViewModel
 - (NSString *)timeText {
     static long calls = 0;
-    static BOOL dumped = NO;
     calls++;
 
-    gDDLastTimeVM = self;   // 供设置页导出日志时取"最近一条时间条"
+    gDDLastTimeVM = self;   // 供设置页导出日志时取"最近一条时间条"（导出时会顺带 dump 它的类结构）
     DDJokerHit(@"ChatTimeViewModel.timeText");
-
-    if (!dumped) {
-        dumped = YES;
-        DDLOG(@"ChatTimeViewModel 首次出现，运行时结构:\n%@", DDJokerDescribeClassIvars([self class]));
-    }
 
     // 先取一次原始 showingTime：首次调用时它还没被改写，正好把 key 钉在原始值上
     double raw = DDRawShowingTimeOf(self);
