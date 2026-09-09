@@ -186,7 +186,16 @@
 - (unsigned int)hkStepCount;
 @end
 
-@interface MMUILabel : UILabel @end
+// 好友数量小丑：对齐爱锋 —— 不 hook MMUILabel（全局 UILabel 复用会误伤/崩溃），
+// 而是在数据层 ContactsDataLogic.m_uiNormalContact（unsigned int，ContactsDataLogic.h:58 确认）直接返回自定义值，
+// 并可选地同步导航标题。爱锋 hooks_final.json：ContactsDataLogic.m_uiNormalContact @0xc5ae8 /
+// ContactsViewController.viewWillAppear: @0xc5d74（真实实现里 updateCustomCountLabel 是死代码，
+// 真正驱动"X个朋友"的是 m_uiNormalContact 的返回值，微信自行拼后缀）。
+@interface ContactsDataLogic : NSObject
+- (unsigned int)m_uiNormalContact;
+@end
+@interface ContactsViewController : UIViewController
+@end
 
 // ScrollNumber.h 确认存在：-(void)updateNumber:(unsigned long long); -(void)defaultNumber:(unsigned long long);
 //                          -(unsigned long long)currentNumber; -(unsigned long long)getNumber;
@@ -215,7 +224,6 @@ static NSString * const kDDStepsValueStringKey = @"DDStepsValueString";
 static NSString * const kDDContactsCountValueKey = @"DDContactsCountValue";
 static NSString * const kDDBalanceValueKey = @"DDBalanceValue";
 static NSString * const kDDLingtongValueKey = @"DDLingtongValue";
-static NSString * const kDDLastStepsUpdateDateKey = @"DDLastStepsUpdateDate";
 
 @interface DDGlobalConfig : NSObject
 + (instancetype)shared;
@@ -1058,23 +1066,19 @@ static NSString *DDTimeStringForDisplay(NSString *originText, double ts) {
 
 #pragma mark - ② 运动步数修改
 
-static BOOL isToday(NSDate *date) {
-    if (!date) return NO;
-    NSCalendar *cal = [NSCalendar currentCalendar];
-    NSDateComponents *dc1 = [cal components:NSCalendarUnitYear|NSCalendarUnitMonth|NSCalendarUnitDay fromDate:date];
-    NSDateComponents *dc2 = [cal components:NSCalendarUnitYear|NSCalendarUnitMonth|NSCalendarUnitDay fromDate:[NSDate date]];
-    return dc1.year == dc2.year && dc1.month == dc2.month && dc1.day == dc2.day;
-}
+#pragma mark - ② 运动步数修改
+// 对齐爱锋：WCDeviceStepObject.m7StepCount / hkStepCount 直接返回自定义步数
+// （爱锋 hooks_final.json 0xb313c / 0xb318c）。这两个 getter 是微信运动排行榜刷新的热路径，
+// 爱锋实现里除读开关 + 自定义值外不做任何磁盘 IO（反汇编确认：调 [DKHelperConfig changeSteps]/
+// [DKHelperConfig changedSteps] 后 csel 返回，无 NSUserDefaults 写）。因此这里绝不写磁盘，值上限 99999
+// （爱锋弹窗建议 ≤60000，showTextFieldWithMaxLen:5）。
 
 %hook WCDeviceStepObject
 - (unsigned int)m7StepCount {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     if (cfg.stepsEnabled && [cfg hasStepsValue]) {
-        NSDate *last = [[NSUserDefaults standardUserDefaults] objectForKey:kDDLastStepsUpdateDateKey];
-        if (!last || !isToday(last)) {
-            [[NSUserDefaults standardUserDefaults] setObject:[NSDate date] forKey:kDDLastStepsUpdateDateKey];
-        }
-        return (unsigned int)[cfg stepsIntegerValue];
+        NSInteger v = [cfg stepsIntegerValue];
+        if (v > 0) return (unsigned int)MIN(v, 99999);
     }
     return %orig;
 }
@@ -1082,35 +1086,38 @@ static BOOL isToday(NSDate *date) {
 - (unsigned int)hkStepCount {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     if (cfg.stepsEnabled && [cfg hasStepsValue]) {
-        NSDate *last = [[NSUserDefaults standardUserDefaults] objectForKey:kDDLastStepsUpdateDateKey];
-        if (!last || !isToday(last)) {
-            [[NSUserDefaults standardUserDefaults] setObject:[NSDate date] forKey:kDDLastStepsUpdateDateKey];
-        }
-        return (unsigned int)[cfg stepsIntegerValue];
+        NSInteger v = [cfg stepsIntegerValue];
+        if (v > 0) return (unsigned int)MIN(v, 99999);
     }
     return %orig;
 }
 %end
 
-// 最新 dump 里 WCDataItem 是朋友圈数据项，没有 stepCount —— 这个 hook 是无效的，删掉。
-// 步数只走 WCDeviceStepObject（m7StepCount / hkStepCount，dump 已确认）
-
 #pragma mark - ③ 好友数量修改
+// 对齐爱锋：不 hook MMUILabel（全局 UILabel 复用会误伤/崩溃），而是在数据层
+// ContactsDataLogic.m_uiNormalContact（unsigned int，ContactsDataLogic.h:58 确认）直接返回自定义好友数，
+// 并可选地同步导航标题。爱锋 hooks_final.json：ContactsDataLogic.m_uiNormalContact @0xc5ae8 /
+// ContactsViewController.viewWillAppear: @0xc5d74。爱锋真实实现里 updateCustomCountLabel 是死代码，
+// 真正驱动"X个朋友"的是 m_uiNormalContact 的返回值（微信自行拼后缀）。
 
-%hook MMUILabel
-- (void)setText:(NSString *)text {
-    if (!text) {
-        %orig;
-        return;
-    }
+%hook ContactsDataLogic
+- (unsigned int)m_uiNormalContact {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     if (cfg.contactsEnabled && [cfg hasContactsValue]) {
-        if ([text hasSuffix:@"个朋友"] && [[text substringToIndex:text.length-3] rangeOfCharacterFromSet:[[NSCharacterSet decimalDigitCharacterSet] invertedSet]].location == NSNotFound) {
-            %orig([NSString stringWithFormat:@"%@个朋友", cfg.contactsValue]);
-            return;
-        }
+        NSInteger v = [cfg.contactsValue integerValue];
+        if (v > 0) return (unsigned int)v;
     }
+    return %orig;
+}
+%end
+
+%hook ContactsViewController
+- (void)viewWillAppear:(BOOL)animated {
     %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.contactsEnabled && [cfg hasContactsValue]) {
+        self.title = [NSString stringWithFormat:@"通讯录(%@)", cfg.contactsValue];
+    }
 }
 %end
 
@@ -1612,10 +1619,6 @@ static unsigned long long DDClampFen(unsigned long long fen) {
         _contactsValue = [def stringForKey:kDDContactsCountValueKey];
         _balanceValue = [def stringForKey:kDDBalanceValueKey];
         _lingtongValue = [def stringForKey:kDDLingtongValueKey];
-        if (![def objectForKey:kDDLastStepsUpdateDateKey]) {
-            [def setObject:[NSDate date] forKey:kDDLastStepsUpdateDateKey];
-            [def synchronize];
-        }
     }
     return self;
 }
@@ -1722,7 +1725,6 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     } else {
         [def removeObjectForKey:kDDStepsValueStringKey];
     }
-    [def setObject:[NSDate date] forKey:kDDLastStepsUpdateDateKey];
     [def synchronize];
 }
 
