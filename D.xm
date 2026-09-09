@@ -133,13 +133,6 @@
 // layoutInternal 由父类提供（CommonMessageCellView.h:78），爱锋就是 hook 它
 @end
 
-// 转账/收付款：金额由 viewModel 的 titleText / descText 渲染（WCPayBaseMessageViewModel.h:6/7）
-@interface WCPayBaseMessageViewModel : CommonMessageViewModel
-@property (readonly, nonatomic) NSString *titleText;
-@property (readonly, nonatomic) NSString *descText;
-@end
-
-@interface WCPayTransferMessageViewModel : WCPayBaseMessageViewModel @end
 // 转账：金额在 layoutContentView 里落到 label，改完要主动触发 updateTitleLabel/updateDescLabel
 @interface WCPayTransferMessageCellView : CommonMessageCellView
 - (void)layoutContentView;
