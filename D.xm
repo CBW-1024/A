@@ -417,18 +417,31 @@ static void DDJokerSetCachedAmount(CMessageWrap *msg, NSString *amount) {
 
 #pragma mark - ①c 聊天时间修改缓存
 
+// 时间条没有消息身份时，只能用 showingTime 当 key。但我们改时间会调 setShowingTime:，
+// showingTime 一变 key 就漂移到新值，下次读到空缓存 → 弹回真实时间（这是之前"改了没反应"的根因）。
+// 对齐爱锋 DKRawShowingTime @0xcd044：记住这条时间条的"原始 showingTime"，
+// 首次读取时（此时还没被改写）记下来，之后一律用原始值算 key，key 就不再漂移。
+static char kDDRawTimeKey;
+static double DDRawShowingTimeOf(id vm) {
+    if (!vm || ![vm respondsToSelector:@selector(showingTime)]) return 0.0;
+    NSNumber *raw = objc_getAssociatedObject(vm, &kDDRawTimeKey);
+    if (!raw) {
+        raw = @([vm showingTime]);
+        objc_setAssociatedObject(vm, &kDDRawTimeKey, raw, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return [raw doubleValue];
+}
+
 // 时间条（ChatTimeViewModel）可能绑定消息，也可能只是个纯时间分隔条。
-// 爱锋同样是优先用消息 ID（wechatku.dylib @0xcb650）：
-//   m_n64MesSvrID != 0 → "message_server_%lld"，否则 "message_local_%u_%u_%@_%@"，
-//   拿不到消息才退回 "time_timestamp_%.3f"（showingTime）。
+// 爱锋同样是优先用消息 ID（wechatku.dylib @0xcb650 / DKPersistentKeyForTimeModel @0xcce10）：
+//   有消息 → "time_" + 消息 key；拿不到消息才退回 "time_timestamp_%.3f"。
 // 这里沿用同样的优先级，但复用插件统一的消息 key，方便"清除修改缓存"一次清干净。
 static NSString *DDJokerTimeKey(id vm) {
     id wrap = [vm respondsToSelector:@selector(messageWrap)] ? [vm messageWrap] : nil;
     if ([wrap respondsToSelector:@selector(m_uiMesLocalID)] && [wrap m_uiMesLocalID] != 0) {
         return DDJokerMessageKey((CMessageWrap *)wrap);
     }
-    double t = [vm respondsToSelector:@selector(showingTime)] ? [vm showingTime] : 0.0;
-    return [NSString stringWithFormat:@"ts_%.3f", t];
+    return [NSString stringWithFormat:@"ts_%.3f", DDRawShowingTimeOf(vm)];
 }
 
 static NSNumber *DDJokerCachedTime(id vm) {
@@ -650,7 +663,7 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
     // 微信原生带输入框 alert：WCUIAlertView（声明见文件顶部）。标题按类型区分，
     // 副标题给出输入指引（金额/文字），输入框本身不放 placeholder —— 默认文本已经是当前值
     NSString *editorTitle = isTransfer ? @"转账修改" : @"文字修改";
-    NSString *editorMessage = isTransfer ? @"请输入需要修改的金额" : @"请输入需要修改的文字";
+    NSString *editorMessage = isTransfer ? @"请输入需要修改的金额\n留空还原" : @"请输入需要修改的文字\n留空还原";
     WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:editorTitle message:editorMessage];
     if (!alert) return;
     [alert showTextFieldWithMaxLen:1000];
@@ -667,13 +680,21 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
         NSString *raw = blockAlert ? [blockAlert getTextFieldText] : nil;
         if (!raw.length) raw = inputField.text;
         NSString *newText = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (newText.length && ![newText isEqualToString:current]) {
+        if (newText.length) {
+            if ([newText isEqualToString:current]) { blockAlert = nil; return; }   // 没改动
             if (isTransfer) {
                 NSString *normalized = JokerNormalizeAmount(newText);
                 if (normalized) DDJokerSetCachedAmount(msg, normalized);
             } else {
                 DDJokerSetCachedText(msg, newText);
             }
+            JokerReloadCellAfterReplace(vc, msg, cell);
+        } else if (isTransfer ? DDJokerCachedAmount(msg) : DDJokerCachedText(msg)) {
+            // 留空 = 还原：清掉这条消息的覆盖值，立即回到原始内容。
+            // 转账走显示层，清了缓存 vm 重算 titleText 就是真实金额；
+            // 文字走数据层，DDJokerApplyTextOverride 会用 DDJokerTextOriginal 里的备份写回 m_nsContent。
+            if (isTransfer) DDJokerSetCachedAmount(msg, nil);
+            else DDJokerSetCachedText(msg, nil);
             JokerReloadCellAfterReplace(vc, msg, cell);
         }
         blockAlert = nil;   // 打破 alert -> handler -> alert 的保留环
@@ -1055,9 +1076,14 @@ static NSString *DDTimeStringForDisplay(double ts) {
 // 不再读微信 origin（避免相对时间 origin 让绝对日期丢失），与爱锋 timeText @0xba2d0 思路一致。
 %hook ChatTimeViewModel
 - (NSString *)timeText {
-    if (![DDGlobalConfig shared].timeEnabled) return %orig;
-    NSNumber *ts = DDJokerCachedTime(self);
-    if (!ts) return %orig;
+    // 先取一次原始 showingTime：首次调用时它还没被改写，正好把 key 钉在原始值上
+    double raw = DDRawShowingTimeOf(self);
+    NSNumber *ts = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(self) : nil;
+    if (!ts) {
+        // 关开关 / 清过缓存：showingTime 还停在上一次的覆盖值上，不还原就回不到真实时间
+        if (raw > 0 && [self showingTime] != raw) [self setShowingTime:raw];
+        return %orig;
+    }
     NSString *s = DDTimeStringForDisplay([ts doubleValue]);
     return s.length ? s : %orig;
 }
@@ -1133,7 +1159,7 @@ static NSString *DDTimeStringForDisplay(double ts) {
 
     // 与爱锋一致：微信原生 WCUIAlertView，标题/提示文案都沿用它的（@0xbb174 / @0x6287e8 / @0x628828）
     WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:@"时间修改"
-                                                                           message:@"输入格式如下\n2024-08-01 22:30"];
+                                                                           message:@"输入格式如下\n2024-08-01 22:30\n留空还原"];
     [alert showTextFieldWithMaxLen:100];
     [alert setTextFieldDefaultText:defaultText];
     // alert 通过 handler: 强引用这两个 block，若 block 再强引用 alert 会形成保留环（-Werror 直接报错），
@@ -1146,14 +1172,23 @@ static NSString *DDTimeStringForDisplay(double ts) {
         NSString *t = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         double ts = DDTimeStampFromString(t);
         if (ts > 0) {
-            // 爱锋 changeTime @0xbb284 的收尾三步（反汇编实证）：
-            //   写覆盖 → [vm updateLayouts] (@0xbb500，让 vm 重算 timeText)
-            //   → [cell layoutInternal] (@0xbb590) → setNeedsLayout (@0xbb598)。
-            // 之前少了 updateLayouts，vm 里已算好的 timeText 不会重算，cell 重画又把它写回 label，
-            // 于是改完立刻弹回真实时间 —— 这就是"时间修改不生效"的根因。
+            // 爱锋 changeTime @0xbb284 的收尾（反汇编实证）：
+            //   DKWriteShowingTime @0xccfd8 把新时间戳直接写进 vm 的 showingTime ivar（str d8, [x19, x0]），
+            //   → [vm updateLayouts] (@0xbb500) → [cell layoutInternal] (@0xbb590) → setNeedsLayout (@0xbb598)。
+            // 之前只写缓存 + 触发布局，showingTime 没动，vm 重算出来的仍然是真实时间 —— 这才是真正根因。
+            // 顺序不能反：先写缓存（此时 showingTime 还是原始值，key 才钉得住），再改 showingTime。
             DDJokerSetCachedTime(vm, ts);
-            [vm updateLayouts];          // ChatTimeViewModel.h:20
+            [vm setShowingTime:ts];      // ChatTimeViewModel.h:19，让 vm 内部状态真的变成新时间
+            [vm updateLayouts];          // ChatTimeViewModel.h:20，触发 timeText 重算
             [self layoutInternal];       // ChatTimeCellView.h:9，用重算后的 timeText 重画
+            [self setNeedsLayout];
+        } else if (DDJokerCachedTime(vm)) {
+            // 留空 = 还原：清缓存（传 0 即移除），并把 showingTime 写回原始值
+            DDJokerSetCachedTime(vm, 0);
+            double rawTime = DDRawShowingTimeOf(vm);
+            if (rawTime > 0) [vm setShowingTime:rawTime];
+            [vm updateLayouts];
+            [self layoutInternal];
             [self setNeedsLayout];
         }
     }];
