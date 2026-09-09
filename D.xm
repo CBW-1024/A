@@ -11,7 +11,6 @@
 - (void)showTextFieldWithMaxLen:(unsigned int)a0;
 - (UITextField *)getTextField;
 - (id)getTextFieldText;
-- (void)setTextFieldPlaceHolder:(id)a0;
 - (void)setTextFieldDefaultText:(id)a0;
 - (void)addBtnTitle:(id)a0 handler:(void (^)(void))a1;
 - (void)addCancelBtnTitle:(id)a0 handler:(void (^)(void))a1;
@@ -648,13 +647,14 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
     BOOL isTransfer = JokerIsTransferCell(cell);
     NSString *current = JokerGetDisplayText(msg, isTransfer);
 
-    // 微信原生带输入框 alert：WCUIAlertView（声明见文件顶部）。标题按类型区分
+    // 微信原生带输入框 alert：WCUIAlertView（声明见文件顶部）。标题按类型区分，
+    // 副标题给出输入指引（金额/文字），输入框本身不放 placeholder —— 默认文本已经是当前值
     NSString *editorTitle = isTransfer ? @"转账修改" : @"文字修改";
-    WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:editorTitle message:nil];
+    NSString *editorMessage = isTransfer ? @"请输入需要修改的金额" : @"请输入需要修改的文字";
+    WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:editorTitle message:editorMessage];
     if (!alert) return;
     [alert showTextFieldWithMaxLen:1000];
     [alert setTextFieldDefaultText:current];
-    if (isTransfer) [alert setTextFieldPlaceHolder:@"例如：888.88"];
 
     // 注意两点（都踩过坑）：
     // 1) 不能用 __weak 引用 alert —— 回调触发时它可能已释放，nil 会让修改静默失效；
