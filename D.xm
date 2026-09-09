@@ -1071,7 +1071,7 @@ static NSString *DDTimeStringForDisplay(double ts) {
 
     NSNumber *cached = DDJokerCachedTime(vm);
     double base = cached ? [cached doubleValue]
-                         : vm.showingTime;
+                         : [vm showingTime];
     NSString *defaultText = base > 0 ? [DDTimeInputFormatter() stringFromDate:[NSDate dateWithTimeIntervalSince1970:base]] : @"";
 
     // 与爱锋一致：微信原生 WCUIAlertView，标题/提示文案都沿用它的（@0xbb174 / @0x6287e8 / @0x628828）
