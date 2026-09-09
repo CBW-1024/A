@@ -1345,8 +1345,12 @@ static double DDTimeStampFromString(NSString *s) {
 - (void)layoutInternal {
     DDJokerHit(@"ChatTimeCellView.layoutInternal");
     id vm = objc_getAssociatedObject(self, &kDDTimeVMKey);
+    NSNumber *cached = vm ? ([DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(vm) : nil) : nil;
+    if (cached) {
+        DDLOG(@"layoutInternal cell=%p vm=%p 缓存=%@ showingTime=%@ 关联vm=%@",
+              self, vm, DDTimeDesc([cached doubleValue]), DDTimeDesc(DDShowingTimeOf(vm)), vm ? @"有" : @"无");
+    }
     if (vm) {
-        NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(vm) : nil;
         if (cached && DDShowingTimeOf(vm) != [cached doubleValue]) {
             DDSetShowingTime(vm, [cached doubleValue]);
             DDLOG(@"layoutInternal 应用覆盖 vm=%p → %@", vm, DDTimeDesc([cached doubleValue]));
@@ -1377,14 +1381,17 @@ static double DDTimeStampFromString(NSString *s) {
     DDJokerHit(@"ChatTimeCellView.didMoveToWindow");
     %orig;
     [self dk_installTimeEditGesture];
-    // 兜底：cell 上屏时若这条时间有覆盖值，确保 showingTime 已是修改值并强制重排，
-    // 让微信用修改值重算 m_timeText（完整复刻编辑路径的 setShowingTime→layoutInternal→setNeedsLayout）。
-    // 证据（DDJokerDiag.log 01:13:46）：光改 showingTime/updateLayouts 不够，微信把 m_timeText 算一次就缓存，
-    // 必须在 cell 上屏、可布局时主动 layoutInternal+setNeedsLayout 才会重绘出修改时间。
-    if (!self.window) return;
+    // 取证：把 didMoveToWindow 当下读到的 vm/缓存/showingTime 全打出来，定位为什么"应用覆盖"从未触发。
+    // （上一轮日志证明 edit 路径的 setShowingTime+layoutInternal+setNeedsLayout 能生效，
+    //  但 didMoveToWindow 里从没写过，说明这里的 vm 关联或缓存判定没通过，先看清再改。）
     id vm = objc_getAssociatedObject(self, &kDDTimeVMKey);
+    NSNumber *cached = vm ? ([DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(vm) : nil) : nil;
+    DDLOG(@"didMoveToWindow cell=%p window=%@ vm=%@ vmClass=%@ 缓存=%@ showingTime=%@",
+          self, self.window ? @"有" : @"无", vm, vm ? [vm class] : nil,
+          cached ? DDTimeDesc([cached doubleValue]) : @"无",
+          vm ? DDTimeDesc(DDShowingTimeOf(vm)) : @"无");
+    if (!self.window) return;
     if (vm) {
-        NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(vm) : nil;
         if (cached && DDShowingTimeOf(vm) != [cached doubleValue]) {
             DDSetShowingTime(vm, [cached doubleValue]);
             DDLOG(@"didMoveToWindow 应用覆盖 vm=%p → %@", vm, DDTimeDesc([cached doubleValue]));
