@@ -1306,12 +1306,31 @@ static double DDTimeStampFromString(NSString *s) {
     id r = %orig;
     // vm 先存起来：弹窗时要用它读 showingTime 和写缓存
     objc_setAssociatedObject(r, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // 单元格创建时就先把时间覆盖写到 showingTime：微信紧接着的首帧 layout/updateLayouts 会用修改值算 m_timeText，
+    // 这样【离开聊天页再进入】新建的时间条从第一帧起就显示修改时间，不用等点一下才重算。
+    // 证据（DDJokerDiag.log 01:13:46）：只在 timeText/updateLayouts 钩子里改 showingTime 不够——
+    // 微信首帧 layout 用真实 showingTime 把 m_timeText 算好、label 已上屏，之后 timeText 再改 showingTime 也不重绘，
+    // 现象就是"重进显示真实时间、点一下才变修改时间"。覆盖必须在 cell 创建、首帧 layout 之前落地。
+    if (vm) {
+        NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(vm) : nil;
+        if (cached && DDShowingTimeOf(vm) != [cached doubleValue]) {
+            DDSetShowingTime(vm, [cached doubleValue]);
+            DDLOG(@"initWithViewModel 应用覆盖 vm=%p → %@", vm, DDTimeDesc([cached doubleValue]));
+        }
+    }
     [(ChatTimeCellView *)r dk_installTimeEditGesture];
     return r;
 }
 - (void)setViewModel:(id)vm {
     %orig;
     objc_setAssociatedObject(self, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (vm) {
+        NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(vm) : nil;
+        if (cached && DDShowingTimeOf(vm) != [cached doubleValue]) {
+            DDSetShowingTime(vm, [cached doubleValue]);
+            DDLOG(@"setViewModel 应用覆盖 vm=%p → %@", vm, DDTimeDesc([cached doubleValue]));
+        }
+    }
     [self dk_installTimeEditGesture];
 }
 // 微信时间条有第二种显示：点一下时间条会切出带日期的完整时间（ChatTimeCellView.h:11 onClickTimeLabel）。
@@ -1334,6 +1353,21 @@ static double DDTimeStampFromString(NSString *s) {
 - (void)didMoveToWindow {
     %orig;
     [self dk_installTimeEditGesture];
+    // 兜底：cell 上屏时若这条时间有覆盖值，确保 showingTime 已是修改值并强制重排，
+    // 让微信用修改值重算 m_timeText（完整复刻编辑路径的 setShowingTime→layoutInternal→setNeedsLayout）。
+    // 证据（DDJokerDiag.log 01:13:46）：光改 showingTime/updateLayouts 不够，微信把 m_timeText 算一次就缓存，
+    // 必须在 cell 上屏、可布局时主动 layoutInternal+setNeedsLayout 才会重绘出修改时间。
+    if (!self.window) return;
+    id vm = objc_getAssociatedObject(self, &kDDTimeVMKey);
+    if (vm) {
+        NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(vm) : nil;
+        if (cached && DDShowingTimeOf(vm) != [cached doubleValue]) {
+            DDSetShowingTime(vm, [cached doubleValue]);
+            DDLOG(@"didMoveToWindow 应用覆盖 vm=%p → %@", vm, DDTimeDesc([cached doubleValue]));
+            [(ChatTimeCellView *)self layoutInternal];
+            [self setNeedsLayout];
+        }
+    }
 }
 %new
 - (UILabel *)dk_timeLabel {
