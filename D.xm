@@ -562,6 +562,19 @@ static void DDSetShowingTime(id vm, double ts) {
           vm, ivar_getName(iv), ivar_getOffset(iv), old, ts);
 }
 
+// 微信的 timeText 是懒加载缓存（m_timeText ivar —— 导出日志实测 offset=88，类型 @"NSString"）。
+// 改完 showingTime 必须让它失效，否则 %orig 仍吐旧串，"改了不生效"就卡在这一步。
+static void DDInvalidateTimeText(id vm) {
+    Ivar iv = class_getInstanceVariable([vm class], "m_timeText");
+    if (iv) {
+        const char *ty = ivar_getTypeEncoding(iv) ?: "";
+        if (ty[0] == '@' && object_getIvar(vm, iv)) {
+            object_setIvar(vm, iv, nil);   // strong ivar，置 nil 会释放旧串
+        }
+    }
+    [(ChatTimeViewModel *)vm updateLayouts];   // ChatTimeViewModel.h:20，让微信按新的 showingTime 重算
+}
+
 // 时间条没有消息身份时，只能用 showingTime 当 key。但我们改时间会直接改写这个 ivar，
 // 它一变 key 就漂移到新值，下次读到空缓存 → 弹回真实时间（这是之前"改了没反应"的根因之一）。
 // 对齐爱锋 DKRawShowingTime @0xcd044：记住这条时间条的"原始 showingTime"，
@@ -1198,26 +1211,10 @@ static void DDImageApplyReplacementToCell(id cell) {
 
 static char kDDTimeVMKey;
 
-// 爱锋 timeText @0xba2d0 直接用覆盖时间（DKHelperConfig 字典里的字符串）自己格式化显示，
-// 根本不依赖微信原始 timeText 文本选格式。DD 之前用微信 origin（可能是"昨天"/"刚刚"相对时间）
-// 选格式串，会把用户改的具体日期格式成"昨天 HH:mm"丢失绝对日期 —— 这是时间修改失效的根因。
-// 改为：基于用户指定的 ts 相对今天推算格式（今天/昨天/前天/今年含星期/跨年），与微信原生一致。
-static NSString *DDTimeFormatForTimestamp(double ts) {
-    NSCalendar *cal = [NSCalendar currentCalendar];
-    NSDate *d = [NSDate dateWithTimeIntervalSince1970:ts];
-    NSDate *now = [NSDate date];
-    if ([cal isDateInToday:d]) return @"今天 HH:mm";
-    if ([cal isDateInYesterday:d]) return @"昨天 HH:mm";
-    NSDateComponents *dc = [cal components:NSCalendarUnitDay fromDate:d toDate:now options:0];
-    if (dc.day == 2) return @"前天 HH:mm";
-    NSInteger y = [cal component:NSCalendarUnitYear fromDate:d];
-    NSInteger ny = [cal component:NSCalendarUnitYear fromDate:now];
-    if (y == ny) return @"M月d日 EEEE HH:mm";
-    return @"yyyy年M月d日 EEEE HH:mm";
-}
-
-// 输入/解析统一用 en_US_POSIX + @"yyyy-MM-dd HH:mm"（爱锋 timestampFromDateString: @0xbaf30 同款）。
-// 必须用 en_US_POSIX，否则用户改了 12/24 小时制或地区后会解析出 nil。
+// 时间条的显示格式一律由微信原生 timeText 决定，本插件不再自创任何格式串
+// （曾经自己拼过"今天 HH:mm"，而微信当天只显示"15:56"，与原生不一致 —— 已彻底移除）。
+// 这里只保留弹窗的输入/解析格式：用户按 yyyy-MM-dd HH:mm 输入，en_US_POSIX 保证
+// 改了 12/24 小时制或地区后仍能解析（爱锋 timestampFromDateString: @0xbaf30 同款）。
 static NSDateFormatter *DDTimeInputFormatter(void) {
     NSDateFormatter *f = [[NSDateFormatter alloc] init];
     f.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
@@ -1231,16 +1228,8 @@ static double DDTimeStampFromString(NSString *s) {
     return d ? [d timeIntervalSince1970] : 0;
 }
 
-static NSString *DDTimeStringForDisplay(double ts) {
-    NSDateFormatter *f = [[NSDateFormatter alloc] init];
-    f.locale = [NSLocale localeWithLocaleIdentifier:@"zh_CN"];
-    f.timeZone = [NSTimeZone localTimeZone];
-    f.dateFormat = DDTimeFormatForTimestamp(ts);
-    return [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:ts]];
-}
-
-// 时间条显示的就是 viewModel 的 timeText（ChatTimeViewModel.h:14）。覆盖时间直接用用户指定的 ts 格式化，
-// 不再读微信 origin（避免相对时间 origin 让绝对日期丢失），与爱锋 timeText @0xba2d0 思路一致。
+// 时间条显示的就是 viewModel 的 timeText（ChatTimeViewModel.h:14）：
+// 本插件只负责把 showingTime 改成目标时间戳，显示文本与格式全部由微信原生实现给出。
 %hook ChatTimeViewModel
 - (NSString *)timeText {
     static long calls = 0;
@@ -1251,24 +1240,27 @@ static NSString *DDTimeStringForDisplay(double ts) {
 
     // 先取一次原始 showingTime：首次调用时它还没被改写，正好把 key 钉在原始值上
     double raw = DDRawShowingTimeOf(self);
-    double now = DDShowingTimeOf(self);
-    NSNumber *ts = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(self) : nil;
+    NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(self) : nil;
+    double target = cached ? [cached doubleValue] : raw;   // 没覆盖值时目标是原始时间（顺带完成还原）
     BOOL verbose = (calls <= 3 || calls % 50 == 0);
-    if (verbose || ts) {
-        DDLOG(@"timeText vm=%p 开关=%d key=%@ 原始=%.3f 当前=%.3f 缓存=%@",
+    if (verbose || cached) {
+        DDLOG(@"timeText vm=%p 开关=%d key=%@ 原始=%.3f 目标=%.3f 缓存=%@",
               self, [DDGlobalConfig shared].timeEnabled, DDJokerTimeKey(self),
-              raw, now, ts ? [NSString stringWithFormat:@"%.3f", [ts doubleValue]] : @"无");
+              raw, target, cached ? [NSString stringWithFormat:@"%.3f", target] : @"无");
     }
-    if (!ts) {
-        // 关开关 / 清过缓存：showingTime 还停在上一次的覆盖值上，不还原就回不到真实时间
-        if (raw > 0 && now != raw) DDSetShowingTime(self, raw);
-        NSString *o = %orig;
-        if (verbose) DDLOG(@"  → 走原始 timeText = %@", o);
-        return o;
+
+    // showingTime 不是目标值就写进去，并让 m_timeText 缓存失效。
+    // 关开关 / 清缓存时 target 就是原始值，同一段逻辑顺带把显示还原回真实时间。
+    if (target > 0 && DDShowingTimeOf(self) != target) {
+        DDSetShowingTime(self, target);
+        DDInvalidateTimeText(self);
     }
-    NSString *s = DDTimeStringForDisplay([ts doubleValue]);
-    if (verbose) DDLOG(@"  → 走覆盖 timeText = %@", s);
-    return s.length ? s : %orig;
+
+    // 格式完全交给微信原生实现：今天只显示"15:56"、昨天"昨天 15:56"、更早带日期，
+    // 全都由微信自己的分档规则决定。之前自己拼"今天 HH:mm"与原生不一致，现已不再自创格式。
+    NSString *o = %orig;
+    if (verbose || cached) DDLOG(@"  → 微信原生 timeText = %@", o);
+    return o;
 }
 // 改时间后微信重算时间条就走这里，打出来才能确认"改了没反应"到底卡在哪一步
 - (void)updateLayouts {
@@ -1384,7 +1376,7 @@ static NSString *DDTimeStringForDisplay(double ts) {
             // 顺序不能反：先写缓存（此时 showingTime 还是原始值，key 才钉得住），再改 showingTime。
             DDJokerSetCachedTime(vm, ts);
             DDSetShowingTime(vm, ts);    // 直接写 _showingTime ivar，爱锋 @0xccfd8 同款
-            [vm updateLayouts];          // ChatTimeViewModel.h:20，触发 timeText 重算
+            DDInvalidateTimeText(vm);    // 清 m_timeText 缓存 + updateLayouts，否则微信还吐旧串
             [self layoutInternal];       // ChatTimeCellView.h:9，用重算后的 timeText 重画
             [self setNeedsLayout];
             DDLOG(@"  → 已写入：目标 ts=%@ 写后 showingTime=%@", DDTimeDesc(ts), DDTimeDesc(DDShowingTimeOf(vm)));
@@ -1393,7 +1385,7 @@ static NSString *DDTimeStringForDisplay(double ts) {
             DDJokerSetCachedTime(vm, 0);
             double rawTime = DDRawShowingTimeOf(vm);
             if (rawTime > 0) DDSetShowingTime(vm, rawTime);
-            [vm updateLayouts];
+            DDInvalidateTimeText(vm);
             [self layoutInternal];
             [self setNeedsLayout];
             DDLOG(@"  → 改后 showingTime=%@", DDTimeDesc(DDShowingTimeOf(vm)));
@@ -1667,9 +1659,7 @@ static NSString *DDJokerDescribeTimeVM(id vm) {
     [s appendFormat:@"  原始 showingTime   : %@\n", DDTimeDesc(DDRawShowingTimeOf(vm))];
     [s appendFormat:@"  时间 key           : %@\n", DDJokerTimeKey(vm)];
     NSNumber *cached = DDJokerCachedTime(vm);
-    [s appendFormat:@"  缓存命中           : %@\n",
-     cached ? [NSString stringWithFormat:@"%@ → 显示 %@", DDTimeDesc([cached doubleValue]),
-                                         DDTimeStringForDisplay([cached doubleValue])] : @"无"];
+    [s appendFormat:@"  缓存命中           : %@\n", cached ? DDTimeDesc([cached doubleValue]) : @"无"];
     return s;
 }
 
