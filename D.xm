@@ -1680,6 +1680,32 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     return v;
 }
 
+// 【关键修复·仿爱锋 currentNumber getter】微信在 updateScrollNumber / 动画里往往是
+// 「直接写 _currentNumber ivar」或「重读 getter」来落笔，只 hook setter（updateNumber: /
+// setCurrentNumber: / defaultNumber:）会被它二次覆盖回真值——日志里 setCurrentNumber:
+// 命中 40 次却无效正是这个原因。改 getter 才是「最终落笔」：无论内部怎么写，屏幕每次
+// 读取到的都是我们的值。爱锋（DKHelper）wechatku.dylib @0xbecc4 的 currentNumber 在
+// enabled 时 return [self isLQT] ? changedLQTYuE : changedYuE，这里用 DDBalancePageKindOf
+// 等价判定（白名单 VC 内才动手，倒计时等非钱包控件一律走 %orig，零副作用）。
+// ⚠️ getter 是热路径（动画每帧都会读），所以判定尽量轻；日志只在命中分支打 HIT 计数，不刷 DDLOG。
+- (unsigned long long)currentNumber {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled) {
+            DDBalancePageKind kind = DDBalancePageKindOf(self);
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) {
+                DDJokerHit(@"余额.currentNumber.LQT");
+                return DDClampFen(DDLingtongFenValue());
+            }
+            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) {
+                DDJokerHit(@"余额.currentNumber.余额");
+                return DDClampFen(DDBalanceFenValue());
+            }
+        }
+    } @catch (NSException *e) {}
+    return %orig;
+}
+
 // 微信初始化时走 defaultNumber:，只 hook updateNumber: 会让刚进页面先闪一下真值
 - (void)defaultNumber:(unsigned long long)original {
     @try {
