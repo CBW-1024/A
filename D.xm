@@ -272,6 +272,30 @@ static BOOL JokerIsReferMessage(CMessageWrap *msg) {
     return [msg isReferMsgType];
 }
 
+// 引用消息（type 57 appmsg）的 GetDisplayContent 返回的是原始 XML 碎片
+// （<msg><appmsg><title>...</title><refermsg>...），直接回填输入框会全是 < > " 这类像正则的字符。
+// 真正显示在气泡里的回复正文其实是 <appmsg><title>，这里把它解析出来作为预填/还原文本。
+static NSString *JokerReferMessageTitle(CMessageWrap *msg) {
+    NSString *xml = [msg m_nsContent];
+    if (![xml isKindOfClass:[NSString class]] || !xml.length) return nil;
+    NSString *open = @"<title>";
+    NSRange ro = [xml rangeOfString:open options:NSCaseInsensitiveSearch];
+    if (ro.location == NSNotFound) return nil;
+    NSUInteger start = ro.location + ro.length;
+    NSRange rc = [xml rangeOfString:@"</title>" options:NSCaseInsensitiveSearch range:NSMakeRange(start, xml.length - start)];
+    if (rc.location == NSNotFound) return nil;
+    NSString *t = [xml substringWithRange:NSMakeRange(start, rc.location - start)];
+    // 引用标题里可能带 HTML 实体，简单还原最常见的几个
+    t = [t stringByReplacingOccurrencesOfString:@"&lt;" withString:@"<"];
+    t = [t stringByReplacingOccurrencesOfString:@"&gt;" withString:@">"];
+    t = [t stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+    t = [t stringByReplacingOccurrencesOfString:@"&quot;" withString:@"\""];
+    t = [t stringByReplacingOccurrencesOfString:@"&apos;" withString:@"'"];
+    // 去掉首尾空白，避免预填出现空行
+    t = [t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return t.length ? t : nil;
+}
+
 // 已删除 JokerIsTransferMessage(msg)：CMessageWrap.h 里没有 m_oWCPayInfoItem
 // （只有 :572 parseWCPayInfoItemIfNeed），那个判定在真机上恒为 NO，
 // 用它会导致"金额改了没反应"和"点小丑不弹窗"。转账一律按下面的类判定。
@@ -489,7 +513,15 @@ static void JokerRefreshVisibleImageCells(void) {
 // 转账金额不再从 WCPayInfoItem 读（新版本拿不到），直接用缓存值回填
 static NSString *JokerGetDisplayText(CMessageWrap *msg, BOOL isTransfer) {
     if (isTransfer) return DDJokerCachedAmount(msg) ?: @"";
-    return DDJokerCachedText(msg) ?: ([msg GetDisplayContent] ?: @"");
+    NSString *cached = DDJokerCachedText(msg);
+    if (cached) return cached;
+    // 引用消息的 GetDisplayContent 是原始 XML 碎片（像正则），回填输入框会一团乱，
+    // 改成取 <title>（即气泡里真正显示的回复正文），与 %orig 的 contentText 显示一致
+    if (JokerIsReferMessage(msg)) {
+        NSString *t = JokerReferMessageTitle(msg);
+        if (t) return t;
+    }
+    return [msg GetDisplayContent] ?: @"";
 }
 
 static UITableView *JokerFindTableView(UIView *view) {
@@ -530,7 +562,11 @@ static void JokerRefreshCellDirectly(CommonMessageCellView *cell) {
         NSString *cached = [DDGlobalConfig shared].textEnabled ? DDJokerCachedText(msg) : nil;
         // 没有缓存（关开关 / 清过缓存）就还原成原文，否则关掉修改后文字变不回去
         if (!cached && (JokerIsTextMessage(msg) || JokerIsReferMessage(msg))) {
-            cached = [msg GetDisplayContent];
+            if (JokerIsReferMessage(msg)) {
+                cached = JokerReferMessageTitle(msg) ?: [msg GetDisplayContent];
+            } else {
+                cached = [msg GetDisplayContent];
+            }
         }
         if ([cell respondsToSelector:@selector(getRichTextView)]) {
             JokerApplyTextToRichView([(TextMessageCellView *)cell getRichTextView], cached);
@@ -884,6 +920,13 @@ static void DDImageApplyReplacementToCell(id cell) {
     NSString *path = DDImageReplacementPath(self.mesLocalID);
     NSData *data = UIImagePNGRepresentation(image);
     if (data) [data writeToFile:path atomically:YES];
+
+    // 选完图后 picker 以动画消失，用户点"选取"的那个 tap 会在过渡窗口被投递到
+    // 已经露出来的 ImageMessageCellView，触发微信的图片预览（全屏浏览器）打开。
+    // 在 dismiss 期间屏蔽全窗交互，吞掉这次误触，过渡结束后再恢复。
+    BOOL wasIgnoring = [[UIApplication sharedApplication] isIgnoringInteractionEvents];
+    if (!wasIgnoring) [[UIApplication sharedApplication] beginIgnoringInteractionEvents];
+
     [picker dismissViewControllerAnimated:YES completion:^{
         // 之前这里要求 viewController 必须是 BaseMsgContentViewController，否则直接 return，
         // 刷新根本没执行 —— 这就是"改完图要退出重进才生效"的原因
@@ -906,6 +949,13 @@ static void DDImageApplyReplacementToCell(id cell) {
                 }
             }
             if (!hit) JokerInvalidateAllLayout();
+
+            // 过渡动画约 0.35s，多等一会再恢复交互，确保误触已被吞掉
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (!wasIgnoring && [[UIApplication sharedApplication] isIgnoringInteractionEvents]) {
+                    [[UIApplication sharedApplication] endIgnoringInteractionEvents];
+                }
+            });
         });
     }];
 }
