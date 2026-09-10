@@ -1037,19 +1037,26 @@ static void DDApplyTransferDetailPatch(UIView *root, NSString *override) {
     NSString *override = gDDLastTransferOverride;
     if (!override.length) return;
     DDLOG(@"[详情页金额] patch 触发 className=%@ override=%@", NSStringFromClass([self class]), override);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        @try {
-            UIView *root = self.view;
-            if (root) DDApplyTransferDetailPatch(root, override);
-        } @catch (NSException *e) {}
-    });
+    @try {
+        UIView *root = self.view;
+        if (root) DDApplyTransferDetailPatch(root, override);
+    } @catch (NSException *e) {}
 }
 - (void)viewDidLoad {
     %orig;
     [self dd_patchTransferDetailAmount];
 }
 - (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    [self dd_patchTransferDetailAmount];
+}
+// 微信在状态轮询 / 数据刷新时会重渲染金额 label，把真值覆盖回来（"闪一下又还原"）。
+// 在 %orig 之后立即重写 override，保证每次重渲染后都显示改写值。
+- (void)refreshViewWithData:(id)arg {
+    %orig;
+    [self dd_patchTransferDetailAmount];
+}
+- (void)reloadTableView {
     %orig;
     [self dd_patchTransferDetailAmount];
 }
