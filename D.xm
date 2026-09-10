@@ -977,40 +977,54 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 }
 %end
 
-// 转账详情页金额改写：把文本中的金额替换为 override（格式如 "200.00"）。
-// 详情页金额有两种写法：① ¥X.XX（标准）；② "X点X X元"（如 "0点1 0元"，无 ¥、小数点写作"点"、各位间可能含空格）。
-static NSString *DDTransferRewriteDetailAmount(NSString *text, NSString *override) {
-    if (!text.length || !override.length) return text;
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"¥?\\d[\\d,]*(\\.\\d+)?" options:0 error:nil];
-    NSTextCheckingResult *m = [re firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
-    if (m) {
-        NSMutableString *out = [text mutableCopy];
-        [out replaceCharactersInRange:m.range withString:[@"¥" stringByAppendingString:override]];
-        return out;
+// 转账详情页金额改写：基于详情页金额 label 实测证据（Flex 属性分组截图）。
+// 金额 label 为 MMUILabel（baseClass=UILabel，frame=(0 128; 414 54)，text 长度 5）。
+// 显示只读 text / attributedText；该 label enableLongPressCopy=0（图2 属性列表），
+// 长按复制手势关闭，textToCopy 仅是 MMUILabel 基类字段、不参与功能，故不写。
+// override 格式如 "200.00"，写入显示文本：setText:（兜底）+ setAttributedText:（保留原颜色）。
+static void DDTransferRewriteDetailLabel(UIView *label, NSString *override) {
+    if (!label || !override.length) return;
+    if (![label respondsToSelector:@selector(text)] || ![label respondsToSelector:@selector(setText:)]) return;
+    NSString *cur = [label text];
+    if (!cur.length) return;
+    // —— 诊断：改写前 dump 显示相关原生字段，确认微信实际读哪个（text / attributedText）——
+    NSAttributedString *origAttr = nil;
+    @try { if ([label respondsToSelector:@selector(attributedText)]) origAttr = [label attributedText]; } @catch (NSException *e) {}
+    DDLOG(@"[详情页金额] 命中 label=%@ className=%@ | text=%@ | attributedText=%@ | override=%@",
+          label, NSStringFromClass([label class]), cur,
+          origAttr ? [origAttr string] : @"(nil)", override);
+    DDJokerHit(@"转账详情页金额");
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"¥\\s*(\\d[\\d,]*(\\.\\d+)?)" options:0 error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:cur options:0 range:NSMakeRange(0, cur.length)];
+    if (!m) {
+        DDLOG(@"[详情页金额] 未匹配 ¥ 金额，跳过。cur=%@", cur);
+        return;
     }
-    NSRegularExpression *re2 = [NSRegularExpression regularExpressionWithPattern:@"(\\d+)\\s*点\\s*([\\d\\s]+?)\\s*元" options:0 error:nil];
-    NSTextCheckingResult *m2 = [re2 firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
-    if (m2) {
-        NSArray *parts = [override componentsSeparatedByString:@"."];
-        NSString *intPart = parts.count ? parts[0] : override;
-        NSString *decPart = parts.count > 1 ? parts[1] : @"00";
-        NSString *newAmt = [NSString stringWithFormat:@"%@点%@元", intPart, decPart];
-        NSMutableString *out = [text mutableCopy];
-        [out replaceCharactersInRange:m2.range withString:newAmt];
-        return out;
+    NSString *newText = [@"¥" stringByAppendingString:override];
+    [label setText:newText];
+    if ([label respondsToSelector:@selector(attributedText)] && [label respondsToSelector:@selector(setAttributedText:)]) {
+        NSAttributedString *attr = nil;
+        @try { attr = [label attributedText]; } @catch (NSException *e) {}
+        if (attr && attr.length) {
+            NSDictionary *attrs = [attr attributesAtIndex:0 effectiveRange:NULL];
+            NSMutableAttributedString *mattr = [[NSMutableAttributedString alloc] initWithString:newText attributes:attrs];
+            [label setAttributedText:mattr];
+        }
     }
-    return text;
+    DDLOG(@"[详情页金额] 已写显示文本 + 富文本 -> %@", newText);
 }
 
-// 递归遍历 view 子树，改写所有含"元"字的 UILabel / MMUILabel 文本。
+// 递归遍历 view 子树，定位金额 label（MMUILabel / UILabel 且文本命中 ¥X.XX）后调用原生改写。
 static void DDApplyTransferDetailPatch(UIView *root, NSString *override) {
     if (!root || !override.length) return;
     for (UIView *v in root.subviews) {
-        if ([v respondsToSelector:@selector(text)] && [v respondsToSelector:@selector(setText:)]) {
-            NSString *t = [v text];
-            if (t.length && [t rangeOfString:@"元"].location != NSNotFound) {
-                NSString *nt = DDTransferRewriteDetailAmount(t, override);
-                if (nt && ![nt isEqualToString:t]) [v setText:nt];
+        if ([v isKindOfClass:[UILabel class]]) {
+            NSString *t = [v respondsToSelector:@selector(text)] ? [v text] : nil;
+            if (t.length) {
+                NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"¥\\s*\\d" options:0 error:nil];
+                if ([re firstMatchInString:t options:0 range:NSMakeRange(0, t.length)]) {
+                    DDTransferRewriteDetailLabel(v, override);
+                }
             }
         }
         DDApplyTransferDetailPatch(v, override);
@@ -1031,6 +1045,7 @@ static void DDApplyTransferDetailPatch(UIView *root, NSString *override) {
     if (![DDGlobalConfig shared].transferEnabled) return;
     NSString *override = gDDLastTransferOverride;
     if (!override.length) return;
+    DDLOG(@"[详情页金额] patch 触发 className=%@ override=%@", NSStringFromClass([self class]), override);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         @try {
