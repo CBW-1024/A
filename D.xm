@@ -932,7 +932,7 @@ static NSString *DDTransferFeedescAmount(NSString *xml) {
 
 static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *override) {
     if (!text.length || !override.length) return text;
-    // 两个页面金额都带 ¥，必带 ¥ + 两位小数（允许千分位逗号），不做宽松匹配。
+    // 转账消息金额：必带 ¥、两位小数（允许千分位逗号）。
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"¥\\d[\\d,]*\\.\\d{2}"
                                                                         options:0
                                                                           error:nil];
@@ -984,9 +984,9 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 // 文本是 ¥ 金额 + 存在 override"时改写。微信每次重设金额（含状态轮询/刷新）都会被接住，不闪不还原。
 // 该 label enableLongPressCopy=0，长按复制未启用，textToCopy 不参与，故不写。
 
-// 沿 responder 链上溯几步判断 label 是否属于转账详情页（只走 responder 链，不遍历 view 树）。
-static BOOL DDLabelOnTransferDetailVC(UIView *v) {
-    UIResponder *r = v;
+// 沿 responder 链上溯判断 label 是否属于转账详情页（只走 responder 链，不遍历 view 树）。
+static BOOL DDLabelOnTransferDetailVC(id v) {
+    UIResponder *r = (UIResponder *)v;
     while (r) {
         if ([r isKindOfClass:[WCPayTransferMoneyStatusViewController class]]) return YES;
         r = r.nextResponder;
@@ -1394,11 +1394,8 @@ typedef NS_ENUM(NSInteger, DDBalancePageKind) {
 
 static const void *kDDBalanceKindKey = &kDDBalanceKindKey;
 
-// 页面判定：沿响应链找最近的 UIViewController，按 description 中的页标识区分。
-// 仅锚定 Flex 截图实证的标识：
-//   6元余额   -> KindaViewController>balanceEntryUIPage
-//   3元零钱通 -> KindaViewController>lqtDetailUIPage
-//   服务页余额 -> WCPayMainViewControllerV2
+// 页面判定：沿响应链找最近 VC，按 description 页标识区分余额/零钱通。
+//   余额：balanceEntryUIPage / WCPayMainViewControllerV2；零钱通：lqtDetailUIPage
 static DDBalancePageKind DDBalancePageKindOf(id sn) {
     @try {
         if (![sn isKindOfClass:[UIView class]]) return DDBalancePageNone;
@@ -1426,8 +1423,7 @@ static unsigned long long DDClampFen(unsigned long long fen) {
 
 static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fen) {
     if (!text.length) return text;
-    // 锚定 Flex 截图：金额由 ScrollNumber 以「分」渲染为两位小数纯数字（600→6.00，300→3.00），
-    // ¥ 是旁边独立 label，不参与数字串；故匹配可选 ¥ + 两位小数数字，不吃整数/任意小数位。
+    // 金额由 ScrollNumber 以两位小数渲染，¥ 为独立 label，故匹配可选 ¥ + 两位小数数字。
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"[¥￥]?\\s*\\d[\\d,]*\\.\\d{2}" options:0 error:nil];
     NSTextCheckingResult *m = [re firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
     if (!m || m.range.location == NSNotFound) return text;
@@ -1440,7 +1436,6 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
     NSInteger dec = 0;
     NSRange dot = [core rangeOfString:@"."];
     if (dot.location != NSNotFound) dec = (NSInteger)core.length - (NSInteger)dot.location - 1;
-    if (dec < 0) dec = 0; if (dec > 6) dec = 6;
     unsigned long long scaled = fen;
     if (dec > 2) { for (int i = 0; i < dec - 2; i++) scaled *= 10; }
     else { for (int i = 0; i < 2 - dec; i++) scaled /= 10; }
