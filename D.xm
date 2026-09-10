@@ -320,8 +320,9 @@ static void DDJokerLog(NSString *fmt, ...) {
 
 #define DDLOG(...) DDJokerLog(__VA_ARGS__)
 
-// hook 命中计数，节流输出（前 3 次 + 每 50 次），避免刷屏
-static void DDJokerHit(NSString *tag) {
+// hook 命中计数，节流输出（前 3 次 + 每 50 次），避免刷屏。
+// 当前为待接线状态（无功能调用），新功能里调 DDJokerHit(@"标签") 即启用，届时移除下方 __attribute__((unused))。
+static void DDJokerHit(NSString *tag) __attribute__((unused)) {
     NSMutableDictionary *hits = DDLogHits();
     NSInteger n = 0;
     @synchronized (hits) {
