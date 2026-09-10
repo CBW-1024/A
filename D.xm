@@ -1645,7 +1645,7 @@ static BOOL DDViewDescendantHasText(UIView *view, NSString *key, BOOL exact) {
 //   ① 第一遍：沿 superview 链检查每个祖先的 className 关键字（O(深度)，每层只比较类名，【不递归子树】，比②快且稳）。
 //      微信所有视图类均 NSObject（头文件硬证据），ScrollNumber 的祖先链上必有明确业务类，其类名编译期固定，
 //      比运行时拼的 UILabel 文本可靠：
-//        · 含 "LQT"/"LingTong" → 零钱通（特属字样，几乎无歧义）
+//        · 含 "LQT"/"LingTong"/"KindaMoneyLoadingView" → 零钱通（KindaMoneyLoadingView 是零钱通详情页数字容器，头文件证据：KindaMoneyLoadingView.h:12 timeoutNumber / :21 setMoney:animated:）
 //        · 含 "Wallet"/"Balance"/"Entrance" → 余额入口（钱包主页卡 WCPayWalletViewCell、服务页钱包卡、零钱通详情页余额卡等）
 //   ② 第二遍（文本兜底，最后保险）：保留原四字精确 + "钱包"兜底递归子树，仅当①全 miss 时才执行（基本不跑）。
 //   诊断：记录 superview 链前 8 层类名到 gDDLastBalanceChain，用于抓"服务页钱包卡"等未知入口的精确类名。
@@ -1659,7 +1659,8 @@ static DDBalancePageKind DDBalancePageKindOf(id sn) {
             NSString *cls = NSStringFromClass([v class]);
             if (depth < 8) [chain appendFormat:@"%d:%@ ", depth, cls];
             if ([cls rangeOfString:@"LQT"].location != NSNotFound ||
-                [cls rangeOfString:@"LingTong"].location != NSNotFound) {
+                [cls rangeOfString:@"LingTong"].location != NSNotFound ||
+                [cls rangeOfString:@"KindaMoneyLoadingView"].location != NSNotFound) {
                 gDDLastBalanceHint = [NSString stringWithFormat:@"类名:%@", cls];
                 gDDLastBalanceChain = chain;
                 return DDBalancePageLQT;
