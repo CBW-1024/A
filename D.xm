@@ -982,7 +982,7 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 // 显示只读 text / attributedText；该 label enableLongPressCopy=0（图2 属性列表），
 // 长按复制手势关闭，textToCopy 仅是 MMUILabel 基类字段、不参与功能，故不写。
 // override 格式如 "200.00"，写入显示文本：setText:（兜底）+ setAttributedText:（保留原颜色）。
-static void DDTransferRewriteDetailLabel(UIView *label, NSString *override) {
+static void DDTransferRewriteDetailLabel(UILabel *label, NSString *override) {
     if (!label || !override.length) return;
     if (![label respondsToSelector:@selector(text)] || ![label respondsToSelector:@selector(setText:)]) return;
     NSString *cur = [label text];
@@ -1018,9 +1018,9 @@ static void DDApplyTransferDetailPatch(UIView *root, NSString *override) {
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"¥\\s*\\d" options:0 error:nil];
     for (UIView *v in root.subviews) {
         if ([v isKindOfClass:[UILabel class]]) {
-            NSString *t = [v respondsToSelector:@selector(text)] ? [v text] : nil;
+            NSString *t = [(UILabel *)v text];
             if (t.length && re && [re firstMatchInString:t options:0 range:NSMakeRange(0, t.length)]) {
-                DDTransferRewriteDetailLabel(v, override);
+                DDTransferRewriteDetailLabel((UILabel *)v, override);
             }
         }
         DDApplyTransferDetailPatch(v, override);
@@ -1028,14 +1028,6 @@ static void DDApplyTransferDetailPatch(UIView *root, NSString *override) {
 }
 
 %hook WCPayTransferMoneyStatusViewController
-- (void)viewDidLoad {
-    %orig;
-    [self dd_patchTransferDetailAmount];
-}
-- (void)viewWillAppear:(BOOL)animated {
-    %orig;
-    [self dd_patchTransferDetailAmount];
-}
 %new
 - (void)dd_patchTransferDetailAmount {
     if (![DDGlobalConfig shared].transferEnabled) return;
@@ -1049,6 +1041,14 @@ static void DDApplyTransferDetailPatch(UIView *root, NSString *override) {
             if (root) DDApplyTransferDetailPatch(root, override);
         } @catch (NSException *e) {}
     });
+}
+- (void)viewDidLoad {
+    %orig;
+    [self dd_patchTransferDetailAmount];
+}
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    [self dd_patchTransferDetailAmount];
 }
 %end
 
