@@ -186,9 +186,6 @@
 
 @interface WCPayTransferMoneyStatusViewController : UIViewController
 @end
-@interface WCPayTransferMoneyStatusViewController (DDTransferDetail)
-- (void)dd_patchTransferDetailAmount;
-@end
 
 @interface WCPayLQTInfo : NSObject
 - (unsigned long long)lqtAvailBalance;
@@ -980,85 +977,45 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 }
 %end
 
-// 转账详情页金额改写：基于详情页金额 label 实测证据（Flex 属性分组截图）。
-// 金额 label 为 MMUILabel（baseClass=UILabel，frame=(0 128; 414 54)，text 长度 5）。
-// 显示只读 text / attributedText；该 label enableLongPressCopy=0（图2 属性列表），
-// 长按复制手势关闭，textToCopy 仅是 MMUILabel 基类字段、不参与功能，故不写。
-// override 格式如 "200.00"，写入显示文本：setText:（兜底）+ setAttributedText:（保留原颜色）。
-static void DDTransferRewriteDetailLabel(UILabel *label, NSString *override) {
-    if (!label || !override.length) return;
-    if (![label respondsToSelector:@selector(text)] || ![label respondsToSelector:@selector(setText:)]) return;
-    NSString *cur = [label text];
-    if (!cur.length) return;
-    // 改写前先抓原始富文本（含微信设的颜色/字号）。setText: 会清空 attributedText，
-    // 故必须在此处取值并复用，不可写完后回头再读（那会拿到降级后的默认属性）。
-    NSAttributedString *origAttr = nil;
-    @try { if ([label respondsToSelector:@selector(attributedText)]) origAttr = [label attributedText]; } @catch (NSException *e) {}
-    DDLOG(@"[详情页金额] 命中 label=%@ className=%@ | text=%@ | attributedText=%@ | override=%@",
-          label, NSStringFromClass([label class]), cur,
-          origAttr ? [origAttr string] : @"(nil)", override);
-    DDJokerHit(@"转账详情页金额");
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"¥\\s*(\\d[\\d,]*(\\.\\d+)?)" options:0 error:nil];
-    NSTextCheckingResult *m = [re firstMatchInString:cur options:0 range:NSMakeRange(0, cur.length)];
-    if (!m) {
-        DDLOG(@"[详情页金额] 未匹配 ¥ 金额，跳过。cur=%@", cur);
-        return;
+// 转账详情页金额改写（精确方案，零 view 树遍历）：
+// 用 Flex 锁定真实金额 label 是 MMUILabel（baseClass=UILabel，frame=(0 128; 414 54)，text=¥0.01），
+// 直接 hook MMUILabel 的 setText:/setAttributedText:，仅当"label 归属转账详情页 VC +
+// 文本是 ¥ 金额 + 存在 override"时改写。微信每次重设金额（含状态轮询/刷新）都会被接住，不闪不还原。
+// 该 label enableLongPressCopy=0，长按复制未启用，textToCopy 不参与，故不写。
+
+// 沿 responder 链上溯几步判断 label 是否属于转账详情页（只走 responder 链，不遍历 view 树）。
+static BOOL DDLabelOnTransferDetailVC(UIView *v) {
+    UIResponder *r = v;
+    while (r) {
+        if ([r isKindOfClass:[WCPayTransferMoneyStatusViewController class]]) return YES;
+        r = r.nextResponder;
     }
-    NSString *newText = [@"¥" stringByAppendingString:override];
-    [label setText:newText];
-    if (origAttr && origAttr.length && [label respondsToSelector:@selector(setAttributedText:)]) {
-        NSDictionary *attrs = [origAttr attributesAtIndex:0 effectiveRange:NULL];
-        NSMutableAttributedString *mattr = [[NSMutableAttributedString alloc] initWithString:newText attributes:attrs];
-        [label setAttributedText:mattr];
-    }
-    DDLOG(@"[详情页金额] 已写显示文本 + 富文本 -> %@", newText);
+    return NO;
 }
 
-// 递归遍历 view 子树，定位金额 label（MMUILabel / UILabel 且文本命中 ¥X.XX）后调用原生改写。
-static void DDApplyTransferDetailPatch(UIView *root, NSString *override) {
-    if (!root || !override.length) return;
-    // 正则提到循环外，避免每个 label 重复编译。
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"¥\\s*\\d" options:0 error:nil];
-    for (UIView *v in root.subviews) {
-        if ([v isKindOfClass:[UILabel class]]) {
-            NSString *t = [(UILabel *)v text];
-            if (t.length && re && [re firstMatchInString:t options:0 range:NSMakeRange(0, t.length)]) {
-                DDTransferRewriteDetailLabel((UILabel *)v, override);
-            }
-        }
-        DDApplyTransferDetailPatch(v, override);
+%hook MMUILabel
+- (void)setText:(NSString *)text {
+    NSString *ov = gDDLastTransferOverride;
+    if (ov.length && [DDGlobalConfig shared].transferEnabled && [text hasPrefix:@"¥"] && DDLabelOnTransferDetailVC(self)) {
+        NSString *nt = [@"¥" stringByAppendingString:ov];
+        DDLOG(@"[详情页金额] setText 改写 -> %@", nt);
+        DDJokerHit(@"转账详情页金额");
+        %orig(nt);
+    } else {
+        %orig;
     }
 }
-
-%hook WCPayTransferMoneyStatusViewController
-%new
-- (void)dd_patchTransferDetailAmount {
-    if (![DDGlobalConfig shared].transferEnabled) return;
-    NSString *override = gDDLastTransferOverride;
-    if (!override.length) return;
-    DDLOG(@"[详情页金额] patch 触发 className=%@ override=%@", NSStringFromClass([self class]), override);
-    @try {
-        UIView *root = self.view;
-        if (root) DDApplyTransferDetailPatch(root, override);
-    } @catch (NSException *e) {}
-}
-- (void)viewDidLoad {
-    %orig;
-    [self dd_patchTransferDetailAmount];
-}
-- (void)viewWillAppear:(BOOL)animated {
-    %orig;
-    [self dd_patchTransferDetailAmount];
-}
-// 微信在状态轮询 / 数据刷新时会重渲染金额 label，把真值覆盖回来（"闪一下又还原"）。
-// 在 %orig 之后立即重写 override，保证每次重渲染后都显示改写值。
-- (void)refreshViewWithData:(id)arg {
-    %orig;
-    [self dd_patchTransferDetailAmount];
-}
-- (void)reloadTableView {
-    %orig;
-    [self dd_patchTransferDetailAmount];
+- (void)setAttributedText:(NSAttributedString *)attr {
+    NSString *ov = gDDLastTransferOverride;
+    if (ov.length && [DDGlobalConfig shared].transferEnabled && attr.string.length && [attr.string hasPrefix:@"¥"] && DDLabelOnTransferDetailVC(self)) {
+        NSDictionary *attrs = [attr attributesAtIndex:0 effectiveRange:NULL];
+        NSAttributedString *na = [[NSAttributedString alloc] initWithString:[@"¥" stringByAppendingString:ov] attributes:attrs];
+        DDLOG(@"[详情页金额] setAttributedText 改写 -> %@", na.string);
+        DDJokerHit(@"转账详情页金额");
+        %orig(na);
+    } else {
+        %orig;
+    }
 }
 %end
 
