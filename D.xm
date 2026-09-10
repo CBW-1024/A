@@ -180,15 +180,6 @@
 - (void)refreshViewWithData:(id)arg;
 @end
 
-@interface WCPayWalletViewController : UIViewController
-- (id)balanceNumber;
-- (id)lqtNumber;
-@end
-
-@interface TimeoutNumber : NSObject
-- (id)scrollNumber;
-@end
-
 @interface WCPayLQTInfo : NSObject
 - (unsigned long long)lqtAvailBalance;
 - (unsigned long long)lqtTotalBalance;
@@ -1407,16 +1398,6 @@ static DDBalancePageKind DDBalancePageKindOf(id sn) {
         for (int depth = 0; depth < 24 && r; depth++) {
             if ([r isKindOfClass:[UIViewController class]]) {
                 NSString *cls = NSStringFromClass([r class]) ?: @"";
-                // 钱包列表页：零钱/零钱通同页两个数字，按指针归属区分。
-                if ([cls isEqualToString:@"WCPayWalletViewController"]) {
-                    WCPayWalletViewController *wvc = (WCPayWalletViewController *)r;
-                    id bal = [wvc balanceNumber];
-                    if (bal && (bal == sn || ([bal isKindOfClass:%c(TimeoutNumber)] && [(TimeoutNumber *)bal scrollNumber] == sn)))
-                        return DDBalancePageBalance;
-                    id lqt = [wvc lqtNumber];
-                    if (lqt && (lqt == sn || ([lqt isKindOfClass:%c(TimeoutNumber)] && [(TimeoutNumber *)lqt scrollNumber] == sn)))
-                        return DDBalancePageLQT;
-                }
                 NSString *all = [NSString stringWithFormat:@"%@ %@", cls, [r description] ?: @""];
                 if ([all rangeOfString:@"lqtDetailUIPage"].location != NSNotFound)
                     return DDBalancePageLQT;
