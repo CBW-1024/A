@@ -1818,6 +1818,7 @@ static NSString *DDJokerWriteDiagLog(void) {
                                                 action:@selector(balanceConfirm:)
                                            placeholder:@"例如：888.88"
                                                   text:currentBalance];
+        self.balanceField.keyboardType = UIKeyboardTypeDecimalPad;
         WCTableViewCellManager *balanceSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳余额自定义" rightView:balanceRight];
         balanceSubCell.userInfo = @"SubCell";
         [profileSection addCell:balanceSubCell];
@@ -1829,6 +1830,7 @@ static NSString *DDJokerWriteDiagLog(void) {
                                                  action:@selector(lingtongConfirm:)
                                             placeholder:@"例如：888.88"
                                                    text:currentLingtong];
+        self.lingtongField.keyboardType = UIKeyboardTypeDecimalPad;
         WCTableViewCellManager *lingtongSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳零钱通自定义" rightView:lingtongRight];
         lingtongSubCell.userInfo = @"SubCell";
         [profileSection addCell:lingtongSubCell];
