@@ -1393,8 +1393,8 @@ typedef NS_ENUM(NSInteger, DDBalancePageKind) {
 
 static const void *kDDBalanceKindKey = &kDDBalanceKindKey;
 
-// 页面判定：沿响应链找最近的 UIViewController，按 class / description 中的页面标识区分。
-// Flex 证据：
+// 页面判定：沿响应链找最近的 UIViewController，按 description 中的页标识区分。
+// 仅锚定 Flex 截图实证的标识：
 //   6元余额   -> KindaViewController>balanceEntryUIPage
 //   3元零钱通 -> KindaViewController>lqtDetailUIPage
 //   服务页余额 -> WCPayMainViewControllerV2
@@ -1405,22 +1405,12 @@ static DDBalancePageKind DDBalancePageKindOf(id sn) {
         for (int depth = 0; depth < 24 && r; depth++) {
             if ([r isKindOfClass:[UIViewController class]]) {
                 NSString *cls = NSStringFromClass([r class]) ?: @"";
-                NSString *desc = [r description] ?: @"";
-                NSString *all = [NSString stringWithFormat:@"%@ %@", cls, desc];
-                if ([cls rangeOfString:@"WCPayLQTDetailViewController"].location != NSNotFound ||
-                    [all rangeOfString:@"lqtDetailUIPage"].location != NSNotFound ||
-                    [all rangeOfString:@"LQTDetail"].location != NSNotFound ||
-                    [all rangeOfString:@"LingTong"].location != NSNotFound) {
+                NSString *all = [NSString stringWithFormat:@"%@ %@", cls, [r description] ?: @""];
+                if ([all rangeOfString:@"lqtDetailUIPage"].location != NSNotFound)
                     return DDBalancePageLQT;
-                }
-                if ([cls rangeOfString:@"WCPayBalanceDetailViewController"].location != NSNotFound ||
-                    [cls rangeOfString:@"WCPayMainViewControllerV2"].location != NSNotFound ||
-                    [all rangeOfString:@"balanceEntryUIPage"].location != NSNotFound ||
-                    [all rangeOfString:@"Wallet"].location != NSNotFound ||
-                    [all rangeOfString:@"BalanceDetail"].location != NSNotFound ||
-                    [all rangeOfString:@"Entrance"].location != NSNotFound) {
+                if ([all rangeOfString:@"balanceEntryUIPage"].location != NSNotFound ||
+                    [cls rangeOfString:@"WCPayMainViewControllerV2"].location != NSNotFound)
                     return DDBalancePageBalance;
-                }
             }
             r = r.nextResponder;
         }
@@ -1435,12 +1425,10 @@ static unsigned long long DDClampFen(unsigned long long fen) {
 
 static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fen) {
     if (!text.length) return text;
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"[¥￥]\\s*\\d[\\d,]*(\\.\\d+)?" options:0 error:nil];
+    // 锚定 Flex 截图：金额由 ScrollNumber 以「分」渲染为两位小数纯数字（600→6.00，300→3.00），
+    // ¥ 是旁边独立 label，不参与数字串；故匹配可选 ¥ + 两位小数数字，不吃整数/任意小数位。
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"[¥￥]?\\s*\\d[\\d,]*\\.\\d{2}" options:0 error:nil];
     NSTextCheckingResult *m = [re firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
-    if (!m || m.range.location == NSNotFound) {
-        re = [NSRegularExpression regularExpressionWithPattern:@"\\d[\\d,]*(\\.\\d+)?" options:0 error:nil];
-        m = [re firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
-    }
     if (!m || m.range.location == NSNotFound) return text;
     NSRange r = m.range;
     NSString *num = [text substringWithRange:r];
@@ -1576,12 +1564,8 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (!(cfg.balanceEnabled && [cfg hasBalanceValue])) return;
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        @try { DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()), @"余额.详情UILabel.余额"); } @catch (NSException *e) {}
-    });
+    if (cfg.balanceEnabled && [cfg hasBalanceValue])
+        DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()), @"余额.详情UILabel.余额");
 }
 %end
 
@@ -1595,11 +1579,8 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (!(cfg.balanceEnabled && [cfg hasLingtongValue])) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        @try { DDBalancePatchTitleLabel(self, DDClampFen(DDLingtongFenValue()), @"余额.详情UILabel.LQT"); } @catch (NSException *e) {}
-    });
+    if (cfg.balanceEnabled && [cfg hasLingtongValue])
+        DDBalancePatchTitleLabel(self, DDClampFen(DDLingtongFenValue()), @"余额.详情UILabel.LQT");
 }
 %end
 
