@@ -111,6 +111,13 @@
 - (void)resetLayoutCache;
 @end
 
+@interface RichTextView : UIView
+- (id)getContent;
+- (void)setContent:(id)content;
+- (void)calculateAndUpdateFrame;
+- (void)forceDisplayInSync;
+@end
+
 @interface TextMessageCellView : CommonMessageCellView
 - (id)getRichTextView;
 - (id)getTextString;
@@ -173,12 +180,26 @@
 - (void)refreshViewWithData:(id)arg;
 @end
 
-@interface WCPayWalletEntryHeaderView : UIView
-- (id)balanceMoneyLabel;
+@interface WCPayLQTDetailViewController : UIViewController
+- (void)refreshViewWithData:(id)arg;
+@end
+
+@interface WCPayLQTInfo : NSObject
+- (unsigned long long)lqtAvailBalance;
+- (unsigned long long)lqtTotalBalance;
+@end
+
+@interface WCPayLQTDetailControlLogic : NSObject
+- (long long)lqtBalance;
+@end
+
+@interface WCPayBalanceInfo : NSObject
 - (unsigned long long)wallet_balance;
-- (void)updateBalanceAndRefreshView;
-- (void)updateBalanceEntryView;
-- (void)handleUpdateWalletBalance;
+- (unsigned long long)m_uiAvailableBalance;
+- (unsigned long long)m_uiTotalBalance;
+@end
+
+@interface WCPayMainViewControllerV2 : UIViewController
 @end
 
 @interface TimeoutNumber : UIView
@@ -1372,32 +1393,20 @@ typedef NS_ENUM(NSInteger, DDBalancePageKind) {
 
 static const void *kDDBalanceKindKey = &kDDBalanceKindKey;
 
-// 页面判定：沿响应链上溯，按 Kinda widget 无障碍标识与 VC description 页标识区分。
-//   零钱通：祖先 accessibilityIdentifier 含 lqt_cell / lqtDetailUIPage
-//   余额：  祖先 accessibilityIdentifier 含 balance_cell / balanceEntryUIPage / WCPayMainViewControllerV2
-//   VC 标识仅限 KindaViewController 自身命中，避免导航控制器 description 拼栈串页。
+// 页面判定：沿响应链找最近 VC，按 description 页标识区分余额/零钱通。
+//   余额：balanceEntryUIPage / WCPayMainViewControllerV2；零钱通：lqtDetailUIPage
 static DDBalancePageKind DDBalancePageKindOf(id sn) {
     @try {
         if (![sn isKindOfClass:[UIView class]]) return DDBalancePageNone;
         UIResponder *r = (UIResponder *)sn;
         for (int depth = 0; depth < 24 && r; depth++) {
-            if ([r isKindOfClass:[UIView class]]) {
-                NSString *ai = ((UIView *)r).accessibilityIdentifier ?: @"";
-                if ([ai rangeOfString:@"lqt_cell"].location != NSNotFound)
-                    return DDBalancePageLQT;
-                if ([ai rangeOfString:@"balance_cell"].location != NSNotFound)
-                    return DDBalancePageBalance;
-            }
             if ([r isKindOfClass:[UIViewController class]]) {
                 NSString *cls = NSStringFromClass([r class]) ?: @"";
                 NSString *all = [NSString stringWithFormat:@"%@ %@", cls, [r description] ?: @""];
-                if ([cls isEqualToString:@"KindaViewController"]) {
-                    if ([all rangeOfString:@"lqtDetailUIPage"].location != NSNotFound)
-                        return DDBalancePageLQT;
-                    if ([all rangeOfString:@"balanceEntryUIPage"].location != NSNotFound)
-                        return DDBalancePageBalance;
-                }
-                if ([cls rangeOfString:@"WCPayMainViewControllerV2"].location != NSNotFound)
+                if ([all rangeOfString:@"lqtDetailUIPage"].location != NSNotFound)
+                    return DDBalancePageLQT;
+                if ([all rangeOfString:@"balanceEntryUIPage"].location != NSNotFound ||
+                    [cls rangeOfString:@"WCPayMainViewControllerV2"].location != NSNotFound)
                     return DDBalancePageBalance;
             }
             r = r.nextResponder;
@@ -1452,21 +1461,6 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     @try {
         if (![vc respondsToSelector:@selector(balanceTitleLabel)]) return;
         id lb = [vc balanceTitleLabel];
-        if (![lb isKindOfClass:[UILabel class]]) return;
-        NSString *t = ((UILabel *)lb).text;
-        if (!t.length) return;
-        NSString *nt = DDBalanceRewriteMoneyText(t, fen);
-        if (![nt isEqualToString:t]) { ((UILabel *)lb).text = nt; }
-    } @catch (NSException *e) {}
-}
-
-// 钱包入口头部：余额走普通 UILabel 文本，不触碰滚动数字，避免 Kinda 页重排顶格。
-static void DDBalancePatchWalletEntryLabel(id view, unsigned long long fen) {
-    @try {
-        DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (!(cfg.balanceEnabled && [cfg hasBalanceValue])) return;
-        if (![view respondsToSelector:@selector(balanceMoneyLabel)]) return;
-        id lb = [view balanceMoneyLabel];
         if (![lb isKindOfClass:[UILabel class]]) return;
         NSString *t = ((UILabel *)lb).text;
         if (!t.length) return;
@@ -1570,18 +1564,18 @@ static void DDBalancePatchWalletEntryLabel(id view, unsigned long long fen) {
 }
 %end
 
-%hook WCPayWalletEntryHeaderView
-- (void)updateBalanceAndRefreshView {
+%hook WCPayLQTDetailViewController
+- (void)refreshViewWithData:(id)arg {
     %orig;
-    DDBalancePatchWalletEntryLabel(self, DDClampFen(DDBalanceFenValue()));
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled && [cfg hasLingtongValue])
+        DDBalancePatchTitleLabel(self, DDClampFen(DDLingtongFenValue()), @"余额.详情UILabel.LQT");
 }
-- (void)updateBalanceEntryView {
+- (void)viewWillAppear:(BOOL)animated {
     %orig;
-    DDBalancePatchWalletEntryLabel(self, DDClampFen(DDBalanceFenValue()));
-}
-- (void)handleUpdateWalletBalance {
-    %orig;
-    DDBalancePatchWalletEntryLabel(self, DDClampFen(DDBalanceFenValue()));
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled && [cfg hasLingtongValue])
+        DDBalancePatchTitleLabel(self, DDClampFen(DDLingtongFenValue()), @"余额.详情UILabel.LQT");
 }
 %end
 
