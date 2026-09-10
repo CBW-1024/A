@@ -321,8 +321,8 @@ static void DDJokerLog(NSString *fmt, ...) {
 #define DDLOG(...) DDJokerLog(__VA_ARGS__)
 
 // hook 命中计数，节流输出（前 3 次 + 每 50 次），避免刷屏。
-// 当前为待接线状态（无功能调用），新功能里调 DDJokerHit(@"标签") 即启用，届时移除下方 __attribute__((unused))。
-static void DDJokerHit(NSString *tag) __attribute__((unused)) {
+// 插件加载时已记一次（见 %ctor），新功能里调 DDJokerHit(@"标签") 即追加命中统计。
+static void DDJokerHit(NSString *tag) {
     NSMutableDictionary *hits = DDLogHits();
     NSInteger n = 0;
     @synchronized (hits) {
@@ -2262,6 +2262,7 @@ static NSString *DDJokerWriteDiagLog(void) {
 %ctor {
     @autoreleasepool {
         DDLOG(@"=== 插件加载 ===");
+        DDJokerHit(@"插件加载");
         WCPluginsMgr *mgr = [%c(WCPluginsMgr) sharedInstance];
         [mgr registerControllerWithTitle:@"DD小丑助手"
                                  version:@"1.0.0"
