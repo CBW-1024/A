@@ -1823,6 +1823,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         DDBalancePageKind kind = cached ? (DDBalancePageKind)cached.integerValue : DDBalancePageNone;
         if (!cached) {
             kind = DDBalancePageKindOf(self);
+            gDDLastBalanceKind = kind;
             objc_setAssociatedObject(self, kDDBalanceKindKey, @(kind), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(self, kDDBalanceHintKey, gDDLastBalanceHint ?: [NSNull null], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
@@ -1840,6 +1841,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         if (cfg.balanceEnabled) {
             objc_setAssociatedObject(self, kDDBalanceKindKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 写路径=数据刷新时机：清缓存，让 currentNumber 渲染时重判最新
             DDBalancePageKind kind = DDBalancePageKindOf(self);
+            gDDLastBalanceKind = kind;
             NSString *hint = gDDLastBalanceHint ?: @"?";
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { DDJokerHit([NSString stringWithFormat:@"余额.SN.updateNumber.LQT.%@", hint]); %orig(DDClampFen(DDLingtongFenValue())); return; }
             if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { DDJokerHit([NSString stringWithFormat:@"余额.SN.updateNumber.余额.%@", hint]); %orig(DDClampFen(DDBalanceFenValue())); return; }
@@ -1853,6 +1855,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         if (cfg.balanceEnabled) {
             objc_setAssociatedObject(self, kDDBalanceKindKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 写路径=数据刷新时机：清缓存，让 currentNumber 渲染时重判最新
             DDBalancePageKind kind = DDBalancePageKindOf(self);
+            gDDLastBalanceKind = kind;
             NSString *hint = gDDLastBalanceHint ?: @"?";
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { DDJokerHit([NSString stringWithFormat:@"余额.SN.defaultNumber.LQT.%@", hint]); %orig(DDClampFen(DDLingtongFenValue())); return; }
             if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { DDJokerHit([NSString stringWithFormat:@"余额.SN.defaultNumber.余额.%@", hint]); %orig(DDClampFen(DDBalanceFenValue())); return; }
@@ -1866,6 +1869,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         if (cfg.balanceEnabled) {
             objc_setAssociatedObject(self, kDDBalanceKindKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 写路径=数据刷新时机：清缓存，让 currentNumber 渲染时重判最新
             DDBalancePageKind kind = DDBalancePageKindOf(self);
+            gDDLastBalanceKind = kind;
             NSString *hint = gDDLastBalanceHint ?: @"?";
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { DDJokerHit([NSString stringWithFormat:@"余额.SN.setCurrentNumber.LQT.%@", hint]); %orig(DDClampFen(DDLingtongFenValue())); return; }
             if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { DDJokerHit([NSString stringWithFormat:@"余额.SN.setCurrentNumber.余额.%@", hint]); %orig(DDClampFen(DDBalanceFenValue())); return; }
