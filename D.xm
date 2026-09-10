@@ -1675,6 +1675,15 @@ static DDBalancePageKind DDBalancePageKindOf(id sn) {
             v = v.superview;
         }
         // ② 第二遍（文本兜底，最后保险）：四字精确 + "钱包"兜底
+        //    走到这里的页 = 第一遍 className 没覆盖的"未知入口"，打一次 superview 链（按链去重，不刷屏）便于抓精确类名
+        {
+            static NSString *ddLastChainLogged = nil;
+            NSString *trimmed = [chain stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if (trimmed.length && ![trimmed isEqualToString:ddLastChainLogged]) {
+                DDLOG(@"余额.判定.第二遍兜底 链=[%@]", trimmed);
+                ddLastChainLogged = trimmed;
+            }
+        }
         v = (UIView *)sn;
         for (int depth = 0; depth < 24 && v; depth++) {
             if (DDViewDescendantHasText(v, @"我的零钱", YES)) { gDDLastBalanceHint = @"我的零钱"; gDDLastBalanceChain = chain; return DDBalancePageBalance; }
