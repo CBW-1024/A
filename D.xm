@@ -202,16 +202,6 @@
 @interface WCPayMainViewControllerV2 : UIViewController
 @end
 
-@interface TimeoutNumber : UIView
-- (void)defaultNumber:(unsigned long long)a0;
-- (void)setNoAnimationStart:(unsigned long long)a0;
-- (void)updateNumber:(unsigned long long)a0;
-- (void)updateNumberInternal:(unsigned long long)a0;
-- (void)updateScrollNumber;
-- (void)layoutSubviews;
-- (id)scrollNumber;
-@end
-
 @interface ScrollNumber : NSObject
 
 - (void)updateNumber:(unsigned long long)a0;
@@ -1515,17 +1505,6 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         }
     } @catch (NSException *e) {}
     %orig(original);
-}
-%end
-
-%hook TimeoutNumber
-- (void)layoutSubviews {
-    %orig;
-    @try {
-
-        if ([self respondsToSelector:@selector(updateScrollNumber)])
-            [self updateScrollNumber];
-    } @catch (NSException *e) {}
 }
 %end
 
