@@ -1391,8 +1391,6 @@ typedef NS_ENUM(NSInteger, DDBalancePageKind) {
     DDBalancePageLQT
 };
 
-static const void *kDDBalanceKindKey = &kDDBalanceKindKey;
-
 // 页面判定：沿响应链上溯，命中的第一条规则即返回。
 //   钱包页单元格（Flex 实证）：祖先 accessibilityIdentifier balance_cell -> 余额，lqt_cell -> 零钱通
 //   详情/服务页（VC description）：balanceEntryUIPage / WCPayMainViewControllerV2 -> 余额，lqtDetailUIPage -> 零钱通
@@ -1402,10 +1400,10 @@ static DDBalancePageKind DDBalancePageKindOf(id sn) {
         UIResponder *r = (UIResponder *)sn;
         for (int depth = 0; depth < 24 && r; depth++) {
             if ([r isKindOfClass:[UIView class]]) {
-                NSString *ai = ((UIView *)r).accessibilityIdentifier ?: @"";
-                if ([ai rangeOfString:@"lqt_cell"].location != NSNotFound)
+                NSString *ai = ((UIView *)r).accessibilityIdentifier;
+                if ([ai isEqualToString:@"lqt_cell"])
                     return DDBalancePageLQT;
-                if ([ai rangeOfString:@"balance_cell"].location != NSNotFound)
+                if ([ai isEqualToString:@"balance_cell"])
                     return DDBalancePageBalance;
             }
             if ([r isKindOfClass:[UIViewController class]]) {
@@ -1481,32 +1479,14 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
 // 接管 ScrollNumber 渲染链路与详情页 UILabel，写入自定义余额 / 零钱通值。
 
 
-// 读路径静默替换：首判后把页面类型缓存到实例关联对象（O(1)）；
-// 三个写入口在刷新时清缓存重判，避免首帧闪烁。
+// 只接管写入口：ScrollNumber 的金额宽度 / 小数点偏移 / container frame 都在写入时算
+//   （isYogaRightAlignment + updateContainer / updateClipView / updateLastNumberFrame），
+//   读路径 currentNumber 直接 return 新值会绕过这套重排导致 Yoga 右对齐下顶格，故不 hook。
 %hook ScrollNumber
-- (unsigned long long)currentNumber {
-    unsigned long long orig = %orig;
-    @try {
-        DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (!cfg.balanceEnabled) return orig;
-
-        NSNumber *cached = objc_getAssociatedObject(self, kDDBalanceKindKey);
-        DDBalancePageKind kind = cached ? (DDBalancePageKind)cached.integerValue : DDBalancePageNone;
-        if (!cached) {
-            kind = DDBalancePageKindOf(self);
-            objc_setAssociatedObject(self, kDDBalanceKindKey, @(kind), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
-        if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) return DDClampFen(DDLingtongFenValue());
-        if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) return DDClampFen(DDBalanceFenValue());
-    } @catch (NSException *e) {}
-    return orig;
-}
-
 - (void)updateNumber:(unsigned long long)original {
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
-            objc_setAssociatedObject(self, kDDBalanceKindKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             DDBalancePageKind kind = DDBalancePageKindOf(self);
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); return; }
             if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); return; }
@@ -1518,7 +1498,6 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
-            objc_setAssociatedObject(self, kDDBalanceKindKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             DDBalancePageKind kind = DDBalancePageKindOf(self);
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); return; }
             if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); return; }
@@ -1530,7 +1509,6 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
-            objc_setAssociatedObject(self, kDDBalanceKindKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             DDBalancePageKind kind = DDBalancePageKindOf(self);
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); return; }
             if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); return; }
