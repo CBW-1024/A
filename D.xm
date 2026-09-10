@@ -1615,24 +1615,26 @@ static UIViewController *DDViewControllerOfView(id view) {
 static UIViewController *DDTopViewController(void) {
     @try {
         UIWindow *win = nil;
-        // iOS 13+ 标准写法：从 connectedScenes 取 UIWindowScene 的 windows。
-        // [UIApplication windows] 自 iOS 15 起弃用，越狱真机 iOS 18 不该再用。
-        NSArray *scenes = [[[UIApplication sharedApplication] connectedScenes] allObjects];
-        for (id scene in scenes) {
+        // ① iOS 13+ 标准写法：遍历 connectedScenes 的 UIWindowScene.windows 取最上层可见 window。
+        NSArray *scenes = [[UIApplication sharedApplication] connectedScenes].allObjects;
+        for (UIScene *scene in scenes) {
             if (![scene isKindOfClass:[UIWindowScene class]]) continue;
             UIWindowScene *ws = (UIWindowScene *)scene;
             for (UIWindow *w in ws.windows) {
-                if (w.isKeyWindow) { win = w; break; }
+                if (w.rootViewController && (w.isKeyWindow || w.windowLevel == UIWindowLevelNormal)) { win = w; break; }
             }
             if (win) break;
         }
+        // ② 兜底：主 window 偶尔不在任何 UIWindowScene.windows 里（微信私有 window / 早期层级），
+        //    回退到 [UIApplication windows]。用 valueForKey 取，绕开 iOS15 的 deprecated 声明，不触发 CI -Werror，
+        //    也无需 pragma。这是防御性兜底，并非兼容旧系统。
         if (!win) {
-            // 极端情况（keyWindow 为空）：取第一个 windowScene 的首个 window 兜底
-            for (id scene in scenes) {
-                if ([scene isKindOfClass:[UIWindowScene class]]) {
-                    win = ((UIWindowScene *)scene).windows.firstObject;
-                    if (win) break;
-                }
+            NSArray *wins = (NSArray *)[[UIApplication sharedApplication] valueForKey:@"windows"];
+            for (UIWindow *w in wins) {
+                if (w.rootViewController && w.isKeyWindow) { win = w; break; }
+            }
+            if (!win) {
+                for (UIWindow *w in wins) { if (w.rootViewController) { win = w; break; } }
             }
         }
         UIViewController *vc = win.rootViewController;
@@ -2030,8 +2032,9 @@ static NSString *DDJokerExportLogText(void) {
     [out appendFormat:@"微信版本 : %@ (%@)\n", info[@"CFBundleShortVersionString"], info[@"CFBundleVersion"]];
 
     DDGlobalConfig *c = [DDGlobalConfig shared];
-    [out appendFormat:@"开关状态 : 文字=%d 图片=%d 时间=%d 转账=%d 诊断=%d\n",
-     c.textEnabled, c.imageEnabled, c.timeEnabled, c.transferEnabled, c.diagEnabled];
+    [out appendFormat:@"开关状态 : 文字=%d 图片=%d 时间=%d 转账=%d 诊断=%d 余额=%d 余额值=%@ 零钱通值=%@\n",
+     c.textEnabled, c.imageEnabled, c.timeEnabled, c.transferEnabled, c.diagEnabled,
+     c.balanceEnabled, ([c hasBalanceValue] ? c.balanceValue : @"-"), ([c hasLingtongValue] ? c.lingtongValue : @"-")];
     [out appendString:@"复现步骤 : 清空日志 → 复现问题（改时间/文字/金额/图片/步数…）→ 回本页导出，把日志发出去即可定位\n"];
 
     [out appendString:@"\n----- hook 命中统计 -----\n"];
