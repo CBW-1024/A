@@ -186,6 +186,9 @@
 
 @interface WCPayTransferMoneyStatusViewController : UIViewController
 @end
+@interface WCPayTransferMoneyStatusViewController (DDTransferDetail)
+- (void)dd_patchTransferDetailAmount;
+@end
 
 @interface WCPayLQTInfo : NSObject
 - (unsigned long long)lqtAvailBalance;
