@@ -180,10 +180,6 @@
 - (void)refreshViewWithData:(id)arg;
 @end
 
-@interface WCPayWalletEntryHeaderView : UIView
-- (unsigned long long)wallet_balance;
-@end
-
 @interface WCPayLQTDetailViewController : UIViewController
 - (void)refreshViewWithData:(id)arg;
 @end
@@ -1397,8 +1393,9 @@ typedef NS_ENUM(NSInteger, DDBalancePageKind) {
 
 static const void *kDDBalanceKindKey = &kDDBalanceKindKey;
 
-// 页面判定：只识别零钱通。余额由 WCPayWalletEntryHeaderView 的 wallet_balance 接管，
-// 不走滚动数字，避免 Kinda 页重排顶格。
+// 页面判定：沿响应链上溯，命中的第一条规则即返回。
+//   钱包页单元格（Flex 实证）：祖先 accessibilityIdentifier balance_cell -> 余额，lqt_cell -> 零钱通
+//   详情/服务页（VC description）：balanceEntryUIPage / WCPayMainViewControllerV2 -> 余额，lqtDetailUIPage -> 零钱通
 static DDBalancePageKind DDBalancePageKindOf(id sn) {
     @try {
         if (![sn isKindOfClass:[UIView class]]) return DDBalancePageNone;
@@ -1408,13 +1405,17 @@ static DDBalancePageKind DDBalancePageKindOf(id sn) {
                 NSString *ai = ((UIView *)r).accessibilityIdentifier ?: @"";
                 if ([ai rangeOfString:@"lqt_cell"].location != NSNotFound)
                     return DDBalancePageLQT;
+                if ([ai rangeOfString:@"balance_cell"].location != NSNotFound)
+                    return DDBalancePageBalance;
             }
             if ([r isKindOfClass:[UIViewController class]]) {
                 NSString *cls = NSStringFromClass([r class]) ?: @"";
                 NSString *all = [NSString stringWithFormat:@"%@ %@", cls, [r description] ?: @""];
-                if ([cls isEqualToString:@"KindaViewController"] &&
-                    [all rangeOfString:@"lqtDetailUIPage"].location != NSNotFound)
+                if ([all rangeOfString:@"lqtDetailUIPage"].location != NSNotFound)
                     return DDBalancePageLQT;
+                if ([all rangeOfString:@"balanceEntryUIPage"].location != NSNotFound ||
+                    [cls rangeOfString:@"WCPayMainViewControllerV2"].location != NSNotFound)
+                    return DDBalancePageBalance;
             }
             r = r.nextResponder;
         }
@@ -1496,6 +1497,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
             objc_setAssociatedObject(self, kDDBalanceKindKey, @(kind), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) return DDClampFen(DDLingtongFenValue());
+        if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) return DDClampFen(DDBalanceFenValue());
     } @catch (NSException *e) {}
     return orig;
 }
@@ -1507,6 +1509,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
             objc_setAssociatedObject(self, kDDBalanceKindKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             DDBalancePageKind kind = DDBalancePageKindOf(self);
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); return; }
+            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); return; }
         }
     } @catch (NSException *e) {}
     %orig(original);
@@ -1518,6 +1521,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
             objc_setAssociatedObject(self, kDDBalanceKindKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             DDBalancePageKind kind = DDBalancePageKindOf(self);
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); return; }
+            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); return; }
         }
     } @catch (NSException *e) {}
     %orig(original);
@@ -1529,6 +1533,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
             objc_setAssociatedObject(self, kDDBalanceKindKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             DDBalancePageKind kind = DDBalancePageKindOf(self);
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); return; }
+            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); return; }
         }
     } @catch (NSException *e) {}
     %orig(original);
@@ -1567,14 +1572,18 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
 }
 %end
 
-// 钱包入口头部：直接接管余额分值，由原生自己渲染，不触碰滚动数字，不顶格。
-%hook WCPayWalletEntryHeaderView
-- (unsigned long long)wallet_balance {
-    @try {
-        DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (cfg.balanceEnabled && [cfg hasBalanceValue]) return DDClampFen(DDBalanceFenValue());
-    } @catch (NSException *e) {}
-    return %orig;
+%hook WCPayLQTDetailViewController
+- (void)refreshViewWithData:(id)arg {
+    %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled && [cfg hasLingtongValue])
+        DDBalancePatchTitleLabel(self, DDClampFen(DDLingtongFenValue()), @"余额.详情UILabel.LQT");
+}
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled && [cfg hasLingtongValue])
+        DDBalancePatchTitleLabel(self, DDClampFen(DDLingtongFenValue()), @"余额.详情UILabel.LQT");
 }
 %end
 
