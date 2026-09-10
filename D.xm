@@ -111,13 +111,6 @@
 - (void)resetLayoutCache;
 @end
 
-@interface RichTextView : UIView
-- (id)getContent;
-- (void)setContent:(id)content;
-- (void)calculateAndUpdateFrame;
-- (void)forceDisplayInSync;
-@end
-
 @interface TextMessageCellView : CommonMessageCellView
 - (id)getRichTextView;
 - (id)getTextString;
@@ -180,22 +173,12 @@
 - (void)refreshViewWithData:(id)arg;
 @end
 
-@interface WCPayLQTInfo : NSObject
-- (unsigned long long)lqtAvailBalance;
-- (unsigned long long)lqtTotalBalance;
-@end
-
-@interface WCPayLQTDetailControlLogic : NSObject
-- (long long)lqtBalance;
-@end
-
-@interface WCPayBalanceInfo : NSObject
+@interface WCPayWalletEntryHeaderView : UIView
+- (id)balanceMoneyLabel;
 - (unsigned long long)wallet_balance;
-- (unsigned long long)m_uiAvailableBalance;
-- (unsigned long long)m_uiTotalBalance;
-@end
-
-@interface WCPayMainViewControllerV2 : UIViewController
+- (void)updateBalanceAndRefreshView;
+- (void)updateBalanceEntryView;
+- (void)handleUpdateWalletBalance;
 @end
 
 @interface TimeoutNumber : UIView
@@ -1477,6 +1460,21 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     } @catch (NSException *e) {}
 }
 
+// 钱包入口头部：余额走普通 UILabel 文本，不触碰滚动数字，避免 Kinda 页重排顶格。
+static void DDBalancePatchWalletEntryLabel(id view, unsigned long long fen) {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (!(cfg.balanceEnabled && [cfg hasBalanceValue])) return;
+        if (![view respondsToSelector:@selector(balanceMoneyLabel)]) return;
+        id lb = [view balanceMoneyLabel];
+        if (![lb isKindOfClass:[UILabel class]]) return;
+        NSString *t = ((UILabel *)lb).text;
+        if (!t.length) return;
+        NSString *nt = DDBalanceRewriteMoneyText(t, fen);
+        if (![nt isEqualToString:t]) { ((UILabel *)lb).text = nt; }
+    } @catch (NSException *e) {}
+}
+
 #pragma mark - 余额 / 零钱通改写（接管 ScrollNumber 渲染）
 // 接管 ScrollNumber 渲染链路与详情页 UILabel，写入自定义余额 / 零钱通值。
 
@@ -1569,6 +1567,21 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     if (cfg.balanceEnabled && [cfg hasBalanceValue])
         DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()), @"余额.详情UILabel.余额");
+}
+%end
+
+%hook WCPayWalletEntryHeaderView
+- (void)updateBalanceAndRefreshView {
+    %orig;
+    DDBalancePatchWalletEntryLabel(self, DDClampFen(DDBalanceFenValue()));
+}
+- (void)updateBalanceEntryView {
+    %orig;
+    DDBalancePatchWalletEntryLabel(self, DDClampFen(DDBalanceFenValue()));
+}
+- (void)handleUpdateWalletBalance {
+    %orig;
+    DDBalancePatchWalletEntryLabel(self, DDClampFen(DDBalanceFenValue()));
 }
 %end
 
