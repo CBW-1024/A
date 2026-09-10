@@ -1042,19 +1042,14 @@ static UIImage *DDImageReplacementForMessage(CMessageWrap *msg) {
 
 static UIImageView *DDImageViewFromCell(UIView *cell) {
     if (!cell) return nil;
+    // Flex 实测：图片 view 是 ImageMessageCellView 的 m_imageView ivar（YYAsyncImageView，UIImageView 子类）。
+    // 直接取 ivar，零遍历。
     Ivar ivar = class_getInstanceVariable([cell class], "m_imageView");
     if (ivar) {
         id value = object_getIvar(cell, ivar);
         if ([value isKindOfClass:[UIImageView class]]) return (UIImageView *)value;
     }
-    UIImageView *best = nil;
-    CGFloat bestArea = 0;
-    for (UIView *v in cell.subviews) {
-        if (![v isKindOfClass:[UIImageView class]]) continue;
-        CGFloat area = v.bounds.size.width * v.bounds.size.height;
-        if (area > bestArea) { bestArea = area; best = (UIImageView *)v; }
-    }
-    return best;
+    return nil;
 }
 
 static void DDImageApplyReplacementToCell(id cell) {
@@ -1241,21 +1236,12 @@ static double DDTimeStampFromString(NSString *s) {
 }
 %new
 - (UILabel *)dk_timeLabel {
-
+    // Flex 实测：时间 label 即 ChatTimeCellView 的 m_timeLabel ivar（MMUILabel，文本如 "昨天 15:56"）。
+    // 直接取 ivar，零遍历。
     Ivar iv = class_getInstanceVariable([self class], "m_timeLabel");
     if (iv) {
         id v = object_getIvar(self, iv);
         if ([v isKindOfClass:[UILabel class]]) return (UILabel *)v;
-    }
-    NSMutableArray *q = [NSMutableArray arrayWithObject:self];
-    for (NSUInteger i = 0; i < q.count && i < 40; i++) {
-        UIView *v = q[i];
-
-        if (v != (UIView *)self && [v isKindOfClass:[UILabel class]] &&
-            (((UILabel *)v).text.length || ((UILabel *)v).attributedText.length)) {
-            return (UILabel *)v;
-        }
-        for (UIView *s in v.subviews) [q addObject:s];
     }
     return nil;
 }
@@ -1407,53 +1393,36 @@ typedef NS_ENUM(NSInteger, DDBalancePageKind) {
 
 static const void *kDDBalanceKindKey = &kDDBalanceKindKey;
 
-static BOOL DDViewDescendantHasText(UIView *view, NSString *key, BOOL exact) {
-    if (!view || !key.length) return NO;
-    @try {
-        for (UIView *sub in view.subviews) {
-            if ([sub isKindOfClass:[UILabel class]]) {
-                NSString *t = ((UILabel *)sub).text;
-                if (t.length && (exact ? [t isEqualToString:key] : [t hasPrefix:key])) return YES;
-            }
-            if (DDViewDescendantHasText(sub, key, exact)) return YES;
-        }
-    } @catch (NSException *e) {}
-    return NO;
-}
-
-// 页面判定：先沿祖先链按 className 关键字（LQT/Wallet/Balance/Entrance）区分；
-// 未命中再按按钮文本递归子树判定。KindaUIView 同时承载余额与零钱通，文本判定不可删。
+// 页面判定：沿响应链找最近的 UIViewController，按 class / description 中的页面标识区分。
+// Flex 证据：
+//   6元余额   -> KindaViewController>balanceEntryUIPage
+//   3元零钱通 -> KindaViewController>lqtDetailUIPage
+//   服务页余额 -> WCPayMainViewControllerV2
 static DDBalancePageKind DDBalancePageKindOf(id sn) {
     @try {
         if (![sn isKindOfClass:[UIView class]]) return DDBalancePageNone;
-        UIView *v = (UIView *)sn;
-
-        for (int depth = 0; depth < 24 && v; depth++) {
-            NSString *cls = NSStringFromClass([v class]);
-            if ([cls rangeOfString:@"LQT"].location != NSNotFound ||
-                [cls rangeOfString:@"LingTong"].location != NSNotFound) {
-                return DDBalancePageLQT;
+        UIResponder *r = (UIResponder *)sn;
+        for (int depth = 0; depth < 24 && r; depth++) {
+            if ([r isKindOfClass:[UIViewController class]]) {
+                NSString *cls = NSStringFromClass([r class]) ?: @"";
+                NSString *desc = [r description] ?: @"";
+                NSString *all = [NSString stringWithFormat:@"%@ %@", cls, desc];
+                if ([cls rangeOfString:@"WCPayLQTDetailViewController"].location != NSNotFound ||
+                    [all rangeOfString:@"lqtDetailUIPage"].location != NSNotFound ||
+                    [all rangeOfString:@"LQTDetail"].location != NSNotFound ||
+                    [all rangeOfString:@"LingTong"].location != NSNotFound) {
+                    return DDBalancePageLQT;
+                }
+                if ([cls rangeOfString:@"WCPayBalanceDetailViewController"].location != NSNotFound ||
+                    [cls rangeOfString:@"WCPayMainViewControllerV2"].location != NSNotFound ||
+                    [all rangeOfString:@"balanceEntryUIPage"].location != NSNotFound ||
+                    [all rangeOfString:@"Wallet"].location != NSNotFound ||
+                    [all rangeOfString:@"BalanceDetail"].location != NSNotFound ||
+                    [all rangeOfString:@"Entrance"].location != NSNotFound) {
+                    return DDBalancePageBalance;
+                }
             }
-            if ([cls rangeOfString:@"Wallet"].location != NSNotFound ||
-                [cls rangeOfString:@"Balance"].location != NSNotFound ||
-                [cls rangeOfString:@"Entrance"].location != NSNotFound) {
-                return DDBalancePageBalance;
-            }
-            v = v.superview;
-        }
-
-        v = (UIView *)sn;
-        for (int depth = 0; depth < 24 && v; depth++) {
-            if (DDViewDescendantHasText(v, @"我的零钱", YES))  return DDBalancePageBalance;
-            if (DDViewDescendantHasText(v, @"账户余额", YES))  return DDBalancePageLQT;
-            if (DDViewDescendantHasText(v, @"零钱通",   YES))  return DDBalancePageLQT;
-            if (DDViewDescendantHasText(v, @"零钱",     YES))  return DDBalancePageBalance;
-            v = v.superview;
-        }
-        v = (UIView *)sn;
-        for (int depth = 0; depth < 8 && v; depth++) {
-            if (DDViewDescendantHasText(v, @"钱包", YES)) return DDBalancePageBalance;
-            v = v.superview;
+            r = r.nextResponder;
         }
     } @catch (NSException *e) {}
     return DDBalancePageNone;
