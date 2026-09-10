@@ -184,9 +184,6 @@
 - (void)refreshViewWithData:(id)arg;
 @end
 
-@interface WCPayTransferMoneyStatusViewController : UIViewController
-@end
-
 @interface WCPayLQTInfo : NSObject
 - (unsigned long long)lqtAvailBalance;
 - (unsigned long long)lqtTotalBalance;
@@ -986,9 +983,11 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 
 // 沿 responder 链上溯判断 label 是否属于转账详情页（只走 responder 链，不遍历 view 树）。
 static BOOL DDLabelOnTransferDetailVC(id v) {
+    Class detailVC = %c(WCPayTransferMoneyStatusViewController);
+    if (!detailVC) return NO;
     UIResponder *r = (UIResponder *)v;
     while (r) {
-        if ([r isKindOfClass:[WCPayTransferMoneyStatusViewController class]]) return YES;
+        if ([r isKindOfClass:detailVC]) return YES;
         r = r.nextResponder;
     }
     return NO;
