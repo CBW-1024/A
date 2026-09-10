@@ -987,7 +987,8 @@ static void DDTransferRewriteDetailLabel(UIView *label, NSString *override) {
     if (![label respondsToSelector:@selector(text)] || ![label respondsToSelector:@selector(setText:)]) return;
     NSString *cur = [label text];
     if (!cur.length) return;
-    // —— 诊断：改写前 dump 显示相关原生字段，确认微信实际读哪个（text / attributedText）——
+    // 改写前先抓原始富文本（含微信设的颜色/字号）。setText: 会清空 attributedText，
+    // 故必须在此处取值并复用，不可写完后回头再读（那会拿到降级后的默认属性）。
     NSAttributedString *origAttr = nil;
     @try { if ([label respondsToSelector:@selector(attributedText)]) origAttr = [label attributedText]; } @catch (NSException *e) {}
     DDLOG(@"[详情页金额] 命中 label=%@ className=%@ | text=%@ | attributedText=%@ | override=%@",
@@ -1002,14 +1003,10 @@ static void DDTransferRewriteDetailLabel(UIView *label, NSString *override) {
     }
     NSString *newText = [@"¥" stringByAppendingString:override];
     [label setText:newText];
-    if ([label respondsToSelector:@selector(attributedText)] && [label respondsToSelector:@selector(setAttributedText:)]) {
-        NSAttributedString *attr = nil;
-        @try { attr = [label attributedText]; } @catch (NSException *e) {}
-        if (attr && attr.length) {
-            NSDictionary *attrs = [attr attributesAtIndex:0 effectiveRange:NULL];
-            NSMutableAttributedString *mattr = [[NSMutableAttributedString alloc] initWithString:newText attributes:attrs];
-            [label setAttributedText:mattr];
-        }
+    if (origAttr && origAttr.length && [label respondsToSelector:@selector(setAttributedText:)]) {
+        NSDictionary *attrs = [origAttr attributesAtIndex:0 effectiveRange:NULL];
+        NSMutableAttributedString *mattr = [[NSMutableAttributedString alloc] initWithString:newText attributes:attrs];
+        [label setAttributedText:mattr];
     }
     DDLOG(@"[详情页金额] 已写显示文本 + 富文本 -> %@", newText);
 }
@@ -1017,14 +1014,13 @@ static void DDTransferRewriteDetailLabel(UIView *label, NSString *override) {
 // 递归遍历 view 子树，定位金额 label（MMUILabel / UILabel 且文本命中 ¥X.XX）后调用原生改写。
 static void DDApplyTransferDetailPatch(UIView *root, NSString *override) {
     if (!root || !override.length) return;
+    // 正则提到循环外，避免每个 label 重复编译。
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"¥\\s*\\d" options:0 error:nil];
     for (UIView *v in root.subviews) {
         if ([v isKindOfClass:[UILabel class]]) {
             NSString *t = [v respondsToSelector:@selector(text)] ? [v text] : nil;
-            if (t.length) {
-                NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"¥\\s*\\d" options:0 error:nil];
-                if ([re firstMatchInString:t options:0 range:NSMakeRange(0, t.length)]) {
-                    DDTransferRewriteDetailLabel(v, override);
-                }
+            if (t.length && re && [re firstMatchInString:t options:0 range:NSMakeRange(0, t.length)]) {
+                DDTransferRewriteDetailLabel(v, override);
             }
         }
         DDApplyTransferDetailPatch(v, override);
