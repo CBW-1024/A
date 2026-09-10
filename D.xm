@@ -1598,6 +1598,13 @@ typedef NS_ENUM(NSInteger, DDBalancePageKind) {
 // 诊断：记录最近一次余额页判定的命中字样（"我的零钱"/"账户余额"/"零钱通"/"零钱"），供导出与 HIT 标签。
 static NSString *gDDLastBalanceHint = nil;
 static DDBalancePageKind gDDLastBalanceKind = DDBalancePageNone;
+// 诊断：记录最近一次判定的 superview 链前 8 层类名（用于抓"服务页钱包卡"等未知入口的精确类名，下一轮硬编码进判定）
+static NSString *gDDLastBalanceChain = nil;
+
+// 关联对象缓存 key：currentNumber 每帧调用，首判后缓存判定结果到 ScrollNumber 实例；
+// 写路径（updateNumber:/defaultNumber:/setCurrentNumber:，数据刷新或 cell 复用时）清缓存重判。
+static const void *kDDBalanceKindKey = &kDDBalanceKindKey;
+static const void *kDDBalanceHintKey = &kDDBalanceHintKey;
 
 // 从 view 起递归下挖所有子视图，找 UILabel 的 text 是否匹配 key。
 // exact=YES 用 isEqual 精确匹配（详情页用，避开"转入零钱通，能赚又能花"小字）；
@@ -1634,18 +1641,54 @@ static BOOL DDViewDescendantHasText(UIView *view, NSString *key, BOOL exact) {
 //     "零钱"     → Balance（主页余额卡；详情页不命中"零钱"精确，避免误判）
 //   主页零钱通卡标题能爬到"零钱通"（LQT），主余额卡标题"零钱"（Balance）；与详情页一致，无需分主页/详情两条路径。
 //   只爬一条祖先链（O(深度)），比整树递归快；currentNumber 每帧调用也扛得住。
+// 判定当前 ScrollNumber 属于【余额 / 零钱通 / 无关页】，两层：
+//   ① 第一遍：沿 superview 链检查每个祖先的 className 关键字（O(深度)，每层只比较类名，【不递归子树】，比②快且稳）。
+//      微信所有视图类均 NSObject（头文件硬证据），ScrollNumber 的祖先链上必有明确业务类，其类名编译期固定，
+//      比运行时拼的 UILabel 文本可靠：
+//        · 含 "LQT"/"LingTong" → 零钱通（特属字样，几乎无歧义）
+//        · 含 "Wallet"/"Balance"/"Entrance" → 余额入口（钱包主页卡 WCPayWalletViewCell、服务页钱包卡、零钱通详情页余额卡等）
+//   ② 第二遍（文本兜底，最后保险）：保留原四字精确 + "钱包"兜底递归子树，仅当①全 miss 时才执行（基本不跑）。
+//   诊断：记录 superview 链前 8 层类名到 gDDLastBalanceChain，用于抓"服务页钱包卡"等未知入口的精确类名。
 static DDBalancePageKind DDBalancePageKindOf(id sn) {
     @try {
         if (![sn isKindOfClass:[UIView class]]) return DDBalancePageNone;
         UIView *v = (UIView *)sn;
+        NSMutableString *chain = [NSMutableString string];
+        // ① 第一遍：沿祖先链检查 className 关键字（无子树递归）
         for (int depth = 0; depth < 24 && v; depth++) {
-            if (DDViewDescendantHasText(v, @"我的零钱", YES)) { gDDLastBalanceHint = @"我的零钱"; return DDBalancePageBalance; }
-            if (DDViewDescendantHasText(v, @"账户余额", YES)) { gDDLastBalanceHint = @"账户余额"; return DDBalancePageLQT; }
-            if (DDViewDescendantHasText(v, @"零钱通",   YES)) { gDDLastBalanceHint = @"零钱通";   return DDBalancePageLQT; }
-            if (DDViewDescendantHasText(v, @"零钱",     YES)) { gDDLastBalanceHint = @"零钱";     return DDBalancePageBalance; }
+            NSString *cls = NSStringFromClass([v class]);
+            if (depth < 8) [chain appendFormat:@"%d:%@ ", depth, cls];
+            if ([cls rangeOfString:@"LQT"].location != NSNotFound ||
+                [cls rangeOfString:@"LingTong"].location != NSNotFound) {
+                gDDLastBalanceHint = [NSString stringWithFormat:@"类名:%@", cls];
+                gDDLastBalanceChain = chain;
+                return DDBalancePageLQT;
+            }
+            if ([cls rangeOfString:@"Wallet"].location != NSNotFound ||
+                [cls rangeOfString:@"Balance"].location != NSNotFound ||
+                [cls rangeOfString:@"Entrance"].location != NSNotFound) {
+                gDDLastBalanceHint = [NSString stringWithFormat:@"类名:%@", cls];
+                gDDLastBalanceChain = chain;
+                return DDBalancePageBalance;
+            }
+            v = v.superview;
+        }
+        // ② 第二遍（文本兜底，最后保险）：四字精确 + "钱包"兜底
+        v = (UIView *)sn;
+        for (int depth = 0; depth < 24 && v; depth++) {
+            if (DDViewDescendantHasText(v, @"我的零钱", YES)) { gDDLastBalanceHint = @"我的零钱"; gDDLastBalanceChain = chain; return DDBalancePageBalance; }
+            if (DDViewDescendantHasText(v, @"账户余额", YES)) { gDDLastBalanceHint = @"账户余额"; gDDLastBalanceChain = chain; return DDBalancePageLQT; }
+            if (DDViewDescendantHasText(v, @"零钱通",   YES)) { gDDLastBalanceHint = @"零钱通";   gDDLastBalanceChain = chain; return DDBalancePageLQT; }
+            if (DDViewDescendantHasText(v, @"零钱",     YES)) { gDDLastBalanceHint = @"零钱";     gDDLastBalanceChain = chain; return DDBalancePageBalance; }
+            v = v.superview;
+        }
+        v = (UIView *)sn;
+        for (int depth = 0; depth < 8 && v; depth++) {
+            if (DDViewDescendantHasText(v, @"钱包", YES)) { gDDLastBalanceHint = @"钱包"; gDDLastBalanceChain = chain; return DDBalancePageBalance; }
             v = v.superview;
         }
         gDDLastBalanceHint = nil;
+        gDDLastBalanceChain = chain;
     } @catch (NSException *e) {}
     return DDBalancePageNone;
 }
@@ -1774,9 +1817,15 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (!cfg.balanceEnabled) return orig;
-        // 判定走 view 树爬祖先链（见 DDBalancePageKindOf，微信 NSObject 容器体系下只能靠 view 信号，不取 VC）：
-        //   详情页按 WCPayBalanceDetail/WCPayLQTDetail 类名（最稳）；主页按附近"零钱通"精确字样（避开"转入零钱通"误判）。
-        DDBalancePageKind kind = DDBalancePageKindOf(self);
+        // 判定结果用关联对象缓存到 ScrollNumber 实例：currentNumber 每帧每位数字都调，
+        // 首判后直读缓存 O(1)，不再每帧爬祖先链（解决性能）。写路径更新缓存即失效，cell 复用/数据刷新时重判。
+        NSNumber *cached = objc_getAssociatedObject(self, kDDBalanceKindKey);
+        DDBalancePageKind kind = cached ? (DDBalancePageKind)cached.integerValue : DDBalancePageNone;
+        if (!cached) {
+            kind = DDBalancePageKindOf(self);
+            objc_setAssociatedObject(self, kDDBalanceKindKey, @(kind), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kDDBalanceHintKey, gDDLastBalanceHint ?: [NSNull null], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
         if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) return DDClampFen(DDLingtongFenValue());
         if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) return DDClampFen(DDBalanceFenValue());
     } @catch (NSException *e) {}
@@ -1789,6 +1838,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
+            objc_setAssociatedObject(self, kDDBalanceKindKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 写路径=数据刷新时机：清缓存，让 currentNumber 渲染时重判最新
             DDBalancePageKind kind = DDBalancePageKindOf(self);
             NSString *hint = gDDLastBalanceHint ?: @"?";
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { DDJokerHit([NSString stringWithFormat:@"余额.SN.updateNumber.LQT.%@", hint]); %orig(DDClampFen(DDLingtongFenValue())); return; }
@@ -1801,6 +1851,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
+            objc_setAssociatedObject(self, kDDBalanceKindKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 写路径=数据刷新时机：清缓存，让 currentNumber 渲染时重判最新
             DDBalancePageKind kind = DDBalancePageKindOf(self);
             NSString *hint = gDDLastBalanceHint ?: @"?";
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { DDJokerHit([NSString stringWithFormat:@"余额.SN.defaultNumber.LQT.%@", hint]); %orig(DDClampFen(DDLingtongFenValue())); return; }
@@ -1813,6 +1864,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
+            objc_setAssociatedObject(self, kDDBalanceKindKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 写路径=数据刷新时机：清缓存，让 currentNumber 渲染时重判最新
             DDBalancePageKind kind = DDBalancePageKindOf(self);
             NSString *hint = gDDLastBalanceHint ?: @"?";
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { DDJokerHit([NSString stringWithFormat:@"余额.SN.setCurrentNumber.LQT.%@", hint]); %orig(DDClampFen(DDLingtongFenValue())); return; }
@@ -2026,6 +2078,8 @@ static NSString *DDJokerExportLogText(void) {
         else if (gDDLastBalanceKind == DDBalancePageNone)    kindStr = @"无关页(None)";
         [out appendFormat:@"  命中字样 : %@\n", gDDLastBalanceHint ?: @"(空→页面字样未命中，即 HIT=0 根因)"];
         [out appendFormat:@"  页判定 : %@\n", kindStr];
+        [out appendFormat:@"  superview链(前8层类名) : %@\n", gDDLastBalanceChain ?: @"(无)"];
+        [out appendString:@"  ⚠️ 若某页没改成功，把上一条 superview 链贴出来——找含 Wallet/Balance/LQT/Entrance 的类名，下一版直接硬编码进 DDBalancePageKindOf 的 className 判定\n"];
     }
 
     [out appendString:@"\n----- 日志正文 -----\n"];
