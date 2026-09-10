@@ -932,7 +932,8 @@ static NSString *DDTransferFeedescAmount(NSString *xml) {
 
 static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *override) {
     if (!text.length || !override.length) return text;
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"¥?\\d+(?:\\.\\d+)?"
+    // 两个页面金额都带 ¥，必带 ¥ + 两位小数（允许千分位逗号），不做宽松匹配。
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"¥\\d[\\d,]*\\.\\d{2}"
                                                                         options:0
                                                                           error:nil];
     if (!re) return text;
