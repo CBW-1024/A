@@ -184,6 +184,9 @@
 - (void)refreshViewWithData:(id)arg;
 @end
 
+@interface WCPayTransferMoneyStatusViewController : UIViewController
+@end
+
 @interface WCPayLQTInfo : NSObject
 - (unsigned long long)lqtAvailBalance;
 - (unsigned long long)lqtTotalBalance;
@@ -521,6 +524,8 @@ static void DDJokerSetCachedAmount(CMessageWrap *msg, NSString *amount) {
     DDJokerSaveCache(kDDJokerAmountCacheKey, d);
 }
 
+static NSString *gDDLastTransferOverride = nil;
+
 #pragma mark - 聊天时间 · 缓存与 ivar 读写
 // 直接读写 ChatTimeViewModel 的 _showingTime ivar（double 时间戳）；缓存按消息或原始时间戳索引。
 
@@ -805,7 +810,7 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
             if ([newText isEqualToString:current]) { blockAlert = nil; return; }
             if (isTransfer) {
                 NSString *normalized = JokerNormalizeAmount(newText);
-                if (normalized) DDJokerSetCachedAmount(msg, normalized);
+                if (normalized) { DDJokerSetCachedAmount(msg, normalized); gDDLastTransferOverride = normalized; }
             } else {
                 DDJokerSetCachedText(msg, newText);
             }
@@ -969,6 +974,70 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
     if (![DDGlobalConfig shared].transferEnabled) return origin;
     NSString *cached = DDJokerCachedAmount(self.messageWrap);
     return cached ? DDTransferReplaceAmountInText(origin, cached) : origin;
+}
+%end
+
+// 转账详情页金额改写：把文本中的金额替换为 override（格式如 "200.00"）。
+// 详情页金额有两种写法：① ¥X.XX（标准）；② "X点X X元"（如 "0点1 0元"，无 ¥、小数点写作"点"、各位间可能含空格）。
+static NSString *DDTransferRewriteDetailAmount(NSString *text, NSString *override) {
+    if (!text.length || !override.length) return text;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"¥?\\d[\\d,]*(\\.\\d+)?" options:0 error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
+    if (m) {
+        NSMutableString *out = [text mutableCopy];
+        [out replaceCharactersInRange:m.range withString:[@"¥" stringByAppendingString:override]];
+        return out;
+    }
+    NSRegularExpression *re2 = [NSRegularExpression regularExpressionWithPattern:@"(\\d+)\\s*点\\s*([\\d\\s]+?)\\s*元" options:0 error:nil];
+    NSTextCheckingResult *m2 = [re2 firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
+    if (m2) {
+        NSArray *parts = [override componentsSeparatedByString:@"."];
+        NSString *intPart = parts.count ? parts[0] : override;
+        NSString *decPart = parts.count > 1 ? parts[1] : @"00";
+        NSString *newAmt = [NSString stringWithFormat:@"%@点%@元", intPart, decPart];
+        NSMutableString *out = [text mutableCopy];
+        [out replaceCharactersInRange:m2.range withString:newAmt];
+        return out;
+    }
+    return text;
+}
+
+// 递归遍历 view 子树，改写所有含"元"字的 UILabel / MMUILabel 文本。
+static void DDApplyTransferDetailPatch(UIView *root, NSString *override) {
+    if (!root || !override.length) return;
+    for (UIView *v in root.subviews) {
+        if ([v respondsToSelector:@selector(text)] && [v respondsToSelector:@selector(setText:)]) {
+            NSString *t = [v text];
+            if (t.length && [t rangeOfString:@"元"].location != NSNotFound) {
+                NSString *nt = DDTransferRewriteDetailAmount(t, override);
+                if (nt && ![nt isEqualToString:t]) [v setText:nt];
+            }
+        }
+        DDApplyTransferDetailPatch(v, override);
+    }
+}
+
+%hook WCPayTransferMoneyStatusViewController
+- (void)viewDidLoad {
+    %orig;
+    [self dd_patchTransferDetailAmount];
+}
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    [self dd_patchTransferDetailAmount];
+}
+%new
+- (void)dd_patchTransferDetailAmount {
+    if (![DDGlobalConfig shared].transferEnabled) return;
+    NSString *override = gDDLastTransferOverride;
+    if (!override.length) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try {
+            UIView *root = self.view;
+            if (root) DDApplyTransferDetailPatch(root, override);
+        } @catch (NSException *e) {}
+    });
 }
 %end
 
