@@ -1390,8 +1390,8 @@ typedef NS_ENUM(NSInteger, DDBalancePageKind) {
 static const void *kDDBalanceKindKey = &kDDBalanceKindKey;
 
 // 页面判定：沿响应链上溯，按 Kinda widget 无障碍标识与 VC description 页标识区分。
-//   零钱通：祖先视图标识含"零钱通" / lqtDetailUIPage
-//   余额：  祖先标识含"零钱" / WalletPageUI(钱包页默认) / balanceEntryUIPage / WCPayMainViewControllerV2
+//   零钱通：祖先 accessibilityIdentifier 含 lqt_cell / lqtDetailUIPage
+//   余额：  祖先 accessibilityIdentifier 含 balance_cell / balanceEntryUIPage / WCPayMainViewControllerV2
 //   VC 标识仅限 KindaViewController 自身命中，避免导航控制器 description 拼栈串页。
 static DDBalancePageKind DDBalancePageKindOf(id sn) {
     @try {
@@ -1399,14 +1399,10 @@ static DDBalancePageKind DDBalancePageKindOf(id sn) {
         UIResponder *r = (UIResponder *)sn;
         for (int depth = 0; depth < 24 && r; depth++) {
             if ([r isKindOfClass:[UIView class]]) {
-                UIView *uv = (UIView *)r;
-                NSString *ai = uv.accessibilityIdentifier ?: @"";
-                NSString *al = uv.accessibilityLabel ?: @"";
-                if ([ai rangeOfString:@"零钱通"].location != NSNotFound ||
-                    [al rangeOfString:@"零钱通"].location != NSNotFound)
+                NSString *ai = ((UIView *)r).accessibilityIdentifier ?: @"";
+                if ([ai rangeOfString:@"lqt_cell"].location != NSNotFound)
                     return DDBalancePageLQT;
-                if ([ai rangeOfString:@"零钱"].location != NSNotFound ||
-                    [al rangeOfString:@"零钱"].location != NSNotFound)
+                if ([ai rangeOfString:@"balance_cell"].location != NSNotFound)
                     return DDBalancePageBalance;
             }
             if ([r isKindOfClass:[UIViewController class]]) {
@@ -1415,8 +1411,6 @@ static DDBalancePageKind DDBalancePageKindOf(id sn) {
                 if ([cls isEqualToString:@"KindaViewController"]) {
                     if ([all rangeOfString:@"lqtDetailUIPage"].location != NSNotFound)
                         return DDBalancePageLQT;
-                    if ([all rangeOfString:@"WalletPageUI"].location != NSNotFound)
-                        return DDBalancePageBalance;
                     if ([all rangeOfString:@"balanceEntryUIPage"].location != NSNotFound)
                         return DDBalancePageBalance;
                 }
