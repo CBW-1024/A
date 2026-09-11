@@ -210,6 +210,7 @@
 - (void)updateScrollNumber;
 - (id)scrollNumber;
 - (CGSize)scrollNumberSize;
+- (CGSize)sizeThatFits:(CGSize)size;   // 原生存在：父布局/Yoga 靠它测量宽度
 @end
 
 @class WCPayTableCellViewDataView;
@@ -1444,9 +1445,10 @@ static NSMutableSet *DDBalanceSeenChains(void) {
 }
 
 // 每个 view 只记前 limit 次，用于看清同一处 frame 的逐次变化。
-static const void *kDDTNLogCount    = &kDDTNLogCount;    // 修帧日志节流
-static const void *kDDValLogCount   = &kDDValLogCount;   // 改值日志节流
-static const void *kDDTNChainLogged = &kDDTNChainLogged; // 该 view 是否已记过页面链
+static const void *kDDTNLogCount      = &kDDTNLogCount;      // 修帧日志节流
+static const void *kDDValLogCount     = &kDDValLogCount;     // 改值日志节流
+static const void *kDDMeasureLogCount = &kDDMeasureLogCount; // 测量日志节流
+static const void *kDDTNChainLogged   = &kDDTNChainLogged;   // 该 view 是否已记过页面链
 static BOOL DDLogTimes(id obj, const void *key, int limit) {
     @try {
         NSNumber *n = objc_getAssociatedObject(obj, key);
@@ -1587,6 +1589,32 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         }
     } @catch (NSException *e) {}
     %orig(original);
+}
+// 治本：实测（DDJokerDiag-2）父布局每轮都把 self.frame 还原成按旧值 measure 的宽度
+//   （零钱/零钱通进来时恒为 41.33），所以在 layoutSubviews 里手改 frame 会被反复打回 → 钱包页闪烁。
+//   改为让原生自己 measure 出正确宽度：hook sizeThatFits:，命中钱包页 cell 时按 scrollNumberSize
+//   返回改写值对应的宽度（高度沿用原生）。父布局据此设 frame，我便不必再动手；layoutSubviews
+//   里的兜底修正也会因"已符合"而不再触发 → 拉锯消失、不闪。
+- (CGSize)sizeThatFits:(CGSize)size {
+    CGSize o = %orig(size);
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (!cfg.balanceEnabled) return o;
+        DDBalancePageKind kind = DDBalanceCellKindOf(self);
+        if (kind != DDBalancePageBalance && kind != DDBalancePageLQT) return o;
+        BOOL on = (kind == DDBalancePageLQT) ? [cfg hasLingtongValue] : [cfg hasBalanceValue];
+        if (!on) return o;
+        if (![self respondsToSelector:@selector(scrollNumberSize)]) return o;
+        CGSize sz = [self scrollNumberSize];
+        if (sz.width <= 0) return o;
+        // 诊断④：父布局是否真的来问过宽度、原生给多少、我们改写后给多少。
+        if (cfg.diagEnabled && DDLogTimes(self, kDDMeasureLogCount, 8)) {
+            DDLOG(@"[余额·测量] %@ 入参w=%.2f 原生w=%.2f 改写w=%.2f",
+                  (kind == DDBalancePageLQT ? @"零钱通" : @"零钱"), size.width, o.width, sz.width);
+        }
+        return CGSizeMake(sz.width, o.height);
+    } @catch (NSException *e) {}
+    return o;
 }
 // 顶格修复：改值后原生 measure 出的 frame 仍是旧宽度，数字变宽向右溢出盖住箭头。
 //   复刻爱锋 wechatku.dylib TimeoutNumber layoutSubviews（反汇编 0xbe624 确证）：它不调
