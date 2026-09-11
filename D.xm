@@ -111,13 +111,6 @@
 - (void)resetLayoutCache;
 @end
 
-@interface RichTextView : UIView
-- (id)getContent;
-- (void)setContent:(id)content;
-- (void)calculateAndUpdateFrame;
-- (void)forceDisplayInSync;
-@end
-
 @interface TextMessageCellView : CommonMessageCellView
 - (id)getRichTextView;
 - (id)getTextString;
@@ -151,7 +144,6 @@
 - (id)initWithViewModel:(id)vm;
 - (void)setViewModel:(id)vm;
 - (void)layoutInternal;
-
 - (UILabel *)dk_timeLabel;
 - (void)dk_installTimeEditGesture;
 - (void)dk_handleTimeLongPress:(UILongPressGestureRecognizer *)g;
@@ -180,28 +172,6 @@
 - (void)refreshViewWithData:(id)arg;
 @end
 
-@interface WCPayLQTDetailViewController : UIViewController
-- (void)refreshViewWithData:(id)arg;
-@end
-
-@interface WCPayLQTInfo : NSObject
-- (unsigned long long)lqtAvailBalance;
-- (unsigned long long)lqtTotalBalance;
-@end
-
-@interface WCPayLQTDetailControlLogic : NSObject
-- (long long)lqtBalance;
-@end
-
-@interface WCPayBalanceInfo : NSObject
-- (unsigned long long)wallet_balance;
-- (unsigned long long)m_uiAvailableBalance;
-- (unsigned long long)m_uiTotalBalance;
-@end
-
-@interface WCPayMainViewControllerV2 : UIViewController
-@end
-
 // TimeoutNumber 是 ScrollNumber 的外层容器，金额宽度/布局由它管，
 //   改它的 updateNumber: 才会连带重算容器尺寸；直接改内层 ScrollNumber 会右溢顶格。
 @interface TimeoutNumber : UIView
@@ -218,11 +188,9 @@
 //   dump 里 ScrollNumber 写作 NSObject，运行时实为 UIView，故按 UIView 声明以便用 frame。
 @interface ScrollNumber : UIView
 - (unsigned long long)currentNumber;
-- (unsigned long long)getNumber;
 - (void)defaultNumber:(unsigned long long)a0;
 - (void)updateNumber:(unsigned long long)a0;
 - (id)container;      // dump 中存在：外层容器（TimeoutNumber）
-- (id)clipView;
 @end
 
 @class WCPayTableCellViewDataView;
@@ -1189,16 +1157,9 @@ static double DDTimeStampFromString(NSString *s) {
         DDRefreshTimeText(self);
     }
 
-    NSString *o = %orig;
-    if (!o && cached) {
-
-    }
-    return o;
+    return %orig;
 }
 
-- (void)updateLayouts {
-    %orig;
-}
 %end
 
 %hook ChatTimeCellView
@@ -1214,10 +1175,6 @@ static double DDTimeStampFromString(NSString *s) {
     objc_setAssociatedObject(self, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [self dk_installTimeEditGesture];
 }
-- (void)layoutInternal {
-    %orig;
-}
-
 - (void)didMoveToWindow {
     %orig;
     [self dk_installTimeEditGesture];
@@ -1483,87 +1440,6 @@ static DDBalancePageKind DDBalanceCellKindOf(id sn) {
     return DDBalancePageNone;
 }
 
-#pragma mark - 钱包页判定（爱锋 wechatku.dylib 反汇编实证 0xbe624 / 0xbe820）
-// 爱锋完全不认 cell 标识符、也不认 WCPay* VC，它的判定是：
-//   1) 取当前 VC，要求 isKindOfClass: NSClassFromString(@"KindaViewController")
-//      —— 钱包页是 Kinda（服务端下发 JSON + Yoga）动态布局页
-//   2) 且 [[vc title] isEqual:@"钱包"]（严格相等）
-//   3) 区分零钱 / 零钱通：self.superview.superview.superview 之上取
-//      subviews[0].subviews[1]，要求它是 UILabel，且 text 以 @"零钱通" 开头
-// 这就是"钱包页的数字在按钮里面"的真实结构 —— 定位靠层级下钻 + 中文标题，
-// 与响应链上的 accessibilityIdentifier 无关。此前只认 cell/VC 的做法确实判偏了。
-// 从 view 沿响应链上溯，找它所属的 UIViewController。
-//   刻意不用 UIApplication.keyWindow / .windows —— 这两个 API 自 iOS 13 / 15 起被标记废弃，
-//   Theos 带 -Werror 会直接编译失败。而响应链上溯拿到的正是"这个 view 真正所属的页面"，
-//   比取全局当前 VC 更准（不会把别的场景的 VC 误当成当前页）。
-static UIViewController *DDOwningViewController(id v) {
-    @try {
-        if (![v isKindOfClass:[UIView class]]) return nil;
-        UIResponder *r = (UIResponder *)v;
-        for (int i = 0; i < 32 && r; i++) {
-            if ([r isKindOfClass:[UIViewController class]]) return (UIViewController *)r;
-            r = r.nextResponder;
-        }
-    } @catch (NSException *e) {}
-    return nil;
-}
-
-// 该 view 所属页面是否为 Kinda 动态布局页（爱锋判定：VC 是 KindaViewController）
-static BOOL DDIsKindaPageFor(id v) {
-    static Class kk = Nil;
-    static BOOL kkLoaded = NO;
-    if (!kkLoaded) { kk = NSClassFromString(@"KindaViewController"); kkLoaded = YES; }
-    if (!kk) return NO;
-    @try {
-        UIViewController *vc = DDOwningViewController(v);
-        return vc ? [vc isKindOfClass:kk] : NO;
-    } @catch (NSException *e) {}
-    return NO;
-}
-
-// 是否为 Kinda 钱包页（爱锋 0xbe69c / 0xbe8b0：KindaViewController 且 title 严格等于"钱包"）。
-//   仅用于诊断日志；真机 title 可能取不到，所以判定本身不依赖它。
-static BOOL DDIsWalletKindaPageFor(id v) {
-    @try {
-        UIViewController *vc = DDOwningViewController(v);
-        if (!vc) return NO;
-        Class kk = NSClassFromString(@"KindaViewController");
-        if (kk && ![vc isKindOfClass:kk]) return NO;
-        NSString *t = [vc respondsToSelector:@selector(title)] ? vc.title : nil;
-        return [t isEqualToString:@"钱包"];
-    } @catch (NSException *e) {}
-    return NO;
-}
-
-// 爱锋 isLQT 复刻（0xbe820）：上溯 3 层到整行，取 subviews[0].subviews[1] 的标题 label，
-//   文本以"零钱通"开头 → 零钱通行；否则视为零钱行。下钻失败返回 None 交调用方退回旧判定。
-static DDBalancePageKind DDBalanceKindByDrill(id v) {
-    @try {
-        UIView *x = (UIView *)v;
-        if (![x isKindOfClass:[UIView class]]) return DDBalancePageNone;
-        for (int i = 0; i < 3 && x.superview; i++) x = x.superview;
-        NSArray *s1 = x.subviews;
-        if (s1.count < 1) return DDBalancePageNone;
-        UIView *box = s1[0];
-        if (![box isKindOfClass:[UIView class]]) return DDBalancePageNone;
-        NSArray *s2 = box.subviews;
-        if (s2.count < 1) return DDBalancePageNone;
-        Class lbCls = NSClassFromString(@"UILabel");
-        // 爱锋先看 subviews[1]，不是 UILabel 再退 subviews[0]
-        UIView *cand = (s2.count > 1) ? s2[1] : s2[0];
-        if (![cand isKindOfClass:[UIView class]]) return DDBalancePageNone;
-        if (lbCls && ![cand isKindOfClass:lbCls]) cand = s2[0];
-        if (![cand isKindOfClass:[UIView class]]) return DDBalancePageNone;
-        if (lbCls && ![cand isKindOfClass:lbCls]) return DDBalancePageNone;
-        if (![cand respondsToSelector:@selector(text)]) return DDBalancePageNone;
-        NSString *t = ((UILabel *)cand).text;
-        if (!t.length) return DDBalancePageNone;
-        if (![t hasPrefix:@"零钱"]) return DDBalancePageNone;   // 连"零钱"都不是 → 不是钱包页金额行
-        return [t hasPrefix:@"零钱通"] ? DDBalancePageLQT : DDBalancePageBalance;
-    } @catch (NSException *e) {}
-    return DDBalancePageNone;
-}
-
 // 统一判定：钱包页走爱锋式下钻（更准），下钻失败退回本文件原有的 cell/VC 判定。
 // 判定基准归一化：ScrollNumber 在 dump 里是 NSObject，运行时未必是 UIView。
 //   若传入的对象不是 UIView，就改用它持有的 container（外层 TimeoutNumber）或 superview
@@ -1583,16 +1459,11 @@ static id DDBalanceAnchorOf(id v) {
     return v;
 }
 
+// 改值判定（宽）：走本文件原有的 cell / VC 规则。
+//   曾叠加过爱锋的"Kinda 页 + 上溯3层下钻"分支，但实测下钻在本机恒返回 None
+//   （多轮日志 [余额·未修] 下钻=0），该分支从未生效，已整体移除 —— 行为完全等价。
 static DDBalancePageKind DDBalanceResolveKind(id v) {
-    // 爱锋式：所属 VC 是 Kinda 页就允许层级下钻区分零钱 / 零钱通。
-    //   title 严格等于"钱包"是爱锋的收紧条件，本机 title 未必取得到，故放宽为 Kinda 页即下钻；
-    //   下钻不中（结构对不上）就退回本文件原有的 cell/VC 判定，保证影响面不扩大。
-    id a = DDBalanceAnchorOf(v);
-    if (DDIsKindaPageFor(a)) {
-        DDBalancePageKind k = DDBalanceKindByDrill(a);
-        if (k != DDBalancePageNone) return k;
-    }
-    return DDBalancePageKindOf(a);
+    return DDBalancePageKindOf(DDBalanceAnchorOf(v));
 }
 
 // 修帧专用判定 —— 命中钱包页 cell 才修（改值才用宽判定 DDBalanceResolveKind）。
@@ -1677,7 +1548,7 @@ static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fe
     return out;
 }
 
-static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hit) {
+static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
     @try {
         if (![vc respondsToSelector:@selector(balanceTitleLabel)]) return;
         id lb = [vc balanceTitleLabel];
@@ -1745,7 +1616,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
 // 前提：scrollNumberSize 必须按改后的值算，所以必须同时 hook currentNumber getter
 //   （见下方 %hook ScrollNumber）。只改 setter 时宽度仍按旧值算，光改 frame 救不回来 ——
 //   这正是此前几版"还是顶格"的根因。
-// 判定改用爱锋式：当前 VC 是 KindaViewController 且 title == "钱包"，再层级下钻区分零钱/零钱通。
+// 判定：命中 balance_cell / lqt_cell 才修帧（见 DDBalanceFixKindFor）。
 - (void)layoutSubviews {
     %orig;
     @try {
@@ -1758,11 +1629,10 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         //   带上父宽：钱包页金额行父宽约 180，详情页居中大数字父宽 414/366，一眼可分。
         if (diag && DDLogTimes(self, kDDTNLayoutCount, 3)) {
             DDBalancePageKind ck = DDBalanceCellKindOf(self);
-            DDLOG(@"[余额·布局] 链=%@ 命中=%@ 钱包页=%d cell=%@ frame=%@ 父w=%.2f",
+            DDLOG(@"[余额·布局] 链=%@ 命中=%@ cell=%@ frame=%@ 父w=%.2f",
                   DDBalanceChainDescOf(self),
                   (kind == DDBalancePageLQT ? @"零钱通"
                    : (kind == DDBalancePageBalance ? @"零钱" : @"未命中")),
-                  (int)DDIsWalletKindaPageFor(self),
                   (ck == DDBalancePageLQT ? @"lqt_cell"
                    : (ck == DDBalancePageBalance ? @"balance_cell" : @"无")),
                   NSStringFromCGRect(self.frame),
@@ -1773,18 +1643,12 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         if (fixKind != DDBalancePageBalance && fixKind != DDBalancePageLQT) {
             // 诊断①b：没修就把判据状态打出来 —— 下一版不用再猜是卡在哪。
             if (diag && DDLogTimes(self, kDDTNFixMissCount, 2)) {
-                id a = DDBalanceAnchorOf(self);
-                UIViewController *vc = DDOwningViewController(a);
-                DDBalancePageKind ck = DDBalanceCellKindOf(a);
-                DDLOG(@"[余额·未修] Kinda=%d title=%@ cell=%@ 下钻=%d 父w=%.2f frame=%@ VC=%@",
-                      (int)DDIsKindaPageFor(a),
-                      (vc && vc.title) ? vc.title : @"(nil)",
+                DDBalancePageKind ck = DDBalanceCellKindOf(DDBalanceAnchorOf(self));
+                DDLOG(@"[余额·未修] cell=%@ 父w=%.2f frame=%@",
                       (ck == DDBalancePageLQT ? @"lqt_cell"
                        : (ck == DDBalancePageBalance ? @"balance_cell" : @"无")),
-                      (int)DDBalanceKindByDrill(a),
                       self.superview ? self.superview.bounds.size.width : -1.0,
-                      NSStringFromCGRect(self.frame),
-                      vc ? NSStringFromClass([vc class]) : @"(无VC)");
+                      NSStringFromCGRect(self.frame));
             }
             return;
         }
@@ -1879,36 +1743,22 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     %orig;
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     if (cfg.balanceEnabled && [cfg hasBalanceValue])
-        DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()), @"余额.详情UILabel.余额");
+        DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()));
 }
 - (void)updateBalanceTitleLabel {
     %orig;
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     if (cfg.balanceEnabled && [cfg hasBalanceValue])
-        DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()), @"余额.详情UILabel.余额");
+        DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()));
 }
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     if (cfg.balanceEnabled && [cfg hasBalanceValue])
-        DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()), @"余额.详情UILabel.余额");
+        DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()));
 }
 %end
 
-%hook WCPayLQTDetailViewController
-- (void)refreshViewWithData:(id)arg {
-    %orig;
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (cfg.balanceEnabled && [cfg hasLingtongValue])
-        DDBalancePatchTitleLabel(self, DDClampFen(DDLingtongFenValue()), @"余额.详情UILabel.LQT");
-}
-- (void)viewWillAppear:(BOOL)animated {
-    %orig;
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (cfg.balanceEnabled && [cfg hasLingtongValue])
-        DDBalancePatchTitleLabel(self, DDClampFen(DDLingtongFenValue()), @"余额.详情UILabel.LQT");
-}
-%end
 
 #pragma mark - 通用诊断日志 · 快照与导出
 // 拼装导出文本（命中统计 / 缓存盘点 / 时间条结构 / 日志正文），写微信 Documents/DDJokerDiag.log。
