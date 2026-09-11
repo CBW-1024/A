@@ -1416,6 +1416,12 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     return fen > kMaxFen ? kMaxFen : fen;
 }
 
+// 写入新值后向上标脏：Kinda/Yoga 在值写入前已完成 measure，新值比原值宽时
+//   父容器 frame 不重算，金额右溢盖住箭头（顶格）。setNeedsLayout 让下一帧重新测量。
+static void DDScrollNumberRelayout(UIView *v) {
+    for (int i = 0; i < 6 && v; i++) { [v setNeedsLayout]; v = v.superview; }
+}
+
 static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fen) {
     if (!text.length) return text;
     // 金额由 ScrollNumber 以两位小数渲染，¥ 为独立 label，故匹配可选 ¥ + 两位小数数字。
@@ -1478,8 +1484,8 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalancePageKindOf(self);
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); return; }
-            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); return; }
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); DDScrollNumberRelayout(self); return; }
+            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); DDScrollNumberRelayout(self); return; }
         }
     } @catch (NSException *e) {}
     %orig(original);
@@ -1489,8 +1495,8 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalancePageKindOf(self);
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); return; }
-            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); return; }
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); DDScrollNumberRelayout(self); return; }
+            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); DDScrollNumberRelayout(self); return; }
         }
     } @catch (NSException *e) {}
     %orig(original);
@@ -1500,8 +1506,8 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalancePageKindOf(self);
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); return; }
-            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); return; }
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); DDScrollNumberRelayout(self); return; }
+            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); DDScrollNumberRelayout(self); return; }
         }
     } @catch (NSException *e) {}
     %orig(original);
