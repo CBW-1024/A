@@ -493,11 +493,6 @@ static void DDJokerClearAllMessageCache(void) {
     [fm removeItemAtPath:DDJokerImagesDir() error:nil];
 }
 
-static NSString *DDTimeDesc(double ts) {
-    if (ts <= 0) return @"0 (无效)";
-    return [NSString stringWithFormat:@"%.3f  %@", ts, [NSDate dateWithTimeIntervalSince1970:ts]];
-}
-
 static void JokerCollectViewControllers(UIViewController *root, NSMutableArray *out) {
     if (!root || [out containsObject:root]) return;
     [out addObject:root];
