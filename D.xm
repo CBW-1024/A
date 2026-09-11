@@ -1418,7 +1418,9 @@ static unsigned long long DDClampFen(unsigned long long fen) {
 
 // 写入新值后向上标脏：Kinda/Yoga 在值写入前已完成 measure，新值比原值宽时
 //   父容器 frame 不重算，金额右溢盖住箭头（顶格）。setNeedsLayout 让下一帧重新测量。
-static void DDScrollNumberRelayout(UIView *v) {
+//   ScrollNumber 在本文件声明为 NSObject（运行时实为 UIView），故入参用 id 规避 ARC 类型冲突。
+static void DDScrollNumberRelayout(id obj) {
+    UIView *v = (UIView *)obj;
     for (int i = 0; i < 6 && v; i++) { [v setNeedsLayout]; v = v.superview; }
 }
 
