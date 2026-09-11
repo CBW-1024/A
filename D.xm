@@ -202,12 +202,12 @@
 @interface WCPayMainViewControllerV2 : UIViewController
 @end
 
-@interface ScrollNumber : NSObject
-
+// TimeoutNumber 是 ScrollNumber 的外层容器，金额宽度/布局由它管，
+//   改它的 updateNumber: 才会连带重算容器尺寸；直接改内层 ScrollNumber 会右溢顶格。
+@interface TimeoutNumber : UIView
 - (void)updateNumber:(unsigned long long)a0;
 - (void)defaultNumber:(unsigned long long)a0;
-- (void)setCurrentNumber:(unsigned long long)a0;
-- (unsigned long long)currentNumber;
+- (id)scrollNumber;
 @end
 
 @class WCPayTableCellViewDataView;
@@ -1416,14 +1416,6 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     return fen > kMaxFen ? kMaxFen : fen;
 }
 
-// 写入新值后向上标脏：Kinda/Yoga 在值写入前已完成 measure，新值比原值宽时
-//   父容器 frame 不重算，金额右溢盖住箭头（顶格）。setNeedsLayout 让下一帧重新测量。
-//   ScrollNumber 在本文件声明为 NSObject（运行时实为 UIView），故入参用 id 规避 ARC 类型冲突。
-static void DDScrollNumberRelayout(id obj) {
-    UIView *v = (UIView *)obj;
-    for (int i = 0; i < 6 && v; i++) { [v setNeedsLayout]; v = v.superview; }
-}
-
 static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fen) {
     if (!text.length) return text;
     // 金额由 ScrollNumber 以两位小数渲染，¥ 为独立 label，故匹配可选 ¥ + 两位小数数字。
@@ -1473,21 +1465,19 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     } @catch (NSException *e) {}
 }
 
-#pragma mark - 余额 / 零钱通改写（接管 ScrollNumber 渲染）
-// 接管 ScrollNumber 渲染链路与详情页 UILabel，写入自定义余额 / 零钱通值。
+#pragma mark - 余额 / 零钱通改写（接管 TimeoutNumber 渲染）
+// 改外层容器 TimeoutNumber：它持有 scrollNumber 并负责尺寸/布局（isYogaRightAlignment、
+//   sizeThatFits: / scrollNumberSize）。改内层的 ScrollNumber 只换数字不换容器宽度，
+//   新值比原值宽时右溢顶格；从容器入口 updateNumber: 进去才会连带重算。
 
-
-// 只接管写入口：ScrollNumber 的金额宽度 / 小数点偏移 / container frame 都在写入时算
-//   （isYogaRightAlignment + updateContainer / updateClipView / updateLastNumberFrame），
-//   读路径 currentNumber 直接 return 新值会绕过这套重排导致 Yoga 右对齐下顶格，故不 hook。
-%hook ScrollNumber
+%hook TimeoutNumber
 - (void)updateNumber:(unsigned long long)original {
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalancePageKindOf(self);
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); DDScrollNumberRelayout(self); return; }
-            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); DDScrollNumberRelayout(self); return; }
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); return; }
+            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); return; }
         }
     } @catch (NSException *e) {}
     %orig(original);
@@ -1497,19 +1487,8 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalancePageKindOf(self);
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); DDScrollNumberRelayout(self); return; }
-            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); DDScrollNumberRelayout(self); return; }
-        }
-    } @catch (NSException *e) {}
-    %orig(original);
-}
-- (void)setCurrentNumber:(unsigned long long)original {
-    @try {
-        DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (cfg.balanceEnabled) {
-            DDBalancePageKind kind = DDBalancePageKindOf(self);
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); DDScrollNumberRelayout(self); return; }
-            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); DDScrollNumberRelayout(self); return; }
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); return; }
+            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); return; }
         }
     } @catch (NSException *e) {}
     %orig(original);
