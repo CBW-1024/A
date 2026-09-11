@@ -1595,35 +1595,23 @@ static DDBalancePageKind DDBalanceResolveKind(id v) {
     return DDBalancePageKindOf(a);
 }
 
-// 修帧专用严格判定 —— 只认钱包页金额行，绝不做 VC 兜底（改值才用宽判定 DDBalanceResolveKind）。
+// 修帧专用判定 —— 命中钱包页 cell 才修（改值才用宽判定 DDBalanceResolveKind）。
 //   教训①（2026-09-12 日志）：修帧若走 DDBalancePageKindOf 兜底，服务页钱包入口
 //     （链=[VC:WCPayMainViewControllerV2]，父w=128，x 8->54）、零钱/零钱通详情页的居中大数字
 //     （父w=414/366）都会被右对齐推到屏幕右侧 —— "钱包页好了，其他地方全漂了"。
-//   教训②（同日）：爱锋 0xbe624 的 title 判据是 [[vc title] isEqual:@"钱包"]，但本机
-//     KindaViewController.title 并不等于"钱包"（日志 [余额·发现] 钱包页=0 实证），
-//     照搬会把钱包页自己拦掉 —— "修帧日志 0 条、钱包页又顶格"。故改为黑名单。
-// title 黑名单：钱包页 Kinda VC 的 title 在真机上并不等于"钱包"
-//   （2026-09-12 日志实证：钱包页 balance_cell / lqt_cell 那条 [余额·发现] 里 钱包页=0）。
-//   所以绝不能做"必须等于钱包"的正向比对 —— 那会把钱包页本身一并拦掉，
-//   表现为 [余额·修帧] 一条都没有（即上一版的状况）。改为只排除明确属于别处的页面。
-static BOOL DDIsOtherPageTitle(NSString *t) {
-    if (!t.length) return NO;                                        // 取不到 title 不拦
-    if ([t isEqualToString:@"服务"]) return YES;                       // 服务页
-    if ([t rangeOfString:@"零钱"].location  != NSNotFound) return YES; // 零钱 / 零钱明细 / 零钱通详情页
-    if ([t rangeOfString:@"明细"].location  != NSNotFound) return YES;
-    if ([t rangeOfString:@"支付"].location  != NSNotFound) return YES;
-    return NO;
-}
-
+//   教训②（同日，重要）：爱锋 0xbe624 的"上溯 3 层 → subviews[0].subviews[1] → 文本前缀"
+//     层级下钻，在本机一律返回 0 —— 日志 [余额·未修] Kinda=1 title=钱包 下钻=0 实证。
+//     本机微信的 Kinda 层级与爱锋所处版本不同，下钻不能当主判据，只能兜底。
+//   教训③（同日）：不要拿"挂载前"的采样下结论。首次 layout 常发生在 view 加入视图树之前，
+//     那时 frame={{0,0},{0,0}}、链上无 cell/VC —— 据此一度误判 title 不等于"钱包"。
+//     钱包页的真实 title 就是"钱包"（见 [余额·未修] title=钱包）。
 static DDBalancePageKind DDBalanceFixKindFor(id v) {
-    id a = DDBalanceAnchorOf(v);
-    if (!DDIsKindaPageFor(a)) return DDBalancePageNone;                 // 闸①  必须 Kinda 页
-    UIViewController *vc = DDOwningViewController(a);
-    if (vc) {                                                            // 闸②  title 明确是别处 → 拦
-        NSString *t = [vc respondsToSelector:@selector(title)] ? vc.title : nil;
-        if (DDIsOtherPageTitle(t)) return DDBalancePageNone;
-    }
-    return DDBalanceKindByDrill(a);   // 闸③  下钻不中即不修，绝不 VC 兜底
+    // 判定收敛到唯一可靠信号：Flex 实证的两个钱包页单元格
+    //   balance_cell（零钱，实测父w=180.67）/ lqt_cell（零钱通，实测父w=127.67）。
+    //   2026-09-12 日志实证：需要修帧的只有这两处，服务页入口、零钱/零钱通详情页本来就正常。
+    //   此前叠的 Kinda / title 两道闸反而是误判来源（Kinda=0 或 title 取不到就把该修的也拦了），
+    //   按实测结论全部去掉 —— 宁可判据单一，不要靠猜的层级条件。
+    return DDBalanceCellKindOf(DDBalanceAnchorOf(v));
 }
 
 // 前向声明：DDClampFen 定义在本文件稍后（取目标值时要先钳位）
@@ -1780,20 +1768,23 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
                   NSStringFromCGRect(self.frame),
                   self.superview ? self.superview.bounds.size.width : -1.0);
         }
-        // 修帧用严格判定：只认钱包页金额行；上面的宽 kind 仅用于日志展示。
+        // 修帧判定：命中 balance_cell / lqt_cell 才修；上面的宽 kind 仅用于日志展示。
         DDBalancePageKind fixKind = DDBalanceFixKindFor(self);
         if (fixKind != DDBalancePageBalance && fixKind != DDBalancePageLQT) {
-            // 诊断①b：没修就把三道闸的状态打出来 —— 下一版不用再猜是哪道闸拦的。
+            // 诊断①b：没修就把判据状态打出来 —— 下一版不用再猜是卡在哪。
             if (diag && DDLogTimes(self, kDDTNFixMissCount, 2)) {
                 id a = DDBalanceAnchorOf(self);
                 UIViewController *vc = DDOwningViewController(a);
-                DDLOG(@"[余额·未修] Kinda=%d VC=%@ title=%@ 下钻=%d 父w=%.2f frame=%@",
+                DDBalancePageKind ck = DDBalanceCellKindOf(a);
+                DDLOG(@"[余额·未修] Kinda=%d title=%@ cell=%@ 下钻=%d 父w=%.2f frame=%@ VC=%@",
                       (int)DDIsKindaPageFor(a),
-                      vc ? NSStringFromClass([vc class]) : @"(无VC)",
                       (vc && vc.title) ? vc.title : @"(nil)",
+                      (ck == DDBalancePageLQT ? @"lqt_cell"
+                       : (ck == DDBalancePageBalance ? @"balance_cell" : @"无")),
                       (int)DDBalanceKindByDrill(a),
                       self.superview ? self.superview.bounds.size.width : -1.0,
-                      NSStringFromCGRect(self.frame));
+                      NSStringFromCGRect(self.frame),
+                      vc ? NSStringFromClass([vc class]) : @"(无VC)");
             }
             return;
         }
@@ -1803,6 +1794,14 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
             ![self respondsToSelector:@selector(scrollNumberSize)]) return;
         UIView *sn = [self scrollNumber];
         if (![sn isKindOfClass:[UIView class]]) return;
+        // 几何加固（必须放在改动任何 frame 之前，否则"拦了但宽度已经改过"，等于没拦）：
+        //   钱包页金额行在 cell 内（实测父宽 180.67 / 127.67）。父容器接近全宽的必然是
+        //   零钱/零钱通详情页那种居中的大数字，一旦右对齐就会被推到屏幕边上。
+        UIView *sp = self.superview;
+        if (!sp) return;
+        CGFloat spW = sp.bounds.size.width;
+        CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
+        if (screenW > 0 && spW > screenW * 0.7) return;
         CGSize sz = [self scrollNumberSize];
         if (sz.width <= 0 || sz.height <= 0) return;
         // ① 滚轮尺寸按新值重设（原点保持不变）
@@ -1812,14 +1811,6 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         // ② 容器按新的滚轮尺寸重排内部
         if ([self respondsToSelector:@selector(updateScrollNumber)]) [self updateScrollNumber];
         // ③ 自身右对齐：右缘钉在 superview 宽度 - 箭头区(28)，数字往左长 → 永远压不到箭头
-        UIView *sp = self.superview;
-        if (!sp) return;
-        CGFloat spW = sp.bounds.size.width;
-        // 几何加固：钱包页金额行在 cell 内（实测父宽 180.67）。父容器接近全宽的必然是
-        //   零钱/零钱通详情页那种居中的大数字，一旦右对齐就会被推到屏幕边上。
-        //   title 取不到 VC 时，靠这条兜住，杜绝"钱包页好了、别处全漂了"。
-        CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
-        if (screenW > 0 && spW > screenW * 0.7) return;
         CGRect selfF = self.frame;
         CGFloat newX = spW - kDDWalletArrowGap - sz.width;
         // 兜底：算出的位置越过左边界（或 superview 宽度异常）就退化为"右缘原地不动"
