@@ -221,6 +221,8 @@
 - (unsigned long long)getNumber;
 - (void)defaultNumber:(unsigned long long)a0;
 - (void)updateNumber:(unsigned long long)a0;
+- (id)container;      // dump 中存在：外层容器（TimeoutNumber）
+- (id)clipView;
 @end
 
 @class WCPayTableCellViewDataView;
@@ -1497,57 +1499,47 @@ static DDBalancePageKind DDBalanceCellKindOf(id sn) {
 //      subviews[0].subviews[1]，要求它是 UILabel，且 text 以 @"零钱通" 开头
 // 这就是"钱包页的数字在按钮里面"的真实结构 —— 定位靠层级下钻 + 中文标题，
 // 与响应链上的 accessibilityIdentifier 无关。此前只认 cell/VC 的做法确实判偏了。
-static UIViewController *DDTopViewController(void) {
+// 从 view 沿响应链上溯，找它所属的 UIViewController。
+//   刻意不用 UIApplication.keyWindow / .windows —— 这两个 API 自 iOS 13 / 15 起被标记废弃，
+//   Theos 带 -Werror 会直接编译失败。而响应链上溯拿到的正是"这个 view 真正所属的页面"，
+//   比取全局当前 VC 更准（不会把别的场景的 VC 误当成当前页）。
+static UIViewController *DDOwningViewController(id v) {
     @try {
-        UIWindow *win = [UIApplication sharedApplication].keyWindow;
-        if (!win) {   // iOS 13+ 多场景时 keyWindow 可能为 nil，退回遍历
-            for (UIWindow *it in [UIApplication sharedApplication].windows) {
-                if (it.isKeyWindow) { win = it; break; }
-            }
-            if (!win) win = [UIApplication sharedApplication].windows.firstObject;
+        if (![v isKindOfClass:[UIView class]]) return nil;
+        UIResponder *r = (UIResponder *)v;
+        for (int i = 0; i < 32 && r; i++) {
+            if ([r isKindOfClass:[UIViewController class]]) return (UIViewController *)r;
+            r = r.nextResponder;
         }
-        UIViewController *root = win.rootViewController;
-        UIViewController *cur = root;
-        for (int i = 0; i < 12 && cur; i++) {
-            if ([cur isKindOfClass:[UINavigationController class]]) {
-                UIViewController *v = ((UINavigationController *)cur).visibleViewController;
-                if (!v || v == cur) break;
-                cur = v;
-            } else if ([cur isKindOfClass:[UITabBarController class]]) {
-                UIViewController *v = ((UITabBarController *)cur).selectedViewController;
-                if (!v || v == cur) break;
-                cur = v;
-            } else if (cur.presentedViewController && !cur.presentedViewController.isBeingDismissed) {
-                cur = cur.presentedViewController;
-            } else break;
-        }
-        return cur ?: root;
     } @catch (NSException *e) {}
     return nil;
 }
 
-// 当前页面是否为 Kinda 钱包页（爱锋判定复刻，0xbe68c / 0xbe8b0）
-//   带 0.25s 结果缓存：currentNumber 会被宽度计算高频调用，不能每次都遍历 VC 层级。
-static BOOL DDIsWalletKindaPage(void) {
+// 该 view 所属页面是否为 Kinda 动态布局页（爱锋判定：VC 是 KindaViewController）
+static BOOL DDIsKindaPageFor(id v) {
     static Class kk = Nil;
     static BOOL kkLoaded = NO;
-    static NSTimeInterval lastT = -1;
-    static BOOL lastV = NO;
-    NSTimeInterval now = [[NSProcessInfo processInfo] systemUptime];
-    if (lastT >= 0 && (now - lastT) < 0.25) return lastV;
-    BOOL r = NO;
+    if (!kkLoaded) { kk = NSClassFromString(@"KindaViewController"); kkLoaded = YES; }
+    if (!kk) return NO;
     @try {
-        if (!kkLoaded) { kk = NSClassFromString(@"KindaViewController"); kkLoaded = YES; }
-        UIViewController *vc = DDTopViewController();
-        if (vc) {
-            if (!kk || [vc isKindOfClass:kk]) {
-                NSString *t = [vc respondsToSelector:@selector(title)] ? vc.title : nil;
-                r = [t isEqualToString:@"钱包"];
-            }
-        }
+        UIViewController *vc = DDOwningViewController(v);
+        return vc ? [vc isKindOfClass:kk] : NO;
     } @catch (NSException *e) {}
-    lastT = now; lastV = r;
-    return r;
+    return NO;
+}
+
+// 是否为 Kinda 钱包页（爱锋 0xbe69c / 0xbe8b0：KindaViewController 且 title 严格等于"钱包"）。
+//   仅用于诊断日志；真机 title 可能取不到，所以判定本身不依赖它。
+static BOOL DDIsWalletKindaPageFor(id v) {
+    @try {
+        UIViewController *vc = DDOwningViewController(v);
+        if (!vc) return NO;
+        Class kk = NSClassFromString(@"KindaViewController");
+        if (kk && ![vc isKindOfClass:kk]) return NO;
+        NSString *t = [vc respondsToSelector:@selector(title)] ? vc.title : nil;
+        return [t isEqualToString:@"钱包"];
+    } @catch (NSException *e) {}
+    return NO;
 }
 
 // 爱锋 isLQT 复刻（0xbe820）：上溯 3 层到整行，取 subviews[0].subviews[1] 的标题 label，
@@ -1573,17 +1565,41 @@ static DDBalancePageKind DDBalanceKindByDrill(id v) {
         if (![cand respondsToSelector:@selector(text)]) return DDBalancePageNone;
         NSString *t = ((UILabel *)cand).text;
         if (!t.length) return DDBalancePageNone;
+        if (![t hasPrefix:@"零钱"]) return DDBalancePageNone;   // 连"零钱"都不是 → 不是钱包页金额行
         return [t hasPrefix:@"零钱通"] ? DDBalancePageLQT : DDBalancePageBalance;
     } @catch (NSException *e) {}
     return DDBalancePageNone;
 }
 
 // 统一判定：钱包页走爱锋式下钻（更准），下钻失败退回本文件原有的 cell/VC 判定。
+// 判定基准归一化：ScrollNumber 在 dump 里是 NSObject，运行时未必是 UIView。
+//   若传入的对象不是 UIView，就改用它持有的 container（外层 TimeoutNumber）或 superview
+//   作为判定基准 —— 否则所有 isKindOfClass:[UIView class] 的守卫都会直接返回"未命中"。
+static id DDBalanceAnchorOf(id v) {
+    if ([v isKindOfClass:[UIView class]]) return v;
+    @try {
+        if ([v respondsToSelector:@selector(container)]) {
+            id c = [v container];
+            if ([c isKindOfClass:[UIView class]]) return c;
+        }
+        if ([v respondsToSelector:@selector(superview)]) {
+            id sp = [v superview];
+            if ([sp isKindOfClass:[UIView class]]) return sp;
+        }
+    } @catch (NSException *e) {}
+    return v;
+}
+
 static DDBalancePageKind DDBalanceResolveKind(id v) {
-    DDBalancePageKind k = DDBalancePageNone;
-    if (DDIsWalletKindaPage()) k = DDBalanceKindByDrill(v);
-    if (k == DDBalancePageNone) k = DDBalancePageKindOf(v);
-    return k;
+    // 爱锋式：所属 VC 是 Kinda 页就允许层级下钻区分零钱 / 零钱通。
+    //   title 严格等于"钱包"是爱锋的收紧条件，本机 title 未必取得到，故放宽为 Kinda 页即下钻；
+    //   下钻不中（结构对不上）就退回本文件原有的 cell/VC 判定，保证影响面不扩大。
+    id a = DDBalanceAnchorOf(v);
+    if (DDIsKindaPageFor(a)) {
+        DDBalancePageKind k = DDBalanceKindByDrill(a);
+        if (k != DDBalancePageNone) return k;
+    }
+    return DDBalancePageKindOf(a);
 }
 
 // 前向声明：DDClampFen 定义在本文件稍后（取目标值时要先钳位）
@@ -1741,7 +1757,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
                 DDLOG(@"[余额·发现] 链=%@ 命中=%@ 钱包页=%d cell=%@ frame=%@", chain,
                       (kind == DDBalancePageLQT ? @"零钱通"
                        : (kind == DDBalancePageBalance ? @"零钱" : @"未命中")),
-                      (int)DDIsWalletKindaPage(),
+                      (int)DDIsWalletKindaPageFor(self),
                       (ck == DDBalancePageLQT ? @"lqt_cell"
                        : (ck == DDBalancePageBalance ? @"balance_cell" : @"无")),
                       NSStringFromCGRect(self.frame));
