@@ -210,6 +210,12 @@
 - (id)scrollNumber;
 @end
 
+// Kinda 钱包页的最上游金额入口：持有 timeoutNumber，setMoney: 之后才做 Yoga measure，
+//   在这层改值布局算的就是新宽度；只在 TimeoutNumber 层改，Kinda 外层布局仍按旧宽度。
+@interface KindaMoneyLoadingView : UIView
+- (void)setMoney:(long long)money animated:(BOOL)animated;
+@end
+
 @class WCPayTableCellViewDataView;
 
 #pragma mark - 配置管理（接口）
@@ -1465,10 +1471,26 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     } @catch (NSException *e) {}
 }
 
-#pragma mark - 余额 / 零钱通改写（接管 TimeoutNumber 渲染）
-// 改外层容器 TimeoutNumber：它持有 scrollNumber 并负责尺寸/布局（isYogaRightAlignment、
-//   sizeThatFits: / scrollNumberSize）。改内层的 ScrollNumber 只换数字不换容器宽度，
-//   新值比原值宽时右溢顶格；从容器入口 updateNumber: 进去才会连带重算。
+#pragma mark - 余额 / 零钱通改写（Kinda 上游 setMoney: + 容器 TimeoutNumber）
+// 两条链路各管一段：KindaMoneyLoadingView.setMoney: 管钱包页（Kinda 动态布局，必须在
+//   measure 前改值），TimeoutNumber.updateNumber: 管服务页 / 详情页（布局固定，改容器即可）。
+//   两者值相同、幂等，重复命中不会叠加。
+
+// Kinda 钱包页走最上游：setMoney: 之后 Kinda 才做 Yoga measure，此时值已是新值，
+//   量出来的宽度就是对的（TimeoutNumber 层改值，Kinda 外层的 measure 早已完成，仍会右溢）。
+%hook KindaMoneyLoadingView
+- (void)setMoney:(long long)money animated:(BOOL)animated {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled) {
+            DDBalancePageKind kind = DDBalancePageKindOf(self);
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig((long long)DDClampFen(DDLingtongFenValue()), animated); return; }
+            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig((long long)DDClampFen(DDBalanceFenValue()), animated); return; }
+        }
+    } @catch (NSException *e) {}
+    %orig(money, animated);
+}
+%end
 
 %hook TimeoutNumber
 - (void)updateNumber:(unsigned long long)original {
