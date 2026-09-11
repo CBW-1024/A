@@ -1448,18 +1448,11 @@ static NSString *DDBalanceChainDescOf(id sn) {
     return s.length ? s : @"(链上无cell/VC)";
 }
 
-// 同一条链只记一次，把各页面出现的 TimeoutNumber 一次性列全，不被高频 layout 刷爆。
-static NSMutableSet *DDBalanceSeenChains(void) {
-    static NSMutableSet *s = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = [NSMutableSet set]; });
-    return s;
-}
-
 // 每个 view 只记前 limit 次，用于看清同一处 frame 的逐次变化。
 static const void *kDDTNLogCount      = &kDDTNLogCount;      // 缩放日志节流
 static const void *kDDValLogCount     = &kDDValLogCount;     // 改值日志节流
-static const void *kDDTNChainLogged   = &kDDTNChainLogged;   // 该 view 是否已记过页面链
+static const void *kDDTNLayoutCount   = &kDDTNLayoutCount;   // 布局日志节流
+static const void *kDDTNFixMissCount  = &kDDTNFixMissCount;  // 未修帧原因日志节流
 static BOOL DDLogTimes(id obj, const void *key, int limit) {
     @try {
         NSNumber *n = objc_getAssociatedObject(obj, key);
@@ -1603,19 +1596,34 @@ static DDBalancePageKind DDBalanceResolveKind(id v) {
 }
 
 // 修帧专用严格判定 —— 只认钱包页金额行，绝不做 VC 兜底（改值才用宽判定 DDBalanceResolveKind）。
-//   教训（2026-09-12 实测日志）：修帧若走 DDBalancePageKindOf 兜底，服务页钱包入口
-//   （链=[VC:WCPayMainViewControllerV2]，父w=128，x 8->54）、零钱/零钱通详情页的居中大数字
-//   （父w=414/366）都会被右对齐推到屏幕右侧 —— "钱包页好了，其他地方全漂了"。
-//   爱锋 0xbe624 的判定就是 KindaViewController + title=="钱包" + 层级下钻，从不认 VC。
+//   教训①（2026-09-12 日志）：修帧若走 DDBalancePageKindOf 兜底，服务页钱包入口
+//     （链=[VC:WCPayMainViewControllerV2]，父w=128，x 8->54）、零钱/零钱通详情页的居中大数字
+//     （父w=414/366）都会被右对齐推到屏幕右侧 —— "钱包页好了，其他地方全漂了"。
+//   教训②（同日）：爱锋 0xbe624 的 title 判据是 [[vc title] isEqual:@"钱包"]，但本机
+//     KindaViewController.title 并不等于"钱包"（日志 [余额·发现] 钱包页=0 实证），
+//     照搬会把钱包页自己拦掉 —— "修帧日志 0 条、钱包页又顶格"。故改为黑名单。
+// title 黑名单：钱包页 Kinda VC 的 title 在真机上并不等于"钱包"
+//   （2026-09-12 日志实证：钱包页 balance_cell / lqt_cell 那条 [余额·发现] 里 钱包页=0）。
+//   所以绝不能做"必须等于钱包"的正向比对 —— 那会把钱包页本身一并拦掉，
+//   表现为 [余额·修帧] 一条都没有（即上一版的状况）。改为只排除明确属于别处的页面。
+static BOOL DDIsOtherPageTitle(NSString *t) {
+    if (!t.length) return NO;                                        // 取不到 title 不拦
+    if ([t isEqualToString:@"服务"]) return YES;                       // 服务页
+    if ([t rangeOfString:@"零钱"].location  != NSNotFound) return YES; // 零钱 / 零钱明细 / 零钱通详情页
+    if ([t rangeOfString:@"明细"].location  != NSNotFound) return YES;
+    if ([t rangeOfString:@"支付"].location  != NSNotFound) return YES;
+    return NO;
+}
+
 static DDBalancePageKind DDBalanceFixKindFor(id v) {
     id a = DDBalanceAnchorOf(v);
-    if (!DDIsKindaPageFor(a)) return DDBalancePageNone;
+    if (!DDIsKindaPageFor(a)) return DDBalancePageNone;                 // 闸①  必须 Kinda 页
     UIViewController *vc = DDOwningViewController(a);
-    if (vc) {   // 能取到 title 时必须严格等于"钱包"：详情页是"零钱/零钱明细/零钱通"，服务页是"服务"
+    if (vc) {                                                            // 闸②  title 明确是别处 → 拦
         NSString *t = [vc respondsToSelector:@selector(title)] ? vc.title : nil;
-        if (t.length && ![t isEqualToString:@"钱包"]) return DDBalancePageNone;
+        if (DDIsOtherPageTitle(t)) return DDBalancePageNone;
     }
-    return DDBalanceKindByDrill(a);   // 下钻不中即不修，绝不兜底
+    return DDBalanceKindByDrill(a);   // 闸③  下钻不中即不修，绝不 VC 兜底
 }
 
 // 前向声明：DDClampFen 定义在本文件稍后（取目标值时要先钳位）
@@ -1757,31 +1765,38 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         if (!cfg.balanceEnabled) return;
         BOOL diag = cfg.diagEnabled;
         DDBalancePageKind kind = DDBalanceResolveKind(self);
-        // 诊断①：每个 view 首次 layout 时记一次所在页面链（同链全局去重），
-        //   用来看清除了钱包页，还有哪些页面带着 TimeoutNumber、它们命中的是哪个。
-        if (diag && !objc_getAssociatedObject(self, kDDTNChainLogged)) {
-            objc_setAssociatedObject(self, kDDTNChainLogged, @(1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            NSString *chain = DDBalanceChainDescOf(self);
-            NSMutableSet *seen = DDBalanceSeenChains();
-            BOOL fresh = NO;
-            @synchronized (seen) {
-                fresh = ![seen containsObject:chain];
-                if (fresh) [seen addObject:chain];
-            }
-            if (fresh) {
-                DDBalancePageKind ck = DDBalanceCellKindOf(self);
-                DDLOG(@"[余额·发现] 链=%@ 命中=%@ 钱包页=%d cell=%@ frame=%@", chain,
-                      (kind == DDBalancePageLQT ? @"零钱通"
-                       : (kind == DDBalancePageBalance ? @"零钱" : @"未命中")),
-                      (int)DDIsWalletKindaPageFor(self),
-                      (ck == DDBalancePageLQT ? @"lqt_cell"
-                       : (ck == DDBalancePageBalance ? @"balance_cell" : @"无")),
+        // 诊断①：每个 view 前 3 次 layout 都记。首次 layout 常常发生在挂载到视图树之前
+        //   （frame 全 0、链还没建好），只记一次会永远看不到钱包页金额行的真实结构。
+        //   带上父宽：钱包页金额行父宽约 180，详情页居中大数字父宽 414/366，一眼可分。
+        if (diag && DDLogTimes(self, kDDTNLayoutCount, 3)) {
+            DDBalancePageKind ck = DDBalanceCellKindOf(self);
+            DDLOG(@"[余额·布局] 链=%@ 命中=%@ 钱包页=%d cell=%@ frame=%@ 父w=%.2f",
+                  DDBalanceChainDescOf(self),
+                  (kind == DDBalancePageLQT ? @"零钱通"
+                   : (kind == DDBalancePageBalance ? @"零钱" : @"未命中")),
+                  (int)DDIsWalletKindaPageFor(self),
+                  (ck == DDBalancePageLQT ? @"lqt_cell"
+                   : (ck == DDBalancePageBalance ? @"balance_cell" : @"无")),
+                  NSStringFromCGRect(self.frame),
+                  self.superview ? self.superview.bounds.size.width : -1.0);
+        }
+        // 修帧用严格判定：只认钱包页金额行；上面的宽 kind 仅用于日志展示。
+        DDBalancePageKind fixKind = DDBalanceFixKindFor(self);
+        if (fixKind != DDBalancePageBalance && fixKind != DDBalancePageLQT) {
+            // 诊断①b：没修就把三道闸的状态打出来 —— 下一版不用再猜是哪道闸拦的。
+            if (diag && DDLogTimes(self, kDDTNFixMissCount, 2)) {
+                id a = DDBalanceAnchorOf(self);
+                UIViewController *vc = DDOwningViewController(a);
+                DDLOG(@"[余额·未修] Kinda=%d VC=%@ title=%@ 下钻=%d 父w=%.2f frame=%@",
+                      (int)DDIsKindaPageFor(a),
+                      vc ? NSStringFromClass([vc class]) : @"(无VC)",
+                      (vc && vc.title) ? vc.title : @"(nil)",
+                      (int)DDBalanceKindByDrill(a),
+                      self.superview ? self.superview.bounds.size.width : -1.0,
                       NSStringFromCGRect(self.frame));
             }
+            return;
         }
-        // 修帧用严格判定：只认钱包页金额行；上面的宽 kind 仅用于 [余额·发现] 日志展示。
-        DDBalancePageKind fixKind = DDBalanceFixKindFor(self);
-        if (fixKind != DDBalancePageBalance && fixKind != DDBalancePageLQT) return;
         unsigned long long want = 0;
         if (!DDBalanceWantFenFor(self, fixKind, &want)) return;
         if (![self respondsToSelector:@selector(scrollNumber)] ||
