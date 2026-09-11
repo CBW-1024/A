@@ -1413,6 +1413,60 @@ static DDBalancePageKind DDBalancePageKindOf(id sn) {
     return DDBalancePageNone;
 }
 
+#pragma mark - 余额顶格诊断工具（定位"顶没"与"闪几下"）
+// 描述 view 所在响应链上出现过的 cell 标识符与 VC 类名，用来分辨这个 TimeoutNumber
+// 究竟属于钱包页还是其他支付页面 —— "顶没"就是被不该命中的页面卷进了 frame 重设。
+static NSString *DDBalanceChainDescOf(id sn) {
+    NSMutableString *s = [NSMutableString string];
+    @try {
+        if (![sn isKindOfClass:[UIView class]]) return @"(非UIView)";
+        UIResponder *r = (UIResponder *)sn;
+        for (int depth = 0; depth < 24 && r; depth++) {
+            if ([r isKindOfClass:[UIView class]]) {
+                NSString *ai = ((UIView *)r).accessibilityIdentifier;
+                if (ai.length) [s appendFormat:@"[cell:%@]", ai];
+            }
+            if ([r isKindOfClass:[UIViewController class]]) {
+                [s appendFormat:@"[VC:%@]", NSStringFromClass([r class])];
+            }
+            r = r.nextResponder;
+        }
+    } @catch (NSException *e) {}
+    return s.length ? s : @"(链上无cell/VC)";
+}
+
+// 同一条链只记一次，把各页面出现的 TimeoutNumber 一次性列全，不被高频 layout 刷爆。
+static NSMutableSet *DDBalanceSeenChains(void) {
+    static NSMutableSet *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [NSMutableSet set]; });
+    return s;
+}
+
+// 每个 view 只记前 limit 次，用于看清同一处 frame 的逐次变化。
+static const void *kDDTNLogCount    = &kDDTNLogCount;    // 修帧日志节流
+static const void *kDDValLogCount   = &kDDValLogCount;   // 改值日志节流
+static const void *kDDTNChainLogged = &kDDTNChainLogged; // 该 view 是否已记过页面链
+static BOOL DDLogTimes(id obj, const void *key, int limit) {
+    @try {
+        NSNumber *n = objc_getAssociatedObject(obj, key);
+        NSInteger c = n ? [n integerValue] : 0;
+        objc_setAssociatedObject(obj, key, @(c + 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return c < limit;
+    } @catch (NSException *e) {}
+    return NO;
+}
+
+// 带容差的矩形相等判断。用于 frame 修正的幂等闸门：
+// 无条件 setFrame 会不断触发布局 dirty，被父布局重设回旧值后再改宽，来回拉锯即"闪几下"。
+// 浮点结果可能有极小抖动，故不能直接用 CGRectEqualToRect。
+static BOOL DDCGRectNear(CGRect a, CGRect b) {
+    return fabs(a.origin.x - b.origin.x)     < 0.01 &&
+           fabs(a.origin.y - b.origin.y)     < 0.01 &&
+           fabs(a.size.width  - b.size.width)  < 0.01 &&
+           fabs(a.size.height - b.size.height) < 0.01;
+}
+
 // 帧修正专用判定：只认钱包页零钱/零钱通行特有的 cell 标识符（Flex 实证），
 // 不认任何 VC，避免把微信支付总页（WCPayMainViewControllerV2 等）下其他页面的
 // TimeoutNumber 也卷进 frame 重设（那种布局不同，强行右对齐会把数字顶没）。
@@ -1498,8 +1552,18 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalancePageKindOf(self);
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); return; }
-            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); return; }
+            unsigned long long want = 0; BOOL rewrite = NO;
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue])          { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
+            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue])   { want = DDClampFen(DDBalanceFenValue());   rewrite = YES; }
+            // 诊断③：值改写链路（每个 view 前 3 次）——看清哪些页面被改了值、原值是多少。
+            if (rewrite) {
+                DDJokerHit(kind == DDBalancePageLQT ? @"余额改值·零钱通" : @"余额改值·零钱");
+                if (cfg.diagEnabled && DDLogTimes(self, kDDValLogCount, 3))
+                    DDLOG(@"[余额·改值] %@ 原=%llu 改=%llu 链=%@",
+                          (kind == DDBalancePageLQT ? @"零钱通" : @"零钱"),
+                          original, want, DDBalanceChainDescOf(self));
+                %orig(want); return;
+            }
         }
     } @catch (NSException *e) {}
     %orig(original);
@@ -1509,8 +1573,17 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalancePageKindOf(self);
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); return; }
-            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); return; }
+            unsigned long long want = 0; BOOL rewrite = NO;
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue])          { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
+            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue])   { want = DDClampFen(DDBalanceFenValue());   rewrite = YES; }
+            if (rewrite) {
+                DDJokerHit(kind == DDBalancePageLQT ? @"余额默认值·零钱通" : @"余额默认值·零钱");
+                if (cfg.diagEnabled && DDLogTimes(self, kDDValLogCount, 3))
+                    DDLOG(@"[余额·默认值] %@ 原=%llu 改=%llu 链=%@",
+                          (kind == DDBalancePageLQT ? @"零钱通" : @"零钱"),
+                          original, want, DDBalanceChainDescOf(self));
+                %orig(want); return;
+            }
         }
     } @catch (NSException *e) {}
     %orig(original);
@@ -1526,6 +1599,25 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (!cfg.balanceEnabled) return;
         DDBalancePageKind kind = DDBalanceCellKindOf(self);
+        BOOL diag = cfg.diagEnabled;
+        // 诊断①：每个 view 首次 layout 时记一次所在页面链（同链全局去重），
+        //   用来看清除了钱包页，还有哪些页面带着 TimeoutNumber、它们命中的是哪个 cell。
+        if (diag && !objc_getAssociatedObject(self, kDDTNChainLogged)) {
+            objc_setAssociatedObject(self, kDDTNChainLogged, @(1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            NSString *chain = DDBalanceChainDescOf(self);
+            NSMutableSet *seen = DDBalanceSeenChains();
+            BOOL fresh = NO;
+            @synchronized (seen) {
+                fresh = ![seen containsObject:chain];
+                if (fresh) [seen addObject:chain];
+            }
+            if (fresh) {
+                DDLOG(@"[余额·发现] 链=%@ 命中=%@ frame=%@", chain,
+                      (kind == DDBalancePageLQT ? @"lqt_cell"
+                       : (kind == DDBalancePageBalance ? @"balance_cell" : @"未命中")),
+                      NSStringFromCGRect(self.frame));
+            }
+        }
         if (kind != DDBalancePageBalance && kind != DDBalancePageLQT) return;
         BOOL on = (kind == DDBalancePageLQT) ? [cfg hasLingtongValue] : [cfg hasBalanceValue];
         if (!on) return;
@@ -1534,18 +1626,33 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         CGSize sz = [self scrollNumberSize];
         if (sz.width <= 0) return;
         UIView *sn = [self scrollNumber];
+        CGRect f0  = self.frame;
+        CGRect sf0 = sn ? sn.frame : CGRectZero;
+        BOOL changed = NO;
         if (sn) {
             CGRect sf = sn.frame;
             CGFloat sr = CGRectGetMaxX(sf);
             sf.size.width = sz.width;
             sf.origin.x = sr - sz.width;   // scrollNumber 右缘不动，数字往左长
-            sn.frame = sf;
+            // 幂等闸门：已等于目标就别再 setFrame。否则每轮 layout 都设一遍，会不断触发
+            // 布局 dirty，被父布局还原后再改宽，来回拉锯 —— 这正是钱包页"闪几下"的根源。
+            if (!DDCGRectNear(sn.frame, sf)) { sn.frame = sf; changed = YES; }
         }
         CGRect f = self.frame;
         CGFloat r = CGRectGetMaxX(f);
         f.size.width = sz.width;
         f.origin.x = r - sz.width;         // 自身右缘不动，向左扩宽
-        self.frame = f;
+        if (!DDCGRectNear(self.frame, f)) { self.frame = f; changed = YES; }
+        // 诊断②：每个 view 前 8 次，打印 frame 修正前后与是否真的落笔。
+        //   "实改=是"反复出现 → 父布局确实在还原 frame（真拉锯）；
+        //   后续变成"实改=否(已符合)" → 已收敛、不再触发新 layout，也就不该再闪。
+        if (diag && DDLogTimes(self, kDDTNLogCount, 8)) {
+            DDLOG(@"[余额·修帧] %@ sizeW=%.2f self.w %.2f->%.2f x %.2f->%.2f sn.w %.2f->%.2f 实改=%@",
+                  (kind == DDBalancePageLQT ? @"零钱通" : @"零钱"), sz.width,
+                  f0.size.width, f.size.width, f0.origin.x, f.origin.x,
+                  sf0.size.width, sn ? sn.frame.size.width : 0.0,
+                  changed ? @"是" : @"否(已符合)");
+        }
     } @catch (NSException *e) {}
 }
 %end
