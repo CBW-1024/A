@@ -198,6 +198,7 @@
 //   dump 里 ScrollNumber 写作 NSObject，运行时实为 UIView，故按 UIView 声明以便用 frame。
 @interface ScrollNumber : UIView
 - (unsigned long long)currentNumber;
+- (void)setCurrentNumber:(unsigned long long)a0;
 - (void)defaultNumber:(unsigned long long)a0;
 - (void)updateNumber:(unsigned long long)a0;
 - (id)container;      // dump 中存在：外层容器（TimeoutNumber）
@@ -1707,6 +1708,27 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
 //   ScrollNumber 的 scrollNumberSize / widthOfNumber: 都读 currentNumber 推算宽度，
 //   只改 setter 的话内部宽度按旧值算，容器与内容对不上 → 数字右溢盖箭头（顶格）。
 %hook ScrollNumber
+// 写入口③：property setter 直赋。服务页（WCPayMainViewControllerV2）的金额由
+//   WCPayWalletGetAllFunctionCgi 回调异步写入，Flash 真实值的正是这条未拦截的路径。
+//   与 currentNumber getter 的改写自洽：写入假值 → 重排按假值算宽 → getter 返回同值。
+- (void)setCurrentNumber:(unsigned long long)original {
+    unsigned long long v = original;
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled) {
+            DDBalancePageKind kind = DDBalanceResolveKind(self);
+            unsigned long long want = 0;
+            if (DDBalanceWantFenFor(self, kind, &want)) {
+                v = want;
+                if (cfg.diagEnabled && DDLogTimes(self, kDDValLogCount, 3))
+                    DDLOG(@"[余额·改值] %@ 直赋 原=%llu 改=%llu 链=%@",
+                          (kind == DDBalancePageLQT ? @"零钱通" : @"零钱"),
+                          original, want, DDBalanceChainDescOf(self));
+            }
+        }
+    } @catch (NSException *e) {}
+    %orig(v);
+}
 - (unsigned long long)currentNumber {
     unsigned long long orig = %orig;
     @try {
