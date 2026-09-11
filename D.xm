@@ -1602,6 +1602,22 @@ static DDBalancePageKind DDBalanceResolveKind(id v) {
     return DDBalancePageKindOf(a);
 }
 
+// 修帧专用严格判定 —— 只认钱包页金额行，绝不做 VC 兜底（改值才用宽判定 DDBalanceResolveKind）。
+//   教训（2026-09-12 实测日志）：修帧若走 DDBalancePageKindOf 兜底，服务页钱包入口
+//   （链=[VC:WCPayMainViewControllerV2]，父w=128，x 8->54）、零钱/零钱通详情页的居中大数字
+//   （父w=414/366）都会被右对齐推到屏幕右侧 —— "钱包页好了，其他地方全漂了"。
+//   爱锋 0xbe624 的判定就是 KindaViewController + title=="钱包" + 层级下钻，从不认 VC。
+static DDBalancePageKind DDBalanceFixKindFor(id v) {
+    id a = DDBalanceAnchorOf(v);
+    if (!DDIsKindaPageFor(a)) return DDBalancePageNone;
+    UIViewController *vc = DDOwningViewController(a);
+    if (vc) {   // 能取到 title 时必须严格等于"钱包"：详情页是"零钱/零钱明细/零钱通"，服务页是"服务"
+        NSString *t = [vc respondsToSelector:@selector(title)] ? vc.title : nil;
+        if (t.length && ![t isEqualToString:@"钱包"]) return DDBalancePageNone;
+    }
+    return DDBalanceKindByDrill(a);   // 下钻不中即不修，绝不兜底
+}
+
 // 前向声明：DDClampFen 定义在本文件稍后（取目标值时要先钳位）
 static unsigned long long DDClampFen(unsigned long long fen);
 
@@ -1763,9 +1779,11 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
                       NSStringFromCGRect(self.frame));
             }
         }
-        if (kind != DDBalancePageBalance && kind != DDBalancePageLQT) return;
+        // 修帧用严格判定：只认钱包页金额行；上面的宽 kind 仅用于 [余额·发现] 日志展示。
+        DDBalancePageKind fixKind = DDBalanceFixKindFor(self);
+        if (fixKind != DDBalancePageBalance && fixKind != DDBalancePageLQT) return;
         unsigned long long want = 0;
-        if (!DDBalanceWantFenFor(self, kind, &want)) return;
+        if (!DDBalanceWantFenFor(self, fixKind, &want)) return;
         if (![self respondsToSelector:@selector(scrollNumber)] ||
             ![self respondsToSelector:@selector(scrollNumberSize)]) return;
         UIView *sn = [self scrollNumber];
@@ -1782,6 +1800,11 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         UIView *sp = self.superview;
         if (!sp) return;
         CGFloat spW = sp.bounds.size.width;
+        // 几何加固：钱包页金额行在 cell 内（实测父宽 180.67）。父容器接近全宽的必然是
+        //   零钱/零钱通详情页那种居中的大数字，一旦右对齐就会被推到屏幕边上。
+        //   title 取不到 VC 时，靠这条兜住，杜绝"钱包页好了、别处全漂了"。
+        CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
+        if (screenW > 0 && spW > screenW * 0.7) return;
         CGRect selfF = self.frame;
         CGFloat newX = spW - kDDWalletArrowGap - sz.width;
         // 兜底：算出的位置越过左边界（或 superview 宽度异常）就退化为"右缘原地不动"
@@ -1791,7 +1814,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         // 诊断②：每个 view 前 8 次，打印右对齐决策前后的几何。
         if (diag && DDLogTimes(self, kDDTNLogCount, 8)) {
             DDLOG(@"[余额·修帧] %@ 父w=%.2f 尺寸=%.2fx%.2f x %.2f->%.2f 右缘 %.2f->%.2f 滚轮w %.2f->%.2f",
-                  (kind == DDBalancePageLQT ? @"零钱通" : @"零钱"),
+                  (fixKind == DDBalancePageLQT ? @"零钱通" : @"零钱"),
                   spW, sz.width, sz.height, selfF.origin.x, selfNew.origin.x,
                   selfF.origin.x + selfF.size.width, selfNew.origin.x + selfNew.size.width,
                   snF.size.width, sz.width);
