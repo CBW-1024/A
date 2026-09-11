@@ -1413,6 +1413,25 @@ static DDBalancePageKind DDBalancePageKindOf(id sn) {
     return DDBalancePageNone;
 }
 
+// 帧修正专用判定：只认钱包页零钱/零钱通行特有的 cell 标识符（Flex 实证），
+// 不认任何 VC，避免把微信支付总页（WCPayMainViewControllerV2 等）下其他页面的
+// TimeoutNumber 也卷进 frame 重设（那种布局不同，强行右对齐会把数字顶没）。
+static DDBalancePageKind DDBalanceCellKindOf(id sn) {
+    @try {
+        if (![sn isKindOfClass:[UIView class]]) return DDBalancePageNone;
+        UIResponder *r = (UIResponder *)sn;
+        for (int depth = 0; depth < 24 && r; depth++) {
+            if ([r isKindOfClass:[UIView class]]) {
+                NSString *ai = ((UIView *)r).accessibilityIdentifier;
+                if ([ai isEqualToString:@"lqt_cell"])    return DDBalancePageLQT;
+                if ([ai isEqualToString:@"balance_cell"]) return DDBalancePageBalance;
+            }
+            r = r.nextResponder;
+        }
+    } @catch (NSException *e) {}
+    return DDBalancePageNone;
+}
+
 static unsigned long long DDClampFen(unsigned long long fen) {
     const unsigned long long kMaxFen = 99999999999ULL;
     return fen > kMaxFen ? kMaxFen : fen;
@@ -1471,8 +1490,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
 // 参考爱锋助手 wechatku.dylib 反汇编：它 hook ScrollNumber 改值，并在 TimeoutNumber
 //   layoutSubviews 里用 [self scrollNumberSize] 按新值重测宽度，重设 scrollNumber 与自身
 //   frame（右缘不动、数字往左长）从而不顶格。顶格根因是原生 measure 出的 frame 仍是旧宽度，
-//   改值不重排 → 右溢盖箭头。此处复刻该 layoutSubviews 修正（判足仍用本文件的 cell 判定）。
-static const void *kDDTNRelayoutGuard = &kDDTNRelayoutGuard;
+//   改值不重排 → 右溢盖箭头。此处复刻该 layoutSubviews 修正（判定只用本文件的 wallet cell 标识符）。
 
 %hook TimeoutNumber
 - (void)updateNumber:(unsigned long long)original {
@@ -1498,44 +1516,37 @@ static const void *kDDTNRelayoutGuard = &kDDTNRelayoutGuard;
     %orig(original);
 }
 // 顶格修复：改值后原生 measure 出的 frame 仍是旧宽度，数字变宽向右溢出盖住箭头。
-//   此处按新值重测宽度（scrollNumberSize），重设 scrollNumber 与自身 frame 并保持右缘不动，
-//   数字往左长不压箭头。kDDTNRelayoutGuard 防止 updateScrollNumber 触发的 layout 重入。
+//   复刻爱锋 wechatku.dylib TimeoutNumber layoutSubviews（反汇编 0xbe624 确证）：它不调
+//   updateScrollNumber，而是直接读 scrollNumberSize 按新值重测宽度，重设 scrollNumber 与自身
+//   frame 并保持右缘不动、数字往左长，从而不压箭头。判定只用钱包页的 balance_cell/lqt_cell
+//   cell 标识符，绝不认 VC，避免把其他支付页面卷进来顶没。
 - (void)layoutSubviews {
     %orig;
-    if (objc_getAssociatedObject(self, kDDTNRelayoutGuard)) return;
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (!cfg.balanceEnabled) return;
-        DDBalancePageKind kind = DDBalancePageKindOf(self);
+        DDBalancePageKind kind = DDBalanceCellKindOf(self);
         if (kind != DDBalancePageBalance && kind != DDBalancePageLQT) return;
         BOOL on = (kind == DDBalancePageLQT) ? [cfg hasLingtongValue] : [cfg hasBalanceValue];
         if (!on) return;
-        if (![self respondsToSelector:@selector(updateScrollNumber)]) return;
         if (![self respondsToSelector:@selector(scrollNumberSize)]) return;
-        objc_setAssociatedObject(self, kDDTNRelayoutGuard, @(1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [self updateScrollNumber];
+        if (![self respondsToSelector:@selector(scrollNumber)]) return;
         CGSize sz = [self scrollNumberSize];
-        if (sz.width > 0) {
-            UIView *sn = nil;
-            if ([self respondsToSelector:@selector(scrollNumber)]) sn = [self scrollNumber];
-            if (sn) {
-                CGRect sf = sn.frame;
-                CGFloat sr = CGRectGetMaxX(sf);
-                sf.size.width = sz.width;
-                sf.origin.x = sr - sz.width;
-                sn.frame = sf;
-            }
-            [self updateScrollNumber];
-            CGRect f = self.frame;
-            CGFloat r = CGRectGetMaxX(f);
-            f.size.width = sz.width;
-            f.origin.x = r - sz.width;
-            self.frame = f;
+        if (sz.width <= 0) return;
+        UIView *sn = [self scrollNumber];
+        if (sn) {
+            CGRect sf = sn.frame;
+            CGFloat sr = CGRectGetMaxX(sf);
+            sf.size.width = sz.width;
+            sf.origin.x = sr - sz.width;   // scrollNumber 右缘不动，数字往左长
+            sn.frame = sf;
         }
-        objc_setAssociatedObject(self, kDDTNRelayoutGuard, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    } @catch (NSException *e) {
-        objc_setAssociatedObject(self, kDDTNRelayoutGuard, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
+        CGRect f = self.frame;
+        CGFloat r = CGRectGetMaxX(f);
+        f.size.width = sz.width;
+        f.origin.x = r - sz.width;         // 自身右缘不动，向左扩宽
+        self.frame = f;
+    } @catch (NSException *e) {}
 }
 %end
 
