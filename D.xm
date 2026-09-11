@@ -210,7 +210,17 @@
 - (void)updateScrollNumber;
 - (id)scrollNumber;
 - (CGSize)scrollNumberSize;
-- (CGSize)sizeThatFits:(CGSize)size;   // 原生存在：父布局/Yoga 靠它测量宽度
+@end
+
+// 爱锋 wechatku.dylib 反汇编确证（0xbecc4）：它改余额不是只改 setter，而是连 getter
+//   currentNumber 一起改 —— 因为 scrollNumberSize / widthOfNumber: 都读 currentNumber 来
+//   推算宽度，只改 setter 的话宽度仍按旧值算，容器与内容宽度不匹配 → 数字右溢顶格。
+//   dump 里 ScrollNumber 写作 NSObject，运行时实为 UIView，故按 UIView 声明以便用 frame。
+@interface ScrollNumber : UIView
+- (unsigned long long)currentNumber;
+- (unsigned long long)getNumber;
+- (void)defaultNumber:(unsigned long long)a0;
+- (void)updateNumber:(unsigned long long)a0;
 @end
 
 @class WCPayTableCellViewDataView;
@@ -1445,9 +1455,8 @@ static NSMutableSet *DDBalanceSeenChains(void) {
 }
 
 // 每个 view 只记前 limit 次，用于看清同一处 frame 的逐次变化。
-static const void *kDDTNLogCount      = &kDDTNLogCount;      // 修帧日志节流
+static const void *kDDTNLogCount      = &kDDTNLogCount;      // 缩放日志节流
 static const void *kDDValLogCount     = &kDDValLogCount;     // 改值日志节流
-static const void *kDDMeasureLogCount = &kDDMeasureLogCount; // 测量日志节流
 static const void *kDDTNChainLogged   = &kDDTNChainLogged;   // 该 view 是否已记过页面链
 static BOOL DDLogTimes(id obj, const void *key, int limit) {
     @try {
@@ -1459,15 +1468,6 @@ static BOOL DDLogTimes(id obj, const void *key, int limit) {
     return NO;
 }
 
-// 带容差的矩形相等判断。用于 frame 修正的幂等闸门：
-// 无条件 setFrame 会不断触发布局 dirty，被父布局重设回旧值后再改宽，来回拉锯即"闪几下"。
-// 浮点结果可能有极小抖动，故不能直接用 CGRectEqualToRect。
-static BOOL DDCGRectNear(CGRect a, CGRect b) {
-    return fabs(a.origin.x - b.origin.x)     < 0.01 &&
-           fabs(a.origin.y - b.origin.y)     < 0.01 &&
-           fabs(a.size.width  - b.size.width)  < 0.01 &&
-           fabs(a.size.height - b.size.height) < 0.01;
-}
 
 // 帧修正专用判定：只认钱包页零钱/零钱通行特有的 cell 标识符（Flex 实证），
 // 不认任何 VC，避免把微信支付总页（WCPayMainViewControllerV2 等）下其他页面的
@@ -1486,6 +1486,125 @@ static DDBalancePageKind DDBalanceCellKindOf(id sn) {
         }
     } @catch (NSException *e) {}
     return DDBalancePageNone;
+}
+
+#pragma mark - 钱包页判定（爱锋 wechatku.dylib 反汇编实证 0xbe624 / 0xbe820）
+// 爱锋完全不认 cell 标识符、也不认 WCPay* VC，它的判定是：
+//   1) 取当前 VC，要求 isKindOfClass: NSClassFromString(@"KindaViewController")
+//      —— 钱包页是 Kinda（服务端下发 JSON + Yoga）动态布局页
+//   2) 且 [[vc title] isEqual:@"钱包"]（严格相等）
+//   3) 区分零钱 / 零钱通：self.superview.superview.superview 之上取
+//      subviews[0].subviews[1]，要求它是 UILabel，且 text 以 @"零钱通" 开头
+// 这就是"钱包页的数字在按钮里面"的真实结构 —— 定位靠层级下钻 + 中文标题，
+// 与响应链上的 accessibilityIdentifier 无关。此前只认 cell/VC 的做法确实判偏了。
+static UIViewController *DDTopViewController(void) {
+    @try {
+        UIWindow *win = [UIApplication sharedApplication].keyWindow;
+        if (!win) {   // iOS 13+ 多场景时 keyWindow 可能为 nil，退回遍历
+            for (UIWindow *it in [UIApplication sharedApplication].windows) {
+                if (it.isKeyWindow) { win = it; break; }
+            }
+            if (!win) win = [UIApplication sharedApplication].windows.firstObject;
+        }
+        UIViewController *root = win.rootViewController;
+        UIViewController *cur = root;
+        for (int i = 0; i < 12 && cur; i++) {
+            if ([cur isKindOfClass:[UINavigationController class]]) {
+                UIViewController *v = ((UINavigationController *)cur).visibleViewController;
+                if (!v || v == cur) break;
+                cur = v;
+            } else if ([cur isKindOfClass:[UITabBarController class]]) {
+                UIViewController *v = ((UITabBarController *)cur).selectedViewController;
+                if (!v || v == cur) break;
+                cur = v;
+            } else if (cur.presentedViewController && !cur.presentedViewController.isBeingDismissed) {
+                cur = cur.presentedViewController;
+            } else break;
+        }
+        return cur ?: root;
+    } @catch (NSException *e) {}
+    return nil;
+}
+
+// 当前页面是否为 Kinda 钱包页（爱锋判定复刻，0xbe68c / 0xbe8b0）
+//   带 0.25s 结果缓存：currentNumber 会被宽度计算高频调用，不能每次都遍历 VC 层级。
+static BOOL DDIsWalletKindaPage(void) {
+    static Class kk = Nil;
+    static BOOL kkLoaded = NO;
+    static NSTimeInterval lastT = -1;
+    static BOOL lastV = NO;
+    NSTimeInterval now = [[NSProcessInfo processInfo] systemUptime];
+    if (lastT >= 0 && (now - lastT) < 0.25) return lastV;
+    BOOL r = NO;
+    @try {
+        if (!kkLoaded) { kk = NSClassFromString(@"KindaViewController"); kkLoaded = YES; }
+        UIViewController *vc = DDTopViewController();
+        if (vc) {
+            if (!kk || [vc isKindOfClass:kk]) {
+                NSString *t = [vc respondsToSelector:@selector(title)] ? vc.title : nil;
+                r = [t isEqualToString:@"钱包"];
+            }
+        }
+    } @catch (NSException *e) {}
+    lastT = now; lastV = r;
+    return r;
+}
+
+// 爱锋 isLQT 复刻（0xbe820）：上溯 3 层到整行，取 subviews[0].subviews[1] 的标题 label，
+//   文本以"零钱通"开头 → 零钱通行；否则视为零钱行。下钻失败返回 None 交调用方退回旧判定。
+static DDBalancePageKind DDBalanceKindByDrill(id v) {
+    @try {
+        UIView *x = (UIView *)v;
+        if (![x isKindOfClass:[UIView class]]) return DDBalancePageNone;
+        for (int i = 0; i < 3 && x.superview; i++) x = x.superview;
+        NSArray *s1 = x.subviews;
+        if (s1.count < 1) return DDBalancePageNone;
+        UIView *box = s1[0];
+        if (![box isKindOfClass:[UIView class]]) return DDBalancePageNone;
+        NSArray *s2 = box.subviews;
+        if (s2.count < 1) return DDBalancePageNone;
+        Class lbCls = NSClassFromString(@"UILabel");
+        // 爱锋先看 subviews[1]，不是 UILabel 再退 subviews[0]
+        UIView *cand = (s2.count > 1) ? s2[1] : s2[0];
+        if (![cand isKindOfClass:[UIView class]]) return DDBalancePageNone;
+        if (lbCls && ![cand isKindOfClass:lbCls]) cand = s2[0];
+        if (![cand isKindOfClass:[UIView class]]) return DDBalancePageNone;
+        if (lbCls && ![cand isKindOfClass:lbCls]) return DDBalancePageNone;
+        if (![cand respondsToSelector:@selector(text)]) return DDBalancePageNone;
+        NSString *t = ((UILabel *)cand).text;
+        if (!t.length) return DDBalancePageNone;
+        return [t hasPrefix:@"零钱通"] ? DDBalancePageLQT : DDBalancePageBalance;
+    } @catch (NSException *e) {}
+    return DDBalancePageNone;
+}
+
+// 统一判定：钱包页走爱锋式下钻（更准），下钻失败退回本文件原有的 cell/VC 判定。
+static DDBalancePageKind DDBalanceResolveKind(id v) {
+    DDBalancePageKind k = DDBalancePageNone;
+    if (DDIsWalletKindaPage()) k = DDBalanceKindByDrill(v);
+    if (k == DDBalancePageNone) k = DDBalancePageKindOf(v);
+    return k;
+}
+
+// 前向声明：DDClampFen 定义在本文件稍后（取目标值时要先钳位）
+static unsigned long long DDClampFen(unsigned long long fen);
+
+// 取该 view 应改成的目标值（分）；不需要改写返回 NO。
+static BOOL DDBalanceWantFenFor(id v, DDBalancePageKind kind, unsigned long long *out) {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { *out = DDClampFen(DDLingtongFenValue()); return YES; }
+    if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { *out = DDClampFen(DDBalanceFenValue()); return YES; }
+    return NO;
+}
+
+// 钱包页金额行右侧箭头 + 间距占用的宽度。爱锋 0xbe780 硬编码 fmov d0, #-28.0
+//   （即 self 右缘 = superview 宽度 - 28），实测不压箭头，此处沿用同一常量。
+static const CGFloat kDDWalletArrowGap = 28.0;
+
+// frame 是否已够接近（避免重复赋值触发 Kinda 反复重排 → 闪烁）
+static BOOL DDBalanceFrameNear(CGRect a, CGRect b) {
+    return (fabs(a.origin.x - b.origin.x) < 0.5 && fabs(a.origin.y - b.origin.y) < 0.5 &&
+            fabs(a.size.width - b.size.width) < 0.5 && fabs(a.size.height - b.size.height) < 0.5);
 }
 
 static unsigned long long DDClampFen(unsigned long long fen) {
@@ -1553,7 +1672,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
-            DDBalancePageKind kind = DDBalancePageKindOf(self);
+            DDBalancePageKind kind = DDBalanceResolveKind(self);
             unsigned long long want = 0; BOOL rewrite = NO;
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue])          { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
             else if (kind == DDBalancePageBalance && [cfg hasBalanceValue])   { want = DDClampFen(DDBalanceFenValue());   rewrite = YES; }
@@ -1574,7 +1693,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
-            DDBalancePageKind kind = DDBalancePageKindOf(self);
+            DDBalancePageKind kind = DDBalanceResolveKind(self);
             unsigned long long want = 0; BOOL rewrite = NO;
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue])          { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
             else if (kind == DDBalancePageBalance && [cfg hasBalanceValue])   { want = DDClampFen(DDBalanceFenValue());   rewrite = YES; }
@@ -1590,46 +1709,24 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     } @catch (NSException *e) {}
     %orig(original);
 }
-// 治本：实测（DDJokerDiag-2）父布局每轮都把 self.frame 还原成按旧值 measure 的宽度
-//   （零钱/零钱通进来时恒为 41.33），所以在 layoutSubviews 里手改 frame 会被反复打回 → 钱包页闪烁。
-//   改为让原生自己 measure 出正确宽度：hook sizeThatFits:，命中钱包页 cell 时按 scrollNumberSize
-//   返回改写值对应的宽度（高度沿用原生）。父布局据此设 frame，我便不必再动手；layoutSubviews
-//   里的兜底修正也会因"已符合"而不再触发 → 拉锯消失、不闪。
-- (CGSize)sizeThatFits:(CGSize)size {
-    CGSize o = %orig(size);
-    @try {
-        DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (!cfg.balanceEnabled) return o;
-        DDBalancePageKind kind = DDBalanceCellKindOf(self);
-        if (kind != DDBalancePageBalance && kind != DDBalancePageLQT) return o;
-        BOOL on = (kind == DDBalancePageLQT) ? [cfg hasLingtongValue] : [cfg hasBalanceValue];
-        if (!on) return o;
-        if (![self respondsToSelector:@selector(scrollNumberSize)]) return o;
-        CGSize sz = [self scrollNumberSize];
-        if (sz.width <= 0) return o;
-        // 诊断④：父布局是否真的来问过宽度、原生给多少、我们改写后给多少。
-        if (cfg.diagEnabled && DDLogTimes(self, kDDMeasureLogCount, 8)) {
-            DDLOG(@"[余额·测量] %@ 入参w=%.2f 原生w=%.2f 改写w=%.2f",
-                  (kind == DDBalancePageLQT ? @"零钱通" : @"零钱"), size.width, o.width, sz.width);
-        }
-        return CGSizeMake(sz.width, o.height);
-    } @catch (NSException *e) {}
-    return o;
-}
-// 顶格修复：改值后原生 measure 出的 frame 仍是旧宽度，数字变宽向右溢出盖住箭头。
-//   复刻爱锋 wechatku.dylib TimeoutNumber layoutSubviews（反汇编 0xbe624 确证）：它不调
-//   updateScrollNumber，而是直接读 scrollNumberSize 按新值重测宽度，重设 scrollNumber 与自身
-//   frame 并保持右缘不动、数字往左长，从而不压箭头。判定只用钱包页的 balance_cell/lqt_cell
-//   cell 标识符，绝不认 VC，避免把其他支付页面卷进来顶没。
+// 顶格修复 —— 完整复刻爱锋 wechatku.dylib TimeoutNumber layoutSubviews（反汇编 0xbe624 确证）。
+// 它做的是三步，缺一不可：
+//   1) [sn setFrame:] 原点不变、尺寸换成 scrollNumberSize —— 滚轮按"新值"的正确尺寸重设
+//   2) [self updateScrollNumber]                         —— 容器按新滚轮尺寸重排内部（确证有调）
+//   3) [self setFrame:] x = superview 宽度 - 28 - 宽度    —— 右缘钉死在箭头左侧，数字往左长
+// 前提：scrollNumberSize 必须按改后的值算，所以必须同时 hook currentNumber getter
+//   （见下方 %hook ScrollNumber）。只改 setter 时宽度仍按旧值算，光改 frame 救不回来 ——
+//   这正是此前几版"还是顶格"的根因。
+// 判定改用爱锋式：当前 VC 是 KindaViewController 且 title == "钱包"，再层级下钻区分零钱/零钱通。
 - (void)layoutSubviews {
     %orig;
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (!cfg.balanceEnabled) return;
-        DDBalancePageKind kind = DDBalanceCellKindOf(self);
         BOOL diag = cfg.diagEnabled;
+        DDBalancePageKind kind = DDBalanceResolveKind(self);
         // 诊断①：每个 view 首次 layout 时记一次所在页面链（同链全局去重），
-        //   用来看清除了钱包页，还有哪些页面带着 TimeoutNumber、它们命中的是哪个 cell。
+        //   用来看清除了钱包页，还有哪些页面带着 TimeoutNumber、它们命中的是哪个。
         if (diag && !objc_getAssociatedObject(self, kDDTNChainLogged)) {
             objc_setAssociatedObject(self, kDDTNChainLogged, @(1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             NSString *chain = DDBalanceChainDescOf(self);
@@ -1640,48 +1737,95 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
                 if (fresh) [seen addObject:chain];
             }
             if (fresh) {
-                DDLOG(@"[余额·发现] 链=%@ 命中=%@ frame=%@", chain,
-                      (kind == DDBalancePageLQT ? @"lqt_cell"
-                       : (kind == DDBalancePageBalance ? @"balance_cell" : @"未命中")),
+                DDBalancePageKind ck = DDBalanceCellKindOf(self);
+                DDLOG(@"[余额·发现] 链=%@ 命中=%@ 钱包页=%d cell=%@ frame=%@", chain,
+                      (kind == DDBalancePageLQT ? @"零钱通"
+                       : (kind == DDBalancePageBalance ? @"零钱" : @"未命中")),
+                      (int)DDIsWalletKindaPage(),
+                      (ck == DDBalancePageLQT ? @"lqt_cell"
+                       : (ck == DDBalancePageBalance ? @"balance_cell" : @"无")),
                       NSStringFromCGRect(self.frame));
             }
         }
         if (kind != DDBalancePageBalance && kind != DDBalancePageLQT) return;
-        BOOL on = (kind == DDBalancePageLQT) ? [cfg hasLingtongValue] : [cfg hasBalanceValue];
-        if (!on) return;
-        if (![self respondsToSelector:@selector(scrollNumberSize)]) return;
-        if (![self respondsToSelector:@selector(scrollNumber)]) return;
-        CGSize sz = [self scrollNumberSize];
-        if (sz.width <= 0) return;
+        unsigned long long want = 0;
+        if (!DDBalanceWantFenFor(self, kind, &want)) return;
+        if (![self respondsToSelector:@selector(scrollNumber)] ||
+            ![self respondsToSelector:@selector(scrollNumberSize)]) return;
         UIView *sn = [self scrollNumber];
-        CGRect f0  = self.frame;
-        CGRect sf0 = sn ? sn.frame : CGRectZero;
-        BOOL changed = NO;
-        if (sn) {
-            CGRect sf = sn.frame;
-            CGFloat sr = CGRectGetMaxX(sf);
-            sf.size.width = sz.width;
-            sf.origin.x = sr - sz.width;   // scrollNumber 右缘不动，数字往左长
-            // 幂等闸门：已等于目标就别再 setFrame。否则每轮 layout 都设一遍，会不断触发
-            // 布局 dirty，被父布局还原后再改宽，来回拉锯 —— 这正是钱包页"闪几下"的根源。
-            if (!DDCGRectNear(sn.frame, sf)) { sn.frame = sf; changed = YES; }
-        }
-        CGRect f = self.frame;
-        CGFloat r = CGRectGetMaxX(f);
-        f.size.width = sz.width;
-        f.origin.x = r - sz.width;         // 自身右缘不动，向左扩宽
-        if (!DDCGRectNear(self.frame, f)) { self.frame = f; changed = YES; }
-        // 诊断②：每个 view 前 8 次，打印 frame 修正前后与是否真的落笔。
-        //   "实改=是"反复出现 → 父布局确实在还原 frame（真拉锯）；
-        //   后续变成"实改=否(已符合)" → 已收敛、不再触发新 layout，也就不该再闪。
+        if (![sn isKindOfClass:[UIView class]]) return;
+        CGSize sz = [self scrollNumberSize];
+        if (sz.width <= 0 || sz.height <= 0) return;
+        // ① 滚轮尺寸按新值重设（原点保持不变）
+        CGRect snF = sn.frame;
+        CGRect snNew = CGRectMake(snF.origin.x, snF.origin.y, sz.width, sz.height);
+        if (!DDBalanceFrameNear(snF, snNew)) sn.frame = snNew;
+        // ② 容器按新的滚轮尺寸重排内部
+        if ([self respondsToSelector:@selector(updateScrollNumber)]) [self updateScrollNumber];
+        // ③ 自身右对齐：右缘钉在 superview 宽度 - 箭头区(28)，数字往左长 → 永远压不到箭头
+        UIView *sp = self.superview;
+        if (!sp) return;
+        CGFloat spW = sp.bounds.size.width;
+        CGRect selfF = self.frame;
+        CGFloat newX = spW - kDDWalletArrowGap - sz.width;
+        // 兜底：算出的位置越过左边界（或 superview 宽度异常）就退化为"右缘原地不动"
+        if (spW <= 0 || newX < 0) newX = (selfF.origin.x + selfF.size.width) - sz.width;
+        CGRect selfNew = CGRectMake(newX, selfF.origin.y, sz.width, selfF.size.height);
+        if (!DDBalanceFrameNear(selfF, selfNew)) self.frame = selfNew;
+        // 诊断②：每个 view 前 8 次，打印右对齐决策前后的几何。
         if (diag && DDLogTimes(self, kDDTNLogCount, 8)) {
-            DDLOG(@"[余额·修帧] %@ sizeW=%.2f self.w %.2f->%.2f x %.2f->%.2f sn.w %.2f->%.2f 实改=%@",
-                  (kind == DDBalancePageLQT ? @"零钱通" : @"零钱"), sz.width,
-                  f0.size.width, f.size.width, f0.origin.x, f.origin.x,
-                  sf0.size.width, sn ? sn.frame.size.width : 0.0,
-                  changed ? @"是" : @"否(已符合)");
+            DDLOG(@"[余额·修帧] %@ 父w=%.2f 尺寸=%.2fx%.2f x %.2f->%.2f 右缘 %.2f->%.2f 滚轮w %.2f->%.2f",
+                  (kind == DDBalancePageLQT ? @"零钱通" : @"零钱"),
+                  spW, sz.width, sz.height, selfF.origin.x, selfNew.origin.x,
+                  selfF.origin.x + selfF.size.width, selfNew.origin.x + selfNew.size.width,
+                  snF.size.width, sz.width);
         }
     } @catch (NSException *e) {}
+}
+%end
+
+// 爱锋实证 0xbecc4：改余额必须连 currentNumber 这个 getter 一起改。
+//   ScrollNumber 的 scrollNumberSize / widthOfNumber: 都读 currentNumber 推算宽度，
+//   只改 setter 的话内部宽度按旧值算，容器与内容对不上 → 数字右溢盖箭头（顶格）。
+%hook ScrollNumber
+- (unsigned long long)currentNumber {
+    unsigned long long orig = %orig;
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (!cfg.balanceEnabled) return orig;
+        DDBalancePageKind kind = DDBalanceResolveKind(self);
+        unsigned long long want = 0;
+        if (!DDBalanceWantFenFor(self, kind, &want)) return orig;
+        if (cfg.diagEnabled && DDLogTimes(self, kDDValLogCount, 3))
+            DDLOG(@"[余额·取值] %@ 原=%llu 改=%llu 链=%@",
+                  (kind == DDBalancePageLQT ? @"零钱通" : @"零钱"), orig, want, DDBalanceChainDescOf(self));
+        return want;
+    } @catch (NSException *e) {}
+    return orig;
+}
+- (void)defaultNumber:(unsigned long long)original {
+    unsigned long long v = original;
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled) {
+            DDBalancePageKind kind = DDBalanceResolveKind(self);
+            unsigned long long want = 0;
+            if (DDBalanceWantFenFor(self, kind, &want)) v = want;
+        }
+    } @catch (NSException *e) {}
+    %orig(v);
+}
+- (void)updateNumber:(unsigned long long)original {
+    unsigned long long v = original;
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled) {
+            DDBalancePageKind kind = DDBalanceResolveKind(self);
+            unsigned long long want = 0;
+            if (DDBalanceWantFenFor(self, kind, &want)) v = want;
+        }
+    } @catch (NSException *e) {}
+    %orig(v);
 }
 %end
 
