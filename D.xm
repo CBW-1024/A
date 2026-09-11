@@ -111,6 +111,16 @@
 - (void)resetLayoutCache;
 @end
 
+// RichTextView：JokerApplyTextToRichView 以 id 接收并调用，类名在代码里不出现，
+//   但方法确在调用（编译期需要声明，删了会 "no known instance method"）。
+//   签名锚定 WeChat/RichTextView.h:131/132/146/223。
+@interface RichTextView : UIView
+- (id)getContent;
+- (void)setContent:(id)content;
+- (void)calculateAndUpdateFrame;
+- (void)forceDisplayInSync;
+@end
+
 @interface TextMessageCellView : CommonMessageCellView
 - (id)getRichTextView;
 - (id)getTextString;
