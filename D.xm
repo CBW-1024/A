@@ -210,10 +210,17 @@
 - (id)scrollNumber;
 @end
 
-// Kinda 钱包页的最上游金额入口：持有 timeoutNumber，setMoney: 之后才做 Yoga measure，
-//   在这层改值布局算的就是新宽度；只在 TimeoutNumber 层改，Kinda 外层布局仍按旧宽度。
-@interface KindaMoneyLoadingView : UIView
-- (void)setMoney:(long long)money animated:(BOOL)animated;
+// Yoga（YGLayout）是 Kinda 页面的布局引擎：TimeoutNumber 的 frame 由 Yoga measure 下发，
+//   改数值不会触发重算，必须 markDirty + applyLayout 才会按新值重新量宽。
+//   绑定为官方 yoga 集成（UIView.yoga），运行时用 respondsToSelector 探测兜底。
+@interface YGLayout : NSObject
+- (BOOL)isEnabled;
+- (BOOL)isLeaf;
+- (void)markDirty;
+- (void)applyLayoutPreservingOrigin:(BOOL)origin;
+@end
+@interface UIView (DDYoga)
+@property (nonatomic, readonly) YGLayout *yoga;
 @end
 
 @class WCPayTableCellViewDataView;
@@ -1422,6 +1429,27 @@ static unsigned long long DDClampFen(unsigned long long fen) {
     return fen > kMaxFen ? kMaxFen : fen;
 }
 
+// Yoga 重排：TimeoutNumber 的 frame 由 Yoga measure 下发，改值后必须显式重算。
+//   1) 内容节点 markDirty（仅 leaf measure 节点合法，isLeaf 即存在 measureFunc）
+//   2) 沿响应链找最外层启用了 Yoga 的节点（布局根），applyLayout 重算整棵子树
+static void DDYogaRelayout(id obj) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            UIView *start = (UIView *)obj;
+            if (!start || ![start respondsToSelector:@selector(yoga)]) return;
+            YGLayout *leaf = start.yoga;
+            if (leaf && leaf.isEnabled && leaf.isLeaf) [leaf markDirty];
+            UIView *root = nil;
+            for (UIView *v = start; v; v = v.superview) {
+                YGLayout *y = v.yoga;
+                if (y && y.isEnabled) root = v;
+            }
+            if (!root) return;
+            [root.yoga applyLayoutPreservingOrigin:YES];
+        } @catch (NSException *e) {}
+    });
+}
+
 static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fen) {
     if (!text.length) return text;
     // 金额由 ScrollNumber 以两位小数渲染，¥ 为独立 label，故匹配可选 ¥ + 两位小数数字。
@@ -1471,26 +1499,10 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
     } @catch (NSException *e) {}
 }
 
-#pragma mark - 余额 / 零钱通改写（Kinda 上游 setMoney: + 容器 TimeoutNumber）
-// 两条链路各管一段：KindaMoneyLoadingView.setMoney: 管钱包页（Kinda 动态布局，必须在
-//   measure 前改值），TimeoutNumber.updateNumber: 管服务页 / 详情页（布局固定，改容器即可）。
-//   两者值相同、幂等，重复命中不会叠加。
-
-// Kinda 钱包页走最上游：setMoney: 之后 Kinda 才做 Yoga measure，此时值已是新值，
-//   量出来的宽度就是对的（TimeoutNumber 层改值，Kinda 外层的 measure 早已完成，仍会右溢）。
-%hook KindaMoneyLoadingView
-- (void)setMoney:(long long)money animated:(BOOL)animated {
-    @try {
-        DDGlobalConfig *cfg = [DDGlobalConfig shared];
-        if (cfg.balanceEnabled) {
-            DDBalancePageKind kind = DDBalancePageKindOf(self);
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig((long long)DDClampFen(DDLingtongFenValue()), animated); return; }
-            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig((long long)DDClampFen(DDBalanceFenValue()), animated); return; }
-        }
-    } @catch (NSException *e) {}
-    %orig(money, animated);
-}
-%end
+#pragma mark - 余额 / 零钱通改写（容器 TimeoutNumber + Yoga 重排）
+// Flex 实证（WalletPageUI 层级树）：钱包页金额 = KindaUIView → TimeoutNumber → ScrollNumber，
+//   无 KindaMoneyLoadingView。TimeoutNumber 的 frame 由 Yoga measure 按原值下发（"3.41"=41.3pt），
+//   改值不重排 → 右溢顶格。故改值后调 DDYogaRelayout 让 Yoga 按新值重新 measure。
 
 %hook TimeoutNumber
 - (void)updateNumber:(unsigned long long)original {
@@ -1498,8 +1510,8 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalancePageKindOf(self);
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); return; }
-            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); return; }
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); DDYogaRelayout(self); return; }
+            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); DDYogaRelayout(self); return; }
         }
     } @catch (NSException *e) {}
     %orig(original);
@@ -1509,8 +1521,8 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen, NSString *hi
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalancePageKindOf(self);
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); return; }
-            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); return; }
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { %orig(DDClampFen(DDLingtongFenValue())); DDYogaRelayout(self); return; }
+            if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { %orig(DDClampFen(DDBalanceFenValue())); DDYogaRelayout(self); return; }
         }
     } @catch (NSException *e) {}
     %orig(original);
