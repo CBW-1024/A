@@ -53,7 +53,7 @@
 + (id)sectionWithHeader:(NSString *)header;
 + (id)sectionWithFooter:(NSString *)footer;
 + (id)sectionWithHeader:(NSString *)header Footer:(NSString *)footer;
-@property (nonatomic, copy) NSAttributedString *attributedFooterTitle;
+@property (nonatomic, copy) NSString *footerTitle;
 - (void)addCell:(id)arg1;
 @end
 
