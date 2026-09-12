@@ -10,10 +10,9 @@
 //  功能：聊天文字、图片、时间、转账改写；运动步数、好友数量；余额 / 零钱通自定义
 //  入口：微信 → 插件入口 → "DD小丑助手"设置页
 //
-//  诊断日志框架（DDLOG / DDJokerHit / 导出）为各功能共用的底座：
-//    · 余额功能已稳定，静默运行、不写日志
-//    · 新增功能时在自己逻辑里调用  DDJokerHit(@"标签") / DDLOG(@"...")
-//      即自动进入命中统计与"导出"日志，无需额外接线
+//  诊断日志（DDLOG / DDJokerHit / 设置页"导出"）默认关闭：仅在设置页"记录运行日志"打开后，
+//    才在 %ctor 加载处与代码中临时加的 DDJokerHit(@"标签") / DDLOG(@"...") 处记录，并进入命中
+//    统计与导出文件；其余功能模块静默运行，不写日志。
 // ============================================================
 
 
@@ -192,10 +191,10 @@
 - (CGSize)scrollNumberSize;
 @end
 
-// 爱锋 wechatku.dylib 反汇编确证（0xbecc4）：它改余额不是只改 setter，而是连 getter
-//   currentNumber 一起改 —— 因为 scrollNumberSize / widthOfNumber: 都读 currentNumber 来
-//   推算宽度，只改 setter 的话宽度仍按旧值算，容器与内容宽度不匹配 → 数字右溢顶格。
-//   dump 里 ScrollNumber 写作 NSObject，运行时实为 UIView，故按 UIView 声明以便用 frame。
+// ScrollNumber：钱包页金额数字容器，运行时为 UIView（dump 声明为 NSObject，故按 UIView 声明以访问 frame）。
+//   scrollNumberSize / widthOfNumber: 均以 currentNumber 推算文字宽度；改写余额须同时拦住
+//   三个写入口（updateNumber: / defaultNumber: / setCurrentNumber:）与 currentNumber getter，
+//   使容器宽度与改写值匹配，否则数字右溢顶格。
 @interface ScrollNumber : UIView
 - (unsigned long long)currentNumber;
 - (void)setCurrentNumber:(unsigned long long)a0;
@@ -981,10 +980,7 @@ static BOOL DDLabelOnTransferDetailVC(id v) {
 - (void)setText:(NSString *)text {
     NSString *ov = gDDLastTransferOverride;
     if (ov.length && [DDGlobalConfig shared].transferEnabled && [text hasPrefix:@"¥"] && DDLabelOnTransferDetailVC(self)) {
-        NSString *nt = [@"¥" stringByAppendingString:ov];
-        DDLOG(@"[详情页金额] setText 改写 -> %@", nt);
-        DDJokerHit(@"转账详情页金额");
-        %orig(nt);
+        %orig([@"¥" stringByAppendingString:ov]);
     } else {
         %orig;
     }
@@ -993,10 +989,7 @@ static BOOL DDLabelOnTransferDetailVC(id v) {
     NSString *ov = gDDLastTransferOverride;
     if (ov.length && [DDGlobalConfig shared].transferEnabled && attr.string.length && [attr.string hasPrefix:@"¥"] && DDLabelOnTransferDetailVC(self)) {
         NSDictionary *attrs = [attr attributesAtIndex:0 effectiveRange:NULL];
-        NSAttributedString *na = [[NSAttributedString alloc] initWithString:[@"¥" stringByAppendingString:ov] attributes:attrs];
-        DDLOG(@"[详情页金额] setAttributedText 改写 -> %@", na.string);
-        DDJokerHit(@"转账详情页金额");
-        %orig(na);
+        %orig([[NSAttributedString alloc] initWithString:[@"¥" stringByAppendingString:ov] attributes:attrs]);
     } else {
         %orig;
     }
@@ -1394,43 +1387,6 @@ static DDBalancePageKind DDBalancePageKindOf(id sn) {
     return DDBalancePageNone;
 }
 
-#pragma mark - 余额顶格诊断工具（定位"顶没"与"闪几下"）
-// 描述 view 所在响应链上出现过的 cell 标识符与 VC 类名，用来分辨这个 TimeoutNumber
-// 究竟属于钱包页还是其他支付页面 —— "顶没"就是被不该命中的页面卷进了 frame 重设。
-static NSString *DDBalanceChainDescOf(id sn) {
-    NSMutableString *s = [NSMutableString string];
-    @try {
-        if (![sn isKindOfClass:[UIView class]]) return @"(非UIView)";
-        UIResponder *r = (UIResponder *)sn;
-        for (int depth = 0; depth < 24 && r; depth++) {
-            if ([r isKindOfClass:[UIView class]]) {
-                NSString *ai = ((UIView *)r).accessibilityIdentifier;
-                if (ai.length) [s appendFormat:@"[cell:%@]", ai];
-            }
-            if ([r isKindOfClass:[UIViewController class]]) {
-                [s appendFormat:@"[VC:%@]", NSStringFromClass([r class])];
-            }
-            r = r.nextResponder;
-        }
-    } @catch (NSException *e) {}
-    return s.length ? s : @"(链上无cell/VC)";
-}
-
-// 每个 view 只记前 limit 次，用于看清同一处 frame 的逐次变化。
-static const void *kDDTNLogCount      = &kDDTNLogCount;      // 缩放日志节流
-static const void *kDDValLogCount     = &kDDValLogCount;     // 改值日志节流
-static const void *kDDTNLayoutCount   = &kDDTNLayoutCount;   // 布局日志节流
-static const void *kDDTNFixMissCount  = &kDDTNFixMissCount;  // 未修帧原因日志节流
-static BOOL DDLogTimes(id obj, const void *key, int limit) {
-    @try {
-        NSNumber *n = objc_getAssociatedObject(obj, key);
-        NSInteger c = n ? [n integerValue] : 0;
-        objc_setAssociatedObject(obj, key, @(c + 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        return c < limit;
-    } @catch (NSException *e) {}
-    return NO;
-}
-
 
 // 帧修正专用判定：只认钱包页零钱/零钱通行特有的 cell 标识符（Flex 实证），
 // 不认任何 VC，避免把微信支付总页（WCPayMainViewControllerV2 等）下其他页面的
@@ -1451,8 +1407,7 @@ static DDBalancePageKind DDBalanceCellKindOf(id sn) {
     return DDBalancePageNone;
 }
 
-// 统一判定：钱包页走爱锋式下钻（更准），下钻失败退回本文件原有的 cell/VC 判定。
-// 判定基准归一化：ScrollNumber 在 dump 里是 NSObject，运行时未必是 UIView。
+// 判定基准归一化：ScrollNumber 在部分 dump 里被标成 NSObject，运行时未必是 UIView。
 //   若传入的对象不是 UIView，就改用它持有的 container（外层 TimeoutNumber）或 superview
 //   作为判定基准 —— 否则所有 isKindOfClass:[UIView class] 的守卫都会直接返回"未命中"。
 static id DDBalanceAnchorOf(id v) {
@@ -1470,29 +1425,16 @@ static id DDBalanceAnchorOf(id v) {
     return v;
 }
 
-// 改值判定（宽）：走本文件原有的 cell / VC 规则。
-//   曾叠加过爱锋的"Kinda 页 + 上溯3层下钻"分支，但实测下钻在本机恒返回 None
-//   （多轮日志 [余额·未修] 下钻=0），该分支从未生效，已整体移除 —— 行为完全等价。
+// 改值判定（宽）：认 cell 标识符，也认详情页 / 服务页的 VC —— 这些页面的金额都要改，
+//   覆盖面要广。与下面修帧用的窄判定刻意分开：改值可以广，动 frame 必须窄。
 static DDBalancePageKind DDBalanceResolveKind(id v) {
     return DDBalancePageKindOf(DDBalanceAnchorOf(v));
 }
 
-// 修帧专用判定 —— 命中钱包页 cell 才修（改值才用宽判定 DDBalanceResolveKind）。
-//   教训①（2026-09-12 日志）：修帧若走 DDBalancePageKindOf 兜底，服务页钱包入口
-//     （链=[VC:WCPayMainViewControllerV2]，父w=128，x 8->54）、零钱/零钱通详情页的居中大数字
-//     （父w=414/366）都会被右对齐推到屏幕右侧 —— "钱包页好了，其他地方全漂了"。
-//   教训②（同日，重要）：爱锋 0xbe624 的"上溯 3 层 → subviews[0].subviews[1] → 文本前缀"
-//     层级下钻，在本机一律返回 0 —— 日志 [余额·未修] Kinda=1 title=钱包 下钻=0 实证。
-//     本机微信的 Kinda 层级与爱锋所处版本不同，下钻不能当主判据，只能兜底。
-//   教训③（同日）：不要拿"挂载前"的采样下结论。首次 layout 常发生在 view 加入视图树之前，
-//     那时 frame={{0,0},{0,0}}、链上无 cell/VC —— 据此一度误判 title 不等于"钱包"。
-//     钱包页的真实 title 就是"钱包"（见 [余额·未修] title=钱包）。
+// 修帧判定（窄）：只认 Flex 实证的两个钱包页单元格 balance_cell（零钱）/ lqt_cell（零钱通）。
+//   这两个 cell 的金额行右侧有箭头，改值后数字变长会右溢盖住它，才需要重排；
+//   服务页钱包入口、零钱 / 零钱通详情页的金额本来就不顶格，动它们的 frame 反而会被推歪。
 static DDBalancePageKind DDBalanceFixKindFor(id v) {
-    // 判定收敛到唯一可靠信号：Flex 实证的两个钱包页单元格
-    //   balance_cell（零钱，实测父w=180.67）/ lqt_cell（零钱通，实测父w=127.67）。
-    //   2026-09-12 日志实证：需要修帧的只有这两处，服务页入口、零钱/零钱通详情页本来就正常。
-    //   此前叠的 Kinda / title 两道闸反而是误判来源（Kinda=0 或 title 取不到就把该修的也拦了），
-    //   按实测结论全部去掉 —— 宁可判据单一，不要靠猜的层级条件。
     return DDBalanceCellKindOf(DDBalanceAnchorOf(v));
 }
 
@@ -1507,8 +1449,7 @@ static BOOL DDBalanceWantFenFor(id v, DDBalancePageKind kind, unsigned long long
     return NO;
 }
 
-// 钱包页金额行右侧箭头 + 间距占用的宽度。爱锋 0xbe780 硬编码 fmov d0, #-28.0
-//   （即 self 右缘 = superview 宽度 - 28），实测不压箭头，此处沿用同一常量。
+// 钱包页金额行右侧箭头 + 间距占用的宽度（实测不压箭头，沿用 28pt 右缘边距常量）。
 static const CGFloat kDDWalletArrowGap = 28.0;
 
 // frame 是否已够接近（避免重复赋值触发 Kinda 反复重排 → 闪烁）
@@ -1571,11 +1512,14 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
     } @catch (NSException *e) {}
 }
 
-#pragma mark - 余额 / 零钱通改写（容器 TimeoutNumber：改值 + layoutSubviews 修宽度）
-// 参考爱锋助手 wechatku.dylib 反汇编：它 hook ScrollNumber 改值，并在 TimeoutNumber
-//   layoutSubviews 里用 [self scrollNumberSize] 按新值重测宽度，重设 scrollNumber 与自身
-//   frame（右缘不动、数字往左长）从而不顶格。顶格根因是原生 measure 出的 frame 仍是旧宽度，
-//   改值不重排 → 右溢盖箭头。此处复刻该 layoutSubviews 修正（判定只用本文件的 wallet cell 标识符）。
+#pragma mark - 余额 / 零钱通改写
+// 金额由 TimeoutNumber（容器）内的 ScrollNumber（滚轮）渲染，两条链都要接管：
+//   · 改值 —— 三个写入口 updateNumber: / defaultNumber: / setCurrentNumber: 全部换成目标值，
+//     外加 currentNumber 读路径（原生按它推算宽度，只改写入口会导致宽度与新值不匹配）。
+//     三个写入口缺一不可：服务页金额由 WCPayWalletGetAllFunctionCgi 回调经 setCurrentNumber:
+//     异步直赋，漏了它就会先闪一下真实金额。
+//   · 修帧 —— 钱包页两个金额单元格右侧有箭头，数字变长后原生 frame 仍是旧宽度会右溢盖住，
+//     故在 layoutSubviews 里按 scrollNumberSize 重设滚轮与自身 frame，把右缘钉在箭头左侧。
 
 %hook TimeoutNumber
 - (void)updateNumber:(unsigned long long)original {
@@ -1586,15 +1530,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
             unsigned long long want = 0; BOOL rewrite = NO;
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue])          { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
             else if (kind == DDBalancePageBalance && [cfg hasBalanceValue])   { want = DDClampFen(DDBalanceFenValue());   rewrite = YES; }
-            // 诊断③：值改写链路（每个 view 前 3 次）——看清哪些页面被改了值、原值是多少。
-            if (rewrite) {
-                DDJokerHit(kind == DDBalancePageLQT ? @"余额改值·零钱通" : @"余额改值·零钱");
-                if (cfg.diagEnabled && DDLogTimes(self, kDDValLogCount, 3))
-                    DDLOG(@"[余额·改值] %@ 原=%llu 改=%llu 链=%@",
-                          (kind == DDBalancePageLQT ? @"零钱通" : @"零钱"),
-                          original, want, DDBalanceChainDescOf(self));
-                %orig(want); return;
-            }
+            if (rewrite) { %orig(want); return; }
         }
     } @catch (NSException *e) {}
     %orig(original);
@@ -1607,62 +1543,25 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
             unsigned long long want = 0; BOOL rewrite = NO;
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue])          { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
             else if (kind == DDBalancePageBalance && [cfg hasBalanceValue])   { want = DDClampFen(DDBalanceFenValue());   rewrite = YES; }
-            if (rewrite) {
-                DDJokerHit(kind == DDBalancePageLQT ? @"余额默认值·零钱通" : @"余额默认值·零钱");
-                if (cfg.diagEnabled && DDLogTimes(self, kDDValLogCount, 3))
-                    DDLOG(@"[余额·默认值] %@ 原=%llu 改=%llu 链=%@",
-                          (kind == DDBalancePageLQT ? @"零钱通" : @"零钱"),
-                          original, want, DDBalanceChainDescOf(self));
-                %orig(want); return;
-            }
+            if (rewrite) { %orig(want); return; }
         }
     } @catch (NSException *e) {}
     %orig(original);
 }
-// 顶格修复 —— 完整复刻爱锋 wechatku.dylib TimeoutNumber layoutSubviews（反汇编 0xbe624 确证）。
-// 它做的是三步，缺一不可：
-//   1) [sn setFrame:] 原点不变、尺寸换成 scrollNumberSize —— 滚轮按"新值"的正确尺寸重设
-//   2) [self updateScrollNumber]                         —— 容器按新滚轮尺寸重排内部（确证有调）
-//   3) [self setFrame:] x = superview 宽度 - 28 - 宽度    —— 右缘钉死在箭头左侧，数字往左长
-// 前提：scrollNumberSize 必须按改后的值算，所以必须同时 hook currentNumber getter
-//   （见下方 %hook ScrollNumber）。只改 setter 时宽度仍按旧值算，光改 frame 救不回来 ——
-//   这正是此前几版"还是顶格"的根因。
-// 判定：命中 balance_cell / lqt_cell 才修帧（见 DDBalanceFixKindFor）。
+// 顶格修复三步，缺一不可：
+//   1) [sn setFrame:] 原点不变、尺寸换成 scrollNumberSize —— 滚轮按新值的正确尺寸重设
+//   2) [self updateScrollNumber]                         —— 容器按新滚轮尺寸重排内部
+//   3) [self setFrame:] x = superview 宽度 - 28 - 宽度    —— 右缘钉在箭头左侧，数字往左长
+// 前提：scrollNumberSize 按改后的值算，所以下方 %hook ScrollNumber 必须连 currentNumber
+//   读路径一起改；只改写入口的话宽度仍按旧值算，光改 frame 救不回来。
 - (void)layoutSubviews {
     %orig;
     @try {
         DDGlobalConfig *cfg = [DDGlobalConfig shared];
         if (!cfg.balanceEnabled) return;
-        BOOL diag = cfg.diagEnabled;
-        DDBalancePageKind kind = DDBalanceResolveKind(self);
-        // 诊断①：每个 view 前 3 次 layout 都记。首次 layout 常常发生在挂载到视图树之前
-        //   （frame 全 0、链还没建好），只记一次会永远看不到钱包页金额行的真实结构。
-        //   带上父宽：钱包页金额行父宽约 180，详情页居中大数字父宽 414/366，一眼可分。
-        if (diag && DDLogTimes(self, kDDTNLayoutCount, 3)) {
-            DDBalancePageKind ck = DDBalanceCellKindOf(self);
-            DDLOG(@"[余额·布局] 链=%@ 命中=%@ cell=%@ frame=%@ 父w=%.2f",
-                  DDBalanceChainDescOf(self),
-                  (kind == DDBalancePageLQT ? @"零钱通"
-                   : (kind == DDBalancePageBalance ? @"零钱" : @"未命中")),
-                  (ck == DDBalancePageLQT ? @"lqt_cell"
-                   : (ck == DDBalancePageBalance ? @"balance_cell" : @"无")),
-                  NSStringFromCGRect(self.frame),
-                  self.superview ? self.superview.bounds.size.width : -1.0);
-        }
-        // 修帧判定：命中 balance_cell / lqt_cell 才修；上面的宽 kind 仅用于日志展示。
+        // 只命中钱包页两个金额单元格才修帧，其余页面一律不碰。
         DDBalancePageKind fixKind = DDBalanceFixKindFor(self);
-        if (fixKind != DDBalancePageBalance && fixKind != DDBalancePageLQT) {
-            // 诊断①b：没修就把判据状态打出来 —— 下一版不用再猜是卡在哪。
-            if (diag && DDLogTimes(self, kDDTNFixMissCount, 2)) {
-                DDBalancePageKind ck = DDBalanceCellKindOf(DDBalanceAnchorOf(self));
-                DDLOG(@"[余额·未修] cell=%@ 父w=%.2f frame=%@",
-                      (ck == DDBalancePageLQT ? @"lqt_cell"
-                       : (ck == DDBalancePageBalance ? @"balance_cell" : @"无")),
-                      self.superview ? self.superview.bounds.size.width : -1.0,
-                      NSStringFromCGRect(self.frame));
-            }
-            return;
-        }
+        if (fixKind != DDBalancePageBalance && fixKind != DDBalancePageLQT) return;
         unsigned long long want = 0;
         if (!DDBalanceWantFenFor(self, fixKind, &want)) return;
         if (![self respondsToSelector:@selector(scrollNumber)] ||
@@ -1692,24 +1591,15 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
         if (spW <= 0 || newX < 0) newX = (selfF.origin.x + selfF.size.width) - sz.width;
         CGRect selfNew = CGRectMake(newX, selfF.origin.y, sz.width, selfF.size.height);
         if (!DDBalanceFrameNear(selfF, selfNew)) self.frame = selfNew;
-        // 诊断②：每个 view 前 8 次，打印右对齐决策前后的几何。
-        if (diag && DDLogTimes(self, kDDTNLogCount, 8)) {
-            DDLOG(@"[余额·修帧] %@ 父w=%.2f 尺寸=%.2fx%.2f x %.2f->%.2f 右缘 %.2f->%.2f 滚轮w %.2f->%.2f",
-                  (fixKind == DDBalancePageLQT ? @"零钱通" : @"零钱"),
-                  spW, sz.width, sz.height, selfF.origin.x, selfNew.origin.x,
-                  selfF.origin.x + selfF.size.width, selfNew.origin.x + selfNew.size.width,
-                  snF.size.width, sz.width);
-        }
     } @catch (NSException *e) {}
 }
 %end
 
-// 爱锋实证 0xbecc4：改余额必须连 currentNumber 这个 getter 一起改。
-//   ScrollNumber 的 scrollNumberSize / widthOfNumber: 都读 currentNumber 推算宽度，
-//   只改 setter 的话内部宽度按旧值算，容器与内容对不上 → 数字右溢盖箭头（顶格）。
+// 读路径必须一起改：scrollNumberSize / widthOfNumber: 都读 currentNumber 推算宽度，
+//   只改写入口的话内部宽度仍按旧值算，容器与内容对不上 → 数字右溢盖箭头（顶格）。
 %hook ScrollNumber
 // 写入口③：property setter 直赋。服务页（WCPayMainViewControllerV2）的金额由
-//   WCPayWalletGetAllFunctionCgi 回调异步写入，Flash 真实值的正是这条未拦截的路径。
+//   WCPayWalletGetAllFunctionCgi 回调异步写入，闪出真实金额的就是这条未拦截的路径。
 //   与 currentNumber getter 的改写自洽：写入假值 → 重排按假值算宽 → getter 返回同值。
 - (void)setCurrentNumber:(unsigned long long)original {
     unsigned long long v = original;
@@ -1718,13 +1608,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalanceResolveKind(self);
             unsigned long long want = 0;
-            if (DDBalanceWantFenFor(self, kind, &want)) {
-                v = want;
-                if (cfg.diagEnabled && DDLogTimes(self, kDDValLogCount, 3))
-                    DDLOG(@"[余额·改值] %@ 直赋 原=%llu 改=%llu 链=%@",
-                          (kind == DDBalancePageLQT ? @"零钱通" : @"零钱"),
-                          original, want, DDBalanceChainDescOf(self));
-            }
+            if (DDBalanceWantFenFor(self, kind, &want)) v = want;
         }
     } @catch (NSException *e) {}
     %orig(v);
@@ -1737,9 +1621,6 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
         DDBalancePageKind kind = DDBalanceResolveKind(self);
         unsigned long long want = 0;
         if (!DDBalanceWantFenFor(self, kind, &want)) return orig;
-        if (cfg.diagEnabled && DDLogTimes(self, kDDValLogCount, 3))
-            DDLOG(@"[余额·取值] %@ 原=%llu 改=%llu 链=%@",
-                  (kind == DDBalancePageLQT ? @"零钱通" : @"零钱"), orig, want, DDBalanceChainDescOf(self));
         return want;
     } @catch (NSException *e) {}
     return orig;
@@ -1926,9 +1807,9 @@ static NSString *DDJokerWriteDiagLog(void) {
     id<UITableViewDelegate> _originalDelegate;
 }
 
-- (NSAttributedString *)dd_centeredFooterString:(NSString *)text {
+- (NSAttributedString *)dd_footerString:(NSString *)text {
     NSMutableParagraphStyle *ps = [[NSMutableParagraphStyle alloc] init];
-    ps.alignment = NSTextAlignmentCenter;
+    ps.alignment = NSTextAlignmentLeft;
     ps.lineBreakMode = NSLineBreakByWordWrapping;
     NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithString:text];
     [attr addAttribute:NSParagraphStyleAttributeName value:ps range:NSMakeRange(0, text.length)];
@@ -2008,7 +1889,7 @@ static NSString *DDJokerWriteDiagLog(void) {
     Class cellCls = %c(WCTableViewCellManager);
 
     WCTableViewSectionManager *chatSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"聊天设置"];
-    chatSection.attributedFooterTitle = [self dd_centeredFooterString:@"聊天文字 / 图片 / 时间 / 转账修改 为独立开关：长按消息弹窗菜单小丑按钮，文字改内容与引用标题、图片替换为相册所选图、时间改显示、转账改金额"];
+    chatSection.attributedFooterTitle = [self dd_footerString:@"聊天文字 / 图片 / 时间 / 转账修改 为独立开关：长按消息弹窗菜单小丑按钮，文字改内容与引用标题、图片替换为相册所选图、时间改显示、转账改金额"];
     [chatSection addCell:[cellCls switchCellForSel:@selector(textSwitchChanged:) target:self title:@"聊天文字修改" on:cfg.textEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(timeSwitchChanged:) target:self title:@"聊天时间修改" on:cfg.timeEnabled]];
@@ -2020,7 +1901,7 @@ static NSString *DDJokerWriteDiagLog(void) {
     [_tableViewManager addSection:chatSection];
 
     WCTableViewSectionManager *profileSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"资料设置"];
-    profileSection.attributedFooterTitle = [self dd_centeredFooterString:@"零钱余额修改开启后可自定义余额与零钱通金额。步数与好友数量修改后返回对应页面即生效（重新进入微信运动或通讯录、或下拉刷新），无需重启微信"];
+    profileSection.attributedFooterTitle = [self dd_footerString:@"零钱余额修改开启后可自定义余额与零钱通金额。步数与好友数量修改后返回对应页面即生效（重新进入微信运动或通讯录、或下拉刷新），无需重启微信"];
     [profileSection addCell:[cellCls switchCellForSel:@selector(balanceSwitchChanged:) target:self title:@"零钱余额修改" on:cfg.balanceEnabled]];
     if (cfg.balanceEnabled) {
         self.balanceField = [[UITextField alloc] init];
@@ -2078,7 +1959,7 @@ static NSString *DDJokerWriteDiagLog(void) {
     [_tableViewManager addSection:profileSection];
 
     WCTableViewSectionManager *diagSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"诊断日志"];
-    diagSection.attributedFooterTitle = [self dd_centeredFooterString:@"所有功能（文字/图片/时间/转账/步数/好友/余额）的运行时日志都记在这一处。排查问题：清空 → 复现 → 导出，日志含各 hook 命中次数、缓存盘点与运行时类结构"];
+    diagSection.attributedFooterTitle = [self dd_footerString:@"默认只在插件加载时记一条，各功能静默运行。排查时打开开关并在代码里临时加 DDLOG / DDJokerHit，复现后导出即可"];
     [diagSection addCell:[cellCls switchCellForSel:@selector(diagSwitchChanged:) target:self title:@"记录运行日志" on:cfg.diagEnabled]];
     UIButton *exportBtn = [self dd_actionButton:@"导出" action:@selector(exportDiagLogTapped:) x:0];
     UIButton *logClearBtn = [self dd_actionButton:@"清空" action:@selector(clearDiagLogTapped:) x:60];
@@ -2330,7 +2211,7 @@ static NSString *DDJokerWriteDiagLog(void) {
         _stepsEnabled = [def boolForKey:kDDFeatureStepsEnabled];
         _contactsEnabled = [def boolForKey:kDDFeatureContactsEnabled];
 
-        _diagEnabled = [def objectForKey:kDDFeatureDiagEnabled] ? [def boolForKey:kDDFeatureDiagEnabled] : YES;
+        _diagEnabled = [def objectForKey:kDDFeatureDiagEnabled] ? [def boolForKey:kDDFeatureDiagEnabled] : NO;
         _stepsValueString = [def stringForKey:kDDStepsValueStringKey];
         _contactsValue = [def stringForKey:kDDContactsCountValueKey];
         _balanceValue = [def stringForKey:kDDBalanceValueKey];
