@@ -53,7 +53,8 @@
 + (id)sectionWithHeader:(NSString *)header;
 + (id)sectionWithFooter:(NSString *)footer;
 + (id)sectionWithHeader:(NSString *)header Footer:(NSString *)footer;
-@property (nonatomic, copy) NSString *footerTitle;
+@property (retain, nonatomic) UIView *footerView;
+@property (nonatomic) double fFooterHeight;
 - (void)addCell:(id)arg1;
 @end
 
@@ -1829,6 +1830,33 @@ static NSString *DDJokerWriteDiagLog(void) {
     [self buildTable];
 }
 
+- (UIView *)dd_footerViewWithText:(NSString *)text {
+    CGFloat tableW = _tableViewManager.tableView.bounds.size.width;
+    if (tableW <= 0) tableW = [[UIScreen mainScreen] bounds].size.width;
+    CGFloat margin = 20.0;
+    CGFloat maxW = tableW - margin * 2.0;
+    if (maxW <= 0) maxW = tableW;
+
+    UIFont *font = [UIFont systemFontOfSize:13.0];
+    UIColor *color = [UIColor secondaryLabelColor];
+
+    CGSize size = [text boundingRectWithSize:CGSizeMake(maxW, CGFLOAT_MAX)
+                                     options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading
+                                  attributes:@{NSFontAttributeName: font}
+                                     context:nil].size;
+    CGFloat textH = ceil(size.height);
+
+    UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, tableW, textH + 16.0)];
+    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(margin, 8.0, maxW, textH)];
+    label.font = font;
+    label.textColor = color;
+    label.numberOfLines = 0;
+    label.lineBreakMode = NSLineBreakByWordWrapping;
+    label.text = text;
+    [container addSubview:label];
+    return container;
+}
+
 - (UIView *)inputRowWithField:(UITextField *)field action:(SEL)action placeholder:(NSString *)placeholder text:(NSString *)text {
     UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 220, 34)];
     container.backgroundColor = [UIColor clearColor];
@@ -1880,7 +1908,8 @@ static NSString *DDJokerWriteDiagLog(void) {
     Class cellCls = %c(WCTableViewCellManager);
 
     WCTableViewSectionManager *chatSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"聊天设置"];
-    chatSection.footerTitle = @"开启后长按聊天消息，在弹窗菜单点「小丑」即可修改：文字内容与引用、替换为相册图片、显示时间、转账金额";
+    chatSection.footerView = [self dd_footerViewWithText:@"开启后长按聊天消息，在弹窗菜单点「小丑」即可修改：文字内容与引用、替换为相册图片、显示时间、转账金额"];
+    chatSection.fFooterHeight = chatSection.footerView.frame.size.height;
     [chatSection addCell:[cellCls switchCellForSel:@selector(textSwitchChanged:) target:self title:@"聊天文字修改" on:cfg.textEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(timeSwitchChanged:) target:self title:@"聊天时间修改" on:cfg.timeEnabled]];
@@ -1892,7 +1921,8 @@ static NSString *DDJokerWriteDiagLog(void) {
     [_tableViewManager addSection:chatSection];
 
     WCTableViewSectionManager *profileSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"资料设置"];
-    profileSection.footerTitle = @"开启「零钱余额修改」后可自定义零钱与零钱通金额；步数、好友数量修改后回到对应页面即生效";
+    profileSection.footerView = [self dd_footerViewWithText:@"开启「零钱余额修改」后可自定义零钱与零钱通金额；步数、好友数量修改后回到对应页面即生效"];
+    profileSection.fFooterHeight = profileSection.footerView.frame.size.height;
     [profileSection addCell:[cellCls switchCellForSel:@selector(balanceSwitchChanged:) target:self title:@"零钱余额修改" on:cfg.balanceEnabled]];
     if (cfg.balanceEnabled) {
         self.balanceField = [[UITextField alloc] init];
@@ -1950,7 +1980,8 @@ static NSString *DDJokerWriteDiagLog(void) {
     [_tableViewManager addSection:profileSection];
 
     WCTableViewSectionManager *diagSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"诊断日志"];
-    diagSection.footerTitle = @"默认仅在插件启动时记录一条。排查问题时打开「记录运行日志」，复现后点下方「导出日志」即可";
+    diagSection.footerView = [self dd_footerViewWithText:@"默认仅在插件启动时记录一条。排查问题时打开「记录运行日志」，复现后点下方「导出日志」即可"];
+    diagSection.fFooterHeight = diagSection.footerView.frame.size.height;
     [diagSection addCell:[cellCls switchCellForSel:@selector(diagSwitchChanged:) target:self title:@"记录运行日志" on:cfg.diagEnabled]];
     UIButton *exportBtn = [self dd_actionButton:@"导出" action:@selector(exportDiagLogTapped:) x:0];
     UIButton *logClearBtn = [self dd_actionButton:@"清空" action:@selector(clearDiagLogTapped:) x:60];
