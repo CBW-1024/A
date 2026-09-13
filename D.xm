@@ -15,10 +15,12 @@
 //
 //  功能二 · 单聊联系人头像替换
 //    总开关：设置页「自定义用户头像」→「备注用户头像」。
-//    入口：单聊「聊天信息」页(AddContactToChatRoomViewController)第一个分组内插入「自定义头像」开关，
-//      打开即调起微信相册选图并裁剪，关闭则删除本地图片。
+//    入口：单聊「聊天信息」页(AddContactToChatRoomViewController)第一个分组首行插入「自定义头像」开关，
+//      打开即调起系统相册选图并裁剪，关闭则删除本地图片。
 //      该 VC 的表格是 MMTableViewInfo，它继承 WCTableViewManager(MMTableViewInfo.h:1)，
 //      所以直接复用 WCTableViewSectionManager / WCTableViewCellManager 建行。
+//      开关是自建 UISwitch + addTarget 绑定 action：微信的 switchCellForSel:target:title:on:
+//      在本版本不回调传入的 sel（日志实证），故不能用它承载点击。
 //    存储：Documents/DDAvatar/<userName>.png，按用户名一一对应，不额外维护映射表。
 //    显示：hook MMHeadImageView 的三个写图入口，命中本地图就替换
 //      updateHeadImage:            (MMHeadImageView.h:66)
@@ -29,8 +31,8 @@
 //  诊断日志（DDLOG / DDJokerHit / 设置页「导出日志」）默认关闭：
 //    仅在设置页打开「记录运行日志」后，才在插件加载处与各功能 hook 命中处记录，
 //    并进入命中统计与导出文件；其余时候各模块静默运行，不写日志。
-//    聊天详情页的「自定义头像」开关由哪个入口创建（reloadTableData / viewWillAppear）
-//    会写进日志，便于定位创建方法；导出文件为 Documents/DDProfileDiag.log。
+//    开关由 viewWillAppear 入口创建（日志实证该 VC 不走 reloadTableData），入口名写进日志；
+//    导出文件为 Documents/DDProfileDiag.log。
 // ============================================================
 
 
@@ -63,20 +65,17 @@ static void DDShowErrorToast(NSString *text) {
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
 @end
 
+// 只声明本插件实际用到的两个构造器：设置页开关用 switchCellForSel，
+// 其余行（清理按钮、导出日志、头像开关）统一走 normalCellForSel 的 rightView 版本。
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)sel target:(id)target title:(id)title on:(BOOL)on;
-+ (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightValue:(id)rightValue;
-+ (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightValue:(id)rightValue rightImage:(id)rightImage;
 + (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightView:(id)rightView;
 @property (nonatomic, retain) id userInfo;
 @end
 
 @interface WCTableViewSectionManager : NSObject
 + (id)sectionWithHeader:(NSString *)header;
-+ (id)sectionWithFooter:(NSString *)footer;
-+ (id)sectionWithHeader:(NSString *)header Footer:(NSString *)footer;
 @property (nonatomic, copy) NSString *footerTitle;
-@property (nonatomic, retain) id userInfo;
 - (void)addCell:(id)arg1;
 - (void)insertCell:(id)a0 At:(unsigned int)a1;
 - (id)getAllCells;
@@ -92,7 +91,6 @@ static void DDShowErrorToast(NSString *text) {
 - (id)cellInfoAtIndexPath:(NSIndexPath *)indexPath;
 - (unsigned long long)getSectionCount;
 - (id)getSectionAt:(unsigned long long)a0;
-- (id)getAllSections;
 - (void)reloadTableView;
 @end
 
@@ -579,7 +577,7 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
     }
     if (!firstSection) {
         DDLOG(@"[头像·注入] 入口=%@ 跳过：首分组为空(sectionCount=%llu)  VC=%@",
-              entry, [info respondsToSelector:@selector(getSectionCount)] ? [info getSectionCount] : 0, vcDesc);
+              entry, [info getSectionCount], vcDesc);
         return;
     }
 
