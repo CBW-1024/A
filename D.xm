@@ -46,17 +46,21 @@
 //    兜底二 · 高清大图：
 //      点开资料页头像是 MMHDHeadImageView(CBaseContactInfoAssist.h:7 m_HDHeadView)，
 //      它直接继承 MMUIView、不是 MMHeadImageView 子类，上面那批 hook 完全管不到，需单独 hook。
-//    限制：不支持群聊，命中 [CBaseContact isChatroom] 直接跳过注入(CBaseContact.h:129)。
+//    范围：只做单聊。注入挂在本就是单聊页的 AddContactToChatRoomViewController 上，
+//      群聊详情页是 ChatRoomInfoViewController，走不到这里，故无需 isChatroom 判断。
 //
 //  诊断日志（DDLOG / DDJokerHit / 设置页「导出日志」）默认关闭：
 //    仅在设置页打开「记录运行日志」后，才在插件加载处与各功能 hook 命中处记录，
 //    并进入命中统计与导出文件；其余时候各模块静默运行，不写日志。
 //    开关由两个入口创建，缺一不可，入口名写进日志：
-//      viewWillAppear  —— 首次进入详情页时表格刚建好。
-//      reloadTableData —— 微信自己的开关(免打扰/置顶等)被点后会重建分组、把这一行冲掉，
-//                         且重建后不走 viewWillAppear，必须在这补回来（真机实测确认）。
+//      viewWillAppear        —— 首次进入详情页时表格刚建好。
+//      WCTableViewManager.reloadTableView
+//                           —— 微信自己的开关(免打扰/置顶等)被点后会 clearAllSection
+//                              重建分组、把这一行冲掉，必须在这补回来。
+//                              实测重建不走 VC 的 reloadTableData（点开关后行确实丢了，
+//                              但那个入口 0 次），所以只能挂在 manager 这一层。
 //    注入只挂这两个「表格生命周期」事件；本插件自己不调 reloadTableData，
-//    保存/删除头像后也不手动补注入（那种场景要么行还在、要么已被 reloadTableData 入口接住）。
+//    保存/删除头像后也不手动补注入（那种场景要么行还在、要么已被 reloadTableView 接住）。
 //    导出文件为 Documents/DDProfileDiag.log。
 // ============================================================
 
@@ -123,8 +127,7 @@ static void DDShowErrorToast(NSString *text) {
 @interface CBaseContact : NSObject
 @property (retain, nonatomic) NSString *m_nsUsrName;
 @property (retain, nonatomic) NSString *m_nsAliasName;
-- (BOOL)isChatroom;
-- (BOOL)isSelf;
+- (BOOL)isSelf;                                // h:177，微信号只替换自己的
 @end
 
 @interface CContact : CBaseContact
@@ -167,7 +170,6 @@ static void DDShowErrorToast(NSString *text) {
 // 下面 %new 方法先声明以便 hook 内互相调用。
 @interface AddContactToChatRoomViewController : UIViewController
 @property (retain, nonatomic) CContact *m_contact;
-- (void)reloadTableData;                       // h:114，微信重建表格走它，必须 hook 见下
 - (void)dd_injectAvatarCellFrom:(NSString *)entry;
 - (void)ddAvatarSwitchChanged:(UISwitch *)sender;
 @end
@@ -745,23 +747,23 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 
 static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
 
+// manager -> 详情页 VC 的弱引用映射（两边都是弱引用，任一方释放条目自动失效）。
+// 用途：reloadTableView 是 WCTableViewManager 的通用方法，全 app 的表格都走它，
+// 得判断「这个 manager 是不是聊天详情页的」才敢注入。
+// 映射由 dd_injectAvatarCellFrom: 在注入时建立（归属清楚，属于详情页自己），
+// 查表是 O(1)，不用每次遍历 VC 列表去反查。
+static NSMapTable *DDTableManagerToVC(void) {
+    static NSMapTable *m = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ m = [NSMapTable weakToWeakObjectsMapTable]; });
+    return m;
+}
+
 %hook AddContactToChatRoomViewController
 
-// 两个注入入口，缺一不可：
-//  viewWillAppear  —— 首次进入详情页时表格刚建好，在这里插第一行。
-//  reloadTableData —— 微信自己的开关（消息免打扰、置顶聊天等）被点后会重建分组，
-//                     把我们插入的行冲掉，而重建后不会再走 viewWillAppear，必须在这里补回来。
-// 注：早前据日志判断「微信不主动调 reloadTableData」是错的——当时根本没 hook 它，
-//     观察不到自然没有记录。真机实测点其它开关后行确实消失，故补上这个入口。
-// 另外：本插件自己绝不主动调 reloadTableData（会冲掉这一行），保存成功后改用补注入。
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
     [self dd_injectAvatarCellFrom:@"viewWillAppear"];
-}
-
-- (void)reloadTableData {
-    %orig;
-    [self dd_injectAvatarCellFrom:@"reloadTableData"];
 }
 
 %new
@@ -780,11 +782,11 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
         DDLOG(@"[头像·注入] 入口=%@ 跳过：m_contact 为空  VC=%@", entry, vcDesc);
         return;
     }
-    // 群聊不支持，直接跳过。
-    if ([contact isChatroom]) {
-        DDLOG(@"[头像·注入] 入口=%@ 跳过：群聊  VC=%@", entry, vcDesc);
-        return;
-    }
+    // 不用判断群聊：群聊详情页是另一个类 ChatRoomInfoViewController
+    // （带 IGroupMgrExt / AddMemLogicDelegate / ChatRoomManagementDelegate 等群管理协议），
+    // 本 hook 只挂在 AddContactToChatRoomViewController（单聊「聊天信息」页）上，群聊根本进不来。
+    // 注：本类里的 ChatRoomMemberGridViewDelegate / createChatRoom 是「从单聊发起群聊」用的，
+    //    不代表它会被当作群聊详情页使用。
 
     NSString *usrName = [contact m_nsUsrName];
     if (usrName.length == 0) {
@@ -802,6 +804,8 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
         DDLOG(@"[头像·注入] 入口=%@ 跳过：m_tableViewInfo 取不到  VC=%@", entry, vcDesc);
         return;
     }
+    // 记下「这个 manager 属于这个详情页」，供 reloadTableView 判断是不是我们的目标表格。
+    [DDTableManagerToVC() setObject:self forKey:info];
 
     // 详情页第一个分组：把「自定义头像」开关作为它的首行插入。
     id firstSection = nil;
@@ -816,7 +820,7 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
         return;
     }
 
-    // 已注入则跳过（每次 reloadTableData 都会走到，靠 cell 的 userInfo 去重）。
+    // 已注入则跳过（表格每重建一次都会走到，靠 cell 的 userInfo 去重）。
     NSArray *cells = [firstSection respondsToSelector:@selector(getAllCells)] ? [firstSection getAllCells] : nil;
     for (id c in cells) {
         if ([[c userInfo] isEqual:kDDAvatarCellId]) {
@@ -899,12 +903,32 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
                 DDLOG(@"[头像·开关] 保存成功 user=%@  图片尺寸=%@", usrName, NSStringFromCGSize(image.size));
                 DDShowDoneToast(@"头像已替换");
                 // 这里不要 reloadTableData（会把插入的行冲掉），也不要手动补注入：
-                // 表格没被重建时行本来就在，被重建时 reloadTableData 入口会自动补回来。
-                // 即注入只由表格生命周期事件驱动（viewWillAppear / reloadTableData），
+                // 表格没被重建时行本来就在，被重建时 reloadTableView 入口会自动补回来。
+                // 即注入只由表格生命周期事件驱动（viewWillAppear / reloadTableView），
                 // 不由「保存图片」这类业务事件驱动——后者要么空转、要么抢不过前者。
             }
         }];
     }
+}
+
+%end
+
+
+#pragma mark - 开关行的保活（表格被微信重建后补回）
+
+
+// 微信自己的开关（消息免打扰、置顶聊天等）被点后会 clearAllSection 重建分组，
+// 把插入的「自定义头像」行冲掉。实测重建不走 VC 的 reloadTableData（点开关后行确实丢了，
+// 但那个入口 0 次），而是直接调 manager 的 reloadTableView，所以补注入必须挂在这一层。
+// 判定方式：查 manager -> VC 映射表（由详情页注入时建立），O(1)，不是遍历。
+// 注：注入内部也会调 reloadTableView，会二次进入本 hook，但那时去重命中会直接 return，
+// 不会无限递归。
+%hook WCTableViewManager
+
+- (void)reloadTableView {
+    %orig;
+    AddContactToChatRoomViewController *vc = [DDTableManagerToVC() objectForKey:self];
+    if (vc) [vc dd_injectAvatarCellFrom:@"reloadTableView"];
 }
 
 %end
