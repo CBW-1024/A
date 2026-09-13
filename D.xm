@@ -52,15 +52,18 @@
 //  诊断日志（DDLOG / DDJokerHit / 设置页「导出日志」）默认关闭：
 //    仅在设置页打开「记录运行日志」后，才在插件加载处与各功能 hook 命中处记录，
 //    并进入命中统计与导出文件；其余时候各模块静默运行，不写日志。
-//    开关由两个入口创建，缺一不可，入口名写进日志：
+//    开关由三个入口创建，入口名写进日志：
 //      viewWillAppear        —— 首次进入详情页时表格刚建好。
-//      WCTableViewManager.reloadTableView
-//                           —— 微信自己的开关(免打扰/置顶等)被点后会 clearAllSection
-//                              重建分组、把这一行冲掉，必须在这补回来。
-//                              实测重建不走 VC 的 reloadTableData（点开关后行确实丢了，
-//                              但那个入口 0 次），所以只能挂在 manager 这一层。
-//    注入只挂这两个「表格生命周期」事件；本插件自己不调 reloadTableData，
-//    保存/删除头像后也不手动补注入（那种场景要么行还在、要么已被 reloadTableView 接住）。
+//      initData 后补注入     —— 详情页重建分组的总入口(h:92)。免打扰/置顶/保存到聊天框
+//                              这些原生开关改完状态后都会重跑它，我们的行就在这被冲掉。
+//                              它比逐个追开关回调靠谱：开关种类多，且
+//                              DelaySwitchSettingLogic(h:11) 还是异步延迟提交的，
+//                              联系人变更还会从 IContactMgrExt(h:141/142) 进来，
+//                              但所有路径最终都收敛到 initData。
+//      重建后补注入          —— 表格层兜底，挂在 MMTableViewInfo（不是 WCTableViewManager，
+//                              理由见实现处：子类覆写了 reloadTableView，挂父类接不到）。
+//    注入只挂这类「表格生命周期」事件；本插件自己不调 reloadTableData，
+//    保存/删除头像后也不手动补注入（那种场景要么行还在、要么已被上面入口接住）。
 //    导出文件为 Documents/DDProfileDiag.log。
 // ============================================================
 
@@ -121,6 +124,21 @@ static void DDShowErrorToast(NSString *text) {
 - (unsigned long long)getSectionCount;
 - (id)getSectionAt:(unsigned long long)a0;
 - (void)reloadTableView;
+- (void)dd_scheduleAvatarReinject;  // 本插件 %new，先声明以便 hook 内调用
+@end
+
+// 聊天详情页的表格真实类型是 MMTableViewInfo(AddContactToChatRoomViewController.h:7
+//   `MMTableViewInfo *m_tableViewInfo;`)，不是裸 WCTableViewManager。
+// 关键：MMTableViewInfo.h 全文只有 6 个方法，却单独列了 `- (void)reloadTableView;`——
+//   class-dump 只列本类实现的方法，既然父类 WCTableViewManager.h:34 已经声明过同名方法，
+//   子类还再列一次，说明 MMTableViewInfo 覆写了它。
+//   于是 Logos %hook WCTableViewManager 只替换了父类 IMP，m_tableViewInfo 收到 reloadTableView
+//   直接走子类自己的 IMP，压根不经过我们的 hook —— 这就是「点免打扰后一条日志都没有」的根因
+//   （日志里那些 reloadTableView 命中其实是设置页自己 alloc 的裸 WCTableViewManager，
+//    见下方 DDProfileSettingsViewController.viewDidLoad）。
+// 结论：补注入必须挂在 MMTableViewInfo 上。即便某些版本它没覆写，Substrate 也会在子类
+//   建立 hook 再转发 super，一样能捕获，所以挂子类是「无论如何都对」的选择。
+@interface MMTableViewInfo : WCTableViewManager
 @end
 
 // 联系人数据模型。CContact 继承 CBaseContact(CContact.h:3)，字段都在基类。
@@ -747,8 +765,12 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 
 static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
 
+// 注入过程中置 YES，用于抑制「注入自己发起的 reloadTableView」再触发一轮补注入排期。
+// reloadTableView 是同步调用，出作用域立即置回，不存在跨帧泄漏。
+static BOOL gDDInjecting = NO;
+
 // manager -> 详情页 VC 的弱引用映射（两边都是弱引用，任一方释放条目自动失效）。
-// 用途：reloadTableView 是 WCTableViewManager 的通用方法，全 app 的表格都走它，
+// 用途：reloadTableView / addSection: 是表格基类的方法，全 app 的表格都走它，
 // 得判断「这个 manager 是不是聊天详情页的」才敢注入。
 // 映射由 dd_injectAvatarCellFrom: 在注入时建立（归属清楚，属于详情页自己），
 // 查表是 O(1)，不用每次遍历 VC 列表去反查。
@@ -764,6 +786,26 @@ static NSMapTable *DDTableManagerToVC(void) {
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
     [self dd_injectAvatarCellFrom:@"viewWillAppear"];
+}
+
+// 详情页重建分组的总入口(AddContactToChatRoomViewController.h:92 `- (void)initData;`)。
+// 免打扰(h:94 setMuteStatus / h:93 setUpdateNotifyMuted:)、置顶(h:89 onTopSession: 、
+// h:146 checkTopSession / h:147 setTopSession)、保存到聊天框(h:136 setChatBoxStatus:)
+// 这些原生开关改完状态后，都要重跑 initData 重建 sections —— 我们插的行就是在这被冲掉的。
+// 挂在 VC 的 initData 上，而不是去逐个追开关回调，理由有二：
+//   1. 开关种类多，且 DelaySwitchSettingLogic(h:11 m_delaySwitchLogic) 是异步延迟提交的
+//      (DelaySwitchSettingLogic.h:14 chatProfileSwitchSetting:withType:andValue:)，
+//      回调回来才改数据，逐个追必然漏；
+//   2. 联系人数据变更还会从 IContactMgrExt 回调 h:141 processModContact: / h:142 onModifyContact:
+//      进来，路径更多。
+//   而所有路径最终都收敛到 initData —— 它是单一收敛点。
+// %orig 之后延一帧再补：微信在 initData 尾部可能紧接着 reloadData，同步插进去会被它盖掉。
+- (void)initData {
+    %orig;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [weakSelf dd_injectAvatarCellFrom:@"initData后补注入"];
+    });
 }
 
 %new
@@ -804,6 +846,10 @@ static NSMapTable *DDTableManagerToVC(void) {
         DDLOG(@"[头像·注入] 入口=%@ 跳过：m_tableViewInfo 取不到  VC=%@", entry, vcDesc);
         return;
     }
+    // 打真实类名：补注入挂的是 MMTableViewInfo，若这里打出别的名字，说明挂错了层，
+    // 点原生开关后行还是会丢（这次踩的就是这个坑，留个可验证的痕迹）。
+    DDLOG(@"[头像·注入] 入口=%@ manager真实类=%@(%p)  VC=%@",
+          entry, NSStringFromClass([info class]), info, vcDesc);
     // 记下「这个 manager 属于这个详情页」，供 reloadTableView 判断是不是我们的目标表格。
     [DDTableManagerToVC() setObject:self forKey:info];
 
@@ -850,7 +896,13 @@ static NSMapTable *DDTableManagerToVC(void) {
     }
     [cell setUserInfo:kDDAvatarCellId];
     [firstSection insertCell:cell At:0];
+
+    // 这次刷新是我们自己发起的、数据也已经就位，没必要再让 MMTableViewInfo 的 hook
+    // 排一轮「重建后补注入」（下一帧跑进来也只会被去重挡掉，白白多一条日志）。
+    // 用同步标志让 hook 里的排期直接跳过：reloadTableView 同步返回，出作用域即清。
+    gDDInjecting = YES;
     [info reloadTableView];
+    gDDInjecting = NO;
 
     DDLOG(@"[头像·注入] 入口=%@ 成功：已插入首分组第0行  user=%@  已有图=%d  首分组原行数=%lu",
           entry, usrName, hasCustom, (unsigned long)cells.count);
@@ -917,18 +969,56 @@ static NSMapTable *DDTableManagerToVC(void) {
 #pragma mark - 开关行的保活（表格被微信重建后补回）
 
 
-// 微信自己的开关（消息免打扰、置顶聊天等）被点后会 clearAllSection 重建分组，
-// 把插入的「自定义头像」行冲掉。实测重建不走 VC 的 reloadTableData（点开关后行确实丢了，
-// 但那个入口 0 次），而是直接调 manager 的 reloadTableView，所以补注入必须挂在这一层。
-// 判定方式：查 manager -> VC 映射表（由详情页注入时建立），O(1)，不是遍历。
-// 注：注入内部也会调 reloadTableView，会二次进入本 hook，但那时去重命中会直接 return，
-// 不会无限递归。
-%hook WCTableViewManager
+// 微信自己的开关（消息免打扰、置顶聊天等）被点后会重建分组，把插入的「自定义头像」行冲掉。
+// 判断「这是不是我们的目标表格」查 manager -> VC 映射表（详情页注入时建立），O(1)，不是遍历。
+//
+// 【踩坑记录 · 挂错层】
+// 之前挂在 WCTableViewManager 上，点免打扰后一条日志都没有，看着像「微信压根没刷新」。
+// 其实是我们的 hook 根本没接到消息：表格真实类型是 MMTableViewInfo
+// (AddContactToChatRoomViewController.h:7 `MMTableViewInfo *m_tableViewInfo;`)，
+// 而 MMTableViewInfo.h 全文只有 6 个方法，却单独列了 - (void)reloadTableView; ——
+// class-dump 只列本类实现，父类 WCTableViewManager.h:34 已声明过同名方法，子类再列一次
+// 就等于明说它覆写了。于是消息派发直接命中 MMTableViewInfo 自己的 IMP，
+// 父类 hook 形同虚设。日志里那些 reloadTableView 命中其实是设置页自己 alloc 的裸
+// WCTableViewManager（见 DDProfileSettingsViewController.viewDidLoad），跟详情页无关。
+// 现在改挂 MMTableViewInfo：它覆写了就抓它自己的；万一某版本没覆写，Substrate 也会在
+// 子类建 hook 再转发 super —— 两种情况都接得住。
+//
+// 三个入口都挂、统一延一帧再补：微信重建是多步流程
+// (clearAllSection -> 若干次 addSection: -> reloadTableView)，中途注入会被后面的步骤冲掉，
+// 得等这一轮跑完才稳。
+%hook MMTableViewInfo
 
 - (void)reloadTableView {
     %orig;
+    [self dd_scheduleAvatarReinject];
+}
+
+- (void)clearAllSection {
+    %orig;
+    [self dd_scheduleAvatarReinject];
+}
+
+- (void)addSection:(id)arg1 {
+    %orig;
+    [self dd_scheduleAvatarReinject];
+}
+
+%new
+- (void)dd_scheduleAvatarReinject {
+    if (gDDInjecting) return;    // 注入自己发起的刷新，不再回灌
+
     AddContactToChatRoomViewController *vc = [DDTableManagerToVC() objectForKey:self];
-    if (vc) [vc dd_injectAvatarCellFrom:@"reloadTableView"];
+    if (!vc) return;   // 不是详情页的表格（比如设置页那个裸 manager），直接放过
+
+    // 同一轮重建只排一次：addSection: 一轮会被连着调十几次，不去重就是十几个 block 排队。
+    if ([objc_getAssociatedObject(self, @selector(dd_scheduleAvatarReinject)) boolValue]) return;
+    objc_setAssociatedObject(self, @selector(dd_scheduleAvatarReinject), @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        objc_setAssociatedObject(self, @selector(dd_scheduleAvatarReinject), nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [vc dd_injectAvatarCellFrom:@"重建后补注入"];
+    });
 }
 
 %end
