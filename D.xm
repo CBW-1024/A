@@ -22,10 +22,20 @@
 //      开关是自建 UISwitch + addTarget 绑定 action：微信的 switchCellForSel:target:title:on:
 //      在本版本不回调传入的 sel（日志实证），故不能用它承载点击。
 //    存储：Documents/DDAvatar/<userName>.png，按用户名一一对应，不额外维护映射表。
-//    显示：hook MMHeadImageView 的三个写图入口，命中本地图就替换
-//      updateHeadImage:            (MMHeadImageView.h:66)
-//      updateUsrName:withHeadImgUrl: (MMHeadImageView.h:54)
-//      ImageDidLoad:Url:           (MMHeadImageView.h:68，异步下载完成后会覆盖，必须拦)
+//    显示：hook MMHeadImageView 的全部写图入口，命中本地图就替换
+//      会话列表/聊天页走这三个：
+//        updateHeadImage:            (MMHeadImageView.h:66)
+//        updateUsrName:withHeadImgUrl: (MMHeadImageView.h:54)
+//        ImageDidLoad:Url:           (MMHeadImageView.h:68，异步下载完成后会覆盖，必须拦)
+//      联系人资料页(CBaseContactInfoAssist.h:16 m_headView，同一个 MMHeadImageView 类)
+//      不走上面三个，补了这批入口：
+//        initWithUsrName:headImgUrl:bAutoUpdate:bRoundCorner: (h:45)
+//        setHeadImageByName:         (h:50，按用户名取图，资料页最可能走它)
+//        doUpdateHeadImg:            (h:52)
+//        onHeadImageChange:          (h:57)
+//        onModifyContact:            (h:71)
+//      另加 didMoveToWindow 兜底(UIView 通用)，覆盖所有未列出入口与「图先设好不再刷新」的情况。
+//      各入口用「头像入口·xxx」计入次、「头像替换·xxx」计替换次，导出日志可看出资料页走的是哪个。
 //    限制：不支持群聊，命中 [CBaseContact isChatroom] 直接跳过注入(CBaseContact.h:129)。
 //
 //  诊断日志（DDLOG / DDJokerHit / 设置页「导出日志」）默认关闭：
@@ -111,11 +121,20 @@ static void DDShowErrorToast(NSString *text) {
 @end
 
 // 微信头像视图：nsUsrName 可直接判断当前渲染的是谁(MMHeadImageView.h:23)。
+// 资料页顶部头像也是它(CBaseContactInfoAssist.h:16 m_headView)，但走的写图入口与会话列表不同，
+// 故下面把头文件里所有可能的写图入口都列上(行号见 MMHeadImageView.h)。
 @interface MMHeadImageView : UIView
 @property (readonly, nonatomic) NSString *nsUsrName;
-- (void)updateHeadImage:(id)image;
-- (void)updateUsrName:(id)usrName withHeadImgUrl:(id)headImgUrl;
-- (void)ImageDidLoad:(id)image Url:(id)url;
+- (id)initWithUsrName:(id)usrName headImgUrl:(id)headImgUrl bAutoUpdate:(BOOL)bAutoUpdate bRoundCorner:(BOOL)bRoundCorner; // h:45
+- (void)setHeadImageByName:(id)usrName;        // h:50
+- (void)doUpdateHeadImg:(BOOL)force;           // h:52
+- (void)updateUsrName:(id)usrName withHeadImgUrl:(id)headImgUrl; // h:54
+- (void)onHeadImageChange:(id)arg1;            // h:57
+- (void)updateHeadImage:(id)image;             // h:66
+- (void)updateHeadImageUrl:(id)headImgUrl;     // h:67
+- (void)ImageDidLoad:(id)image Url:(id)url;    // h:68
+- (void)onModifyContact:(id)arg1;              // h:71
+- (void)didMoveToWindow;                       // UIView 通用兜底
 @end
 
 // 单聊「聊天信息」页。m_contact 是当前联系人(AddContactToChatRoomViewController.h:24)。
@@ -299,12 +318,34 @@ static NSString *DDAvatarPathForUser(NSString *usrName) {
     return [DDAvatarDir() stringByAppendingPathComponent:[safe stringByAppendingPathExtension:@"png"]];
 }
 
+// 头像解码结果缓存：资料页等入口会高频查询(尤其 didMoveToWindow 兜底)，
+// 每次 imageWithContentsOfFile 都走磁盘会拖慢渲染，故按用户名缓存，增删时失效。
+static NSCache *DDAvatarCache(void) {
+    static NSCache *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cache = [[NSCache alloc] init];
+        cache.countLimit = 64;
+    });
+    return cache;
+}
+
+static void DDAvatarCacheInvalidate(NSString *usrName) {
+    if (usrName.length) [DDAvatarCache() removeObjectForKey:usrName];
+    else [DDAvatarCache() removeAllObjects];
+}
+
 static UIImage *DDAvatarImageForUser(NSString *usrName) {
     if (![DDProfileConfig shared].avatarEnabled) return nil;
-    NSString *path = DDAvatarPathForUser(usrName);
-    if (!path) return nil;
-    UIImage *img = [UIImage imageWithContentsOfFile:path];
-    return (img && img.size.width > 0 && img.size.height > 0) ? img : nil;
+    if (usrName.length == 0) return nil;
+    NSCache *cache = DDAvatarCache();
+    id cached = [cache objectForKey:usrName];
+    if (cached) return (cached == [NSNull null]) ? nil : (UIImage *)cached;
+
+    UIImage *img = [UIImage imageWithContentsOfFile:DDAvatarPathForUser(usrName)];
+    if (!(img && img.size.width > 0 && img.size.height > 0)) img = nil;
+    [cache setObject:(img ?: (UIImage *)[NSNull null]) forKey:usrName];
+    return img;
 }
 
 // 等比缩到最大边 maxSide，避免原图过大拖慢列表渲染。
@@ -327,14 +368,18 @@ static BOOL DDAvatarSaveImage(UIImage *image, NSString *usrName) {
     if (!image || !path) return NO;
     NSData *data = UIImagePNGRepresentation(DDScaledImage(image, 400.0));
     if (data.length == 0) return NO;
-    return [data writeToFile:path atomically:YES];
+    BOOL ok = [data writeToFile:path atomically:YES];
+    if (ok) DDAvatarCacheInvalidate(usrName);
+    return ok;
 }
 
 static BOOL DDAvatarRemoveForUser(NSString *usrName) {
     NSString *path = DDAvatarPathForUser(usrName);
     if (!path) return NO;
     if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return NO;
-    return [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+    BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+    DDAvatarCacheInvalidate(usrName);
+    return ok;
 }
 
 static NSInteger DDAvatarRemoveAll(void) {
@@ -345,6 +390,7 @@ static NSInteger DDAvatarRemoveAll(void) {
         if (![f.pathExtension isEqualToString:@"png"]) continue;
         if ([[NSFileManager defaultManager] removeItemAtPath:[dir stringByAppendingPathComponent:f] error:nil]) n++;
     }
+    if (n > 0) DDAvatarCacheInvalidate(nil);
     return n;
 }
 
@@ -482,6 +528,31 @@ static NSString *DDCustomWxid(void) {
 #pragma mark - 头像替换（显示侧）
 
 
+// 用户名采样：只诊断用。开日志时把每个头像视图实际渲染的 nsUsrName 记一次，
+// 用于核对「存的图片文件名」与「资料页视图要的名字」是不是同一个 key。
+static void DDSampleAvatarName(NSString *name) {
+    if (![DDProfileConfig shared].diagEnabled || name.length == 0) return;
+    static NSMutableSet *seen = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
+    @synchronized (seen) {
+        if ([seen containsObject:name]) return;
+        [seen addObject:name];
+    }
+    DDLOG(@"[头像·采样] nsUsrName=%@", name);
+}
+
+// 统一替换出口：命中本地图就写回，返回是否替换。命中才记日志，未命中静默。
+// 参数 usrName 为空时回落到视图自己的 nsUsrName。
+static BOOL DDTryApplyCustomAvatar(MMHeadImageView *view, NSString *usrName, NSString *tag) {
+    NSString *name = usrName.length ? usrName : view.nsUsrName;
+    UIImage *custom = DDAvatarImageForUser(name);
+    if (!custom) return NO;
+    DDJokerHit(tag);
+    [view updateHeadImage:custom];
+    return YES;
+}
+
 %hook MMHeadImageView
 
 // 同步写图入口：命中本地图就直接换成本地图，不再显示网络头像。
@@ -510,6 +581,50 @@ static NSString *DDCustomWxid(void) {
         DDJokerHit(@"头像替换·ImageDidLoad");
         [self updateHeadImage:custom];
     }
+}
+
+// ——— 下面这批是联系人资料页(CBaseContactInfoAssist.m_headView)走的入口 ———
+// 资料页不调 updateUsrName:withHeadImgUrl:，而是按用户名直接取图，
+// 所以原来三个入口拦不到它。逐个补上，命中的那个会在日志里显形。
+
+- (id)initWithUsrName:(id)usrName headImgUrl:(id)headImgUrl bAutoUpdate:(BOOL)bAuto bRoundCorner:(BOOL)bRound {
+    id ret = %orig(usrName, headImgUrl, bAuto, bRound);
+    DDJokerHit(@"头像入口·init");
+    DDTryApplyCustomAvatar(ret, usrName, @"头像替换·initWithUsrName");
+    return ret;
+}
+
+- (void)setHeadImageByName:(id)usrName {
+    %orig(usrName);
+    DDJokerHit(@"头像入口·setHeadImageByName");
+    DDTryApplyCustomAvatar(self, usrName, @"头像替换·setHeadImageByName");
+}
+
+- (void)doUpdateHeadImg:(BOOL)force {
+    %orig(force);
+    DDJokerHit(@"头像入口·doUpdateHeadImg");
+    DDTryApplyCustomAvatar(self, nil, @"头像替换·doUpdateHeadImg");
+}
+
+- (void)onHeadImageChange:(id)arg1 {
+    %orig(arg1);
+    DDJokerHit(@"头像入口·onHeadImageChange");
+    DDTryApplyCustomAvatar(self, nil, @"头像替换·onHeadImageChange");
+}
+
+- (void)onModifyContact:(id)arg1 {
+    %orig(arg1);
+    DDJokerHit(@"头像入口·onModifyContact");
+    DDTryApplyCustomAvatar(self, nil, @"头像替换·onModifyContact");
+}
+
+// 终极兜底：视图挂到 window 时再确认一次。覆盖所有上面没列出的入口，
+// 以及「图在 hook 生效前就设好、之后不再刷新」的情况。有缓存，开销可忽略。
+- (void)didMoveToWindow {
+    %orig;
+    if (!self.window) return;
+    DDSampleAvatarName(self.nsUsrName);
+    DDTryApplyCustomAvatar(self, nil, @"头像替换·didMoveToWindow");
 }
 
 %end
