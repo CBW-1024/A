@@ -14,7 +14,9 @@
 //    只改内存里的显示值，不写数据库、不发网络请求；关闭开关即恢复真实微信号。
 //
 //  功能二 · 单聊联系人头像替换
-//    入口：单聊「聊天信息」页(AddContactToChatRoomViewController)底部注入一行操作区。
+//    总开关：设置页「自定义用户头像」→「备注用户头像」。
+//    入口：单聊「聊天信息」页(AddContactToChatRoomViewController)第一个分组内插入「自定义头像」开关，
+//      打开即调起微信相册选图并裁剪，关闭则删除本地图片。
 //      该 VC 的表格是 MMTableViewInfo，它继承 WCTableViewManager(MMTableViewInfo.h:1)，
 //      所以直接复用 WCTableViewSectionManager / WCTableViewCellManager 建行。
 //    存储：Documents/DDAvatar/<userName>.png，按用户名一一对应，不额外维护映射表。
@@ -44,6 +46,7 @@
 @interface WCTableViewCellManager : NSObject
 + (id)switchCellForSel:(SEL)sel target:(id)target title:(id)title on:(BOOL)on;
 + (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightValue:(id)rightValue;
++ (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightValue:(id)rightValue rightImage:(id)rightImage;
 + (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightView:(id)rightView;
 @property (nonatomic, retain) id userInfo;
 @end
@@ -55,6 +58,8 @@
 @property (nonatomic, copy) NSString *footerTitle;
 @property (nonatomic, retain) id userInfo;
 - (void)addCell:(id)arg1;
+- (void)insertCell:(id)a0 At:(unsigned int)a1;
+- (id)getAllCells;
 @end
 
 @interface WCTableViewManager : NSObject
@@ -91,27 +96,43 @@
 - (void)ImageDidLoad:(id)image Url:(id)url;
 @end
 
+// 微信原生选图器(MMImagePickerManager.h:82/12)：optionObj 只列本插件用到的配置项；
+// m_delegate 是 weak，manager 由调用方强引用住(DDAvatarPicker.pickerManager)。
+@interface MMImagePickerManagerOptionObj : NSObject
+@property (nonatomic) long long maxImageCount;
+@property (nonatomic) BOOL canSendMultiImage;
+@property (nonatomic) BOOL disableVideoSelection;
+@property (nonatomic) BOOL imageDirectToEditMode;
+@property (nonatomic) BOOL m_directToFirstAlbum;
+@end
+
+@interface MMImagePickerManager : NSObject
+@property (weak, nonatomic) id m_delegate;
+- (void)showWithOptionObj:(id)option inViewController:(id)vc delegate:(id)delegate;
+@end
+
 // 单聊「聊天信息」页。m_contact 是当前联系人(AddContactToChatRoomViewController.h:24)。
-// 下面三个 dd_ 前缀方法是本插件 %new 注入的，先声明以便 hook 内互相调用。
+// 下面 %new 方法先声明以便 hook 内互相调用。
 @interface AddContactToChatRoomViewController : UIViewController
 @property (retain, nonatomic) CContact *m_contact;
 - (void)reloadTableData;
-- (void)dd_injectAvatarSectionIfNeeded;
-- (void)dd_pickAvatarTapped:(id)sender;
-- (void)dd_resetAvatarTapped:(id)sender;
+- (void)dd_injectAvatarCellIfNeeded;
+- (void)toggleCustomContactAvatar:(id)a0;
 @end
 
 
 #pragma mark - 配置
 
 
-static NSString *const kDDWxidEnabledKey = @"DDProfileWxidEnabled";
-static NSString *const kDDWxidValueKey   = @"DDProfileWxidValue";
+static NSString *const kDDWxidEnabledKey  = @"DDProfileWxidEnabled";
+static NSString *const kDDWxidValueKey    = @"DDProfileWxidValue";
+static NSString *const kDDAvatarEnabledKey = @"DDProfileAvatarEnabled";
 
 @interface DDProfileConfig : NSObject
 + (instancetype)shared;
 @property (nonatomic) BOOL wxidEnabled;
 @property (nonatomic, copy) NSString *wxidValue;
+@property (nonatomic) BOOL avatarEnabled;
 @end
 
 
@@ -150,6 +171,7 @@ static NSString *DDAvatarPathForUser(NSString *usrName) {
 }
 
 static UIImage *DDAvatarImageForUser(NSString *usrName) {
+    if (![DDProfileConfig shared].avatarEnabled) return nil;
     NSString *path = DDAvatarPathForUser(usrName);
     if (!path) return nil;
     UIImage *img = [UIImage imageWithContentsOfFile:path];
@@ -198,56 +220,74 @@ static NSInteger DDAvatarRemoveAll(void) {
 }
 
 
-#pragma mark - 相册选图
-// 独立代理对象：不往微信 VC 上加 %new 的同名 delegate 方法，避免和微信自身或其它插件的
-// imagePickerController:didFinishPickingMediaWithInfo: 撞车(AddContactToChatRoomViewController.h:76)。
+#pragma mark - 选图（微信原生 MMImagePickerManager）
+// 走微信自己的选图 + 裁剪链路：MMImagePickerManager + MMImagePickerManagerOptionObj
+//   (MMImagePickerManager.h:82  showWithOptionObj:inViewController:delegate:)
+// 回调方法名由两处原生实现确证：TakeOrSelectHeadImageLogic.h:17、NewRemarkViewController.h:290
+//   MMImagePickerManager:didFinishPickingImageWithInfo: / MMImagePickerManagerDidCancel:
+// 仍用独立代理对象承接，不往微信 VC 上加同名 %new 方法——该 VC 自己已有
+// imagePickerController:didFinishPickingMediaWithInfo:(AddContactToChatRoomViewController.h:76)。
+// 注意 m_delegate 是 weak(MMImagePickerManager.h:12)，manager 必须自己强引用住。
 
 
 typedef void (^DDAvatarPickCompletion)(UIImage *image);
 
-@interface DDAvatarPicker : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
+// info 的 key 由微信内部决定，做通用提取：先按系统 key 取，取不到就遍历值找 UIImage。
+static UIImage *DDExtractImageFromInfo(id info) {
+    if (!info) return nil;
+    if ([info isKindOfClass:[UIImage class]]) return (UIImage *)info;
+    if (![info isKindOfClass:[NSDictionary class]]) return nil;
+    NSDictionary *dic = (NSDictionary *)info;
+    UIImage *img = dic[UIImagePickerControllerEditedImage] ?: dic[UIImagePickerControllerOriginalImage];
+    if (img) return img;
+    for (id value in dic.allValues) {
+        if ([value isKindOfClass:[UIImage class]]) return (UIImage *)value;
+    }
+    return nil;
+}
+
+@interface DDAvatarPicker : NSObject
 @property (nonatomic, copy) DDAvatarPickCompletion completion;
+@property (nonatomic, strong) MMImagePickerManager *pickerManager;
 + (void)presentFromViewController:(UIViewController *)vc completion:(DDAvatarPickCompletion)completion;
 @end
 
 @implementation DDAvatarPicker
 
-// 强引用持有，否则 picker 弹出期间代理被释放、回调收不到。
+// 强引用持有：代理和 manager 都得活到选图结束。
 static DDAvatarPicker *gDDAvatarPicker = nil;
 
 + (void)presentFromViewController:(UIViewController *)vc completion:(DDAvatarPickCompletion)completion {
     if (!vc) return;
-    if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypePhotoLibrary]) {
-        if (completion) completion(nil);
-        return;
-    }
-    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
-    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    picker.allowsEditing = YES;
 
+    MMImagePickerManagerOptionObj *option = [[%c(MMImagePickerManagerOptionObj) alloc] init];
+    option.maxImageCount = 1;            // 头像只要一张
+    option.canSendMultiImage = NO;
+    option.disableVideoSelection = YES;  // 只要图片，不要视频
+    option.imageDirectToEditMode = YES;  // 选完直接进裁剪页
+    option.m_directToFirstAlbum = YES;
+
+    MMImagePickerManager *manager = [[%c(MMImagePickerManager) alloc] init];
     DDAvatarPicker *proxy = [[DDAvatarPicker alloc] init];
     proxy.completion = completion;
-    picker.delegate = proxy;
+    proxy.pickerManager = manager;       // 强引用，否则 m_delegate(weak) 一放就断
+    manager.m_delegate = (id)proxy;
     gDDAvatarPicker = proxy;
 
-    [vc presentViewController:picker animated:YES completion:nil];
+    [manager showWithOptionObj:option inViewController:vc delegate:(id)proxy];
 }
 
-- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary *)info {
-    UIImage *img = info[UIImagePickerControllerEditedImage] ?: info[UIImagePickerControllerOriginalImage];
+- (void)MMImagePickerManager:(id)manager didFinishPickingImageWithInfo:(id)info {
+    UIImage *image = DDExtractImageFromInfo(info);
     DDAvatarPickCompletion cb = self.completion;
-    [picker dismissViewControllerAnimated:YES completion:^{
-        if (cb) cb(img);
-        gDDAvatarPicker = nil;
-    }];
+    gDDAvatarPicker = nil;
+    if (cb) cb(image);
 }
 
-- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
+- (void)MMImagePickerManagerDidCancel:(id)manager {
     DDAvatarPickCompletion cb = self.completion;
-    [picker dismissViewControllerAnimated:YES completion:^{
-        if (cb) cb(nil);
-        gDDAvatarPicker = nil;
-    }];
+    gDDAvatarPicker = nil;
+    if (cb) cb(nil);
 }
 
 @end
@@ -317,18 +357,21 @@ static NSString *DDCustomWxid(void) {
 #pragma mark - 头像修改入口（单聊「聊天信息」页）
 
 
-static NSString *const kDDAvatarSectionId = @"DDProfileAvatarSection";
+static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
 
 %hook AddContactToChatRoomViewController
 
-// 表格重建后注入，靠 userInfo 标记去重，避免 reload 多次重复插行。
+// 表格重建后注入，靠 cell 的 userInfo 标记去重，避免 reload 多次重复插行。
 - (void)reloadTableData {
     %orig;
-    [self dd_injectAvatarSectionIfNeeded];
+    [self dd_injectAvatarCellIfNeeded];
 }
 
 %new
-- (void)dd_injectAvatarSectionIfNeeded {
+- (void)dd_injectAvatarCellIfNeeded {
+    // 全局总开关关闭时不注入聊天详情页入口。
+    if (![DDProfileConfig shared].avatarEnabled) return;
+
     CContact *contact = [self m_contact];
     if (!contact) return;
     // 群聊不支持，直接跳过。
@@ -345,69 +388,62 @@ static NSString *const kDDAvatarSectionId = @"DDProfileAvatarSection";
     }
     if (!info) return;
 
-    for (id sec in [info getAllSections]) {
-        if ([[sec userInfo] isEqual:kDDAvatarSectionId]) return;
+    // 详情页第一个分组：把「自定义头像」开关作为它的首行插入。
+    id firstSection = nil;
+    @try {
+        firstSection = [info getSectionAt:0];
+    } @catch (NSException *e) {
+        firstSection = nil;
+    }
+    if (!firstSection) return;
+
+    // 已注入则跳过（每次 reloadTableData 都会走到，靠 cell 的 userInfo 去重）。
+    for (id c in [firstSection getAllCells]) {
+        if ([[c userInfo] isEqual:kDDAvatarCellId]) return;
     }
 
-    WCTableViewSectionManager *section = [%c(WCTableViewSectionManager) sectionWithHeader:@"小丑 · 头像"];
-    section.userInfo = kDDAvatarSectionId;
-    section.footerTitle = @"替换后仅本机可见，用于本地伪装；点恢复即删除本地图片、显示原头像";
-
-    UIButton *pickBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    pickBtn.frame = CGRectMake(0, 0, 60, 34);
-    [pickBtn setTitle:@"选择" forState:UIControlStateNormal];
-    pickBtn.titleLabel.font = [UIFont systemFontOfSize:15];
-    [pickBtn addTarget:self action:@selector(dd_pickAvatarTapped:) forControlEvents:UIControlEventTouchUpInside];
-
-    UIButton *resetBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    resetBtn.frame = CGRectMake(66, 0, 60, 34);
-    [resetBtn setTitle:@"恢复" forState:UIControlStateNormal];
-    resetBtn.titleLabel.font = [UIFont systemFontOfSize:15];
-    [resetBtn addTarget:self action:@selector(dd_resetAvatarTapped:) forControlEvents:UIControlEventTouchUpInside];
-
-    UIView *right = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 126, 34)];
-    [right addSubview:pickBtn];
-    [right addSubview:resetBtn];
-
-    [section addCell:[%c(WCTableViewCellManager) normalCellForSel:nil
-                                                           target:nil
-                                                            title:@"联系人头像"
-                                                        rightView:right]];
-    [info addSection:section];
+    // 原生 switchCell：on 状态取决于当前联系人是否已保存本地头像(WCTableViewCellManager.h:55)。
+    Class cellCls = %c(WCTableViewCellManager);
+    BOOL hasCustom = DDAvatarImageForUser(usrName) != nil;
+    id cell = [cellCls switchCellForSel:@selector(toggleCustomContactAvatar:)
+                                target:self
+                                 title:@"自定义头像"
+                                    on:hasCustom];
+    [cell setUserInfo:kDDAvatarCellId];
+    [firstSection insertCell:cell At:0];
     [info reloadTableView];
 }
 
-%new
-- (void)dd_pickAvatarTapped:(id)sender {
+// 复用微信原生的「自定义头像」开关 action（AddContactToChatRoomViewController.h:66）：
+// 上面插入的开关 cell 把 sel 指向它，逻辑统一在这里实现，不再自己起 dd_ 前缀方法。
+// 不依赖传入参数判断状态，改以「当前联系人是否已有本地头像」决定开/关，规避参数签名不确定的风险。
+- (void)toggleCustomContactAvatar:(id)a0 {
     CContact *contact = [self m_contact];
     NSString *usrName = [contact m_nsUsrName];
     if (usrName.length == 0) return;
 
-    __weak typeof(self) weakSelf = self;
-    [DDAvatarPicker presentFromViewController:self completion:^(UIImage *image) {
-        if (!image) return;
-        if (!DDAvatarSaveImage(image, usrName)) {
-            [[%c(WeToast) toast] showErrorToastWithText:@"保存失败"];
-            return;
-        }
-        [[%c(WeToast) toast] showDoneToastWithText:@"头像已替换"];
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (strongSelf) [strongSelf reloadTableData];
-    }];
-}
-
-%new
-- (void)dd_resetAvatarTapped:(id)sender {
-    CContact *contact = [self m_contact];
-    NSString *usrName = [contact m_nsUsrName];
-    if (usrName.length == 0) return;
-
-    if (!DDAvatarRemoveForUser(usrName)) {
-        [[%c(WeToast) toast] showDoneToastWithText:@"当前未替换"];
-        return;
+    if (DDAvatarImageForUser(usrName)) {
+        // 当前有图 -> 切换为关闭，删除本地图片。
+        DDAvatarRemoveForUser(usrName);
+        [[%c(WeToast) toast] showDoneToastWithText:@"已恢复默认头像"];
+    } else {
+        // 当前无图 -> 切换为打开，调起微信相册选图并裁剪。
+        __weak typeof(self) weakSelf = self;
+        [DDAvatarPicker presentFromViewController:self completion:^(UIImage *image) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if (!image) {
+                [strongSelf reloadTableData];
+                return;
+            }
+            if (!DDAvatarSaveImage(image, usrName)) {
+                [[%c(WeToast) toast] showErrorToastWithText:@"保存失败"];
+            } else {
+                [[%c(WeToast) toast] showDoneToastWithText:@"头像已替换"];
+            }
+            [strongSelf reloadTableData];
+        }];
     }
-    [[%c(WeToast) toast] showDoneToastWithText:@"已恢复原头像"];
-    [self reloadTableData];
 }
 
 %end
@@ -506,19 +542,16 @@ static NSString *const kDDAvatarSectionId = @"DDProfileAvatarSection";
     }
     [_tableViewManager addSection:wxidSection];
 
-    WCTableViewSectionManager *avatarSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"联系人头像"];
-    avatarSection.footerTitle = @"进入单聊的「聊天信息」页，在底部「小丑 · 头像」一栏可替换该联系人头像；群聊不支持";
-    UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    clearBtn.frame = CGRectMake(0, 0, 60, 34);
-    [clearBtn setTitle:@"清空" forState:UIControlStateNormal];
-    clearBtn.titleLabel.font = [UIFont systemFontOfSize:15];
-    [clearBtn addTarget:self action:@selector(clearAllAvatarTapped:) forControlEvents:UIControlEventTouchUpInside];
-    UIView *clearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 60, 34)];
-    [clearRight addSubview:clearBtn];
-    [avatarSection addCell:[cellCls normalCellForSel:nil
-                                             target:nil
-                                              title:@"已替换的头像"
-                                          rightView:clearRight]];
+    WCTableViewSectionManager *avatarSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"自定义用户头像"];
+    avatarSection.footerTitle = @"开启后可在单聊「聊天信息」页替换联系人头像；关闭后不再显示替换入口，也不替换头像";
+    [avatarSection addCell:[cellCls switchCellForSel:@selector(avatarSwitchChanged:)
+                                               target:self
+                                                title:@"备注用户头像"
+                                                   on:cfg.avatarEnabled]];
+    [avatarSection addCell:[cellCls normalCellForSel:@selector(clearAllAvatarTapped:)
+                                               target:self
+                                                title:@"一键全部还原"
+                                           rightValue:@"清理"]];
     [_tableViewManager addSection:avatarSection];
 }
 
@@ -533,6 +566,12 @@ static NSString *const kDDAvatarSectionId = @"DDProfileAvatarSection";
     [DDProfileConfig shared].wxidValue = text;
     [_wxidField resignFirstResponder];
     [[%c(WeToast) toast] showDoneToastWithText:(text.length ? @"已保存" : @"已清空")];
+    [self rebuild];
+}
+
+- (void)avatarSwitchChanged:(id)sender {
+    UISwitch *sw = (UISwitch *)sender;
+    [DDProfileConfig shared].avatarEnabled = sw.on;
     [self rebuild];
 }
 
@@ -575,6 +614,7 @@ static NSString *const kDDAvatarSectionId = @"DDProfileAvatarSection";
         NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
         _wxidEnabled = [def boolForKey:kDDWxidEnabledKey];
         _wxidValue = [def stringForKey:kDDWxidValueKey] ?: @"";
+        _avatarEnabled = [def boolForKey:kDDAvatarEnabledKey];
     }
     return self;
 }
@@ -590,6 +630,13 @@ static NSString *const kDDAvatarSectionId = @"DDProfileAvatarSection";
     _wxidValue = wxidValue ?: @"";
     NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
     [def setObject:_wxidValue forKey:kDDWxidValueKey];
+    [def synchronize];
+}
+
+- (void)setAvatarEnabled:(BOOL)avatarEnabled {
+    _avatarEnabled = avatarEnabled;
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    [def setBool:avatarEnabled forKey:kDDAvatarEnabledKey];
     [def synchronize];
 }
 
