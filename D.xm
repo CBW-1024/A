@@ -60,8 +60,11 @@
 //                              DelaySwitchSettingLogic(h:11) 还是异步延迟提交的，
 //                              联系人变更还会从 IContactMgrExt(h:141/142) 进来，
 //                              但所有路径最终都收敛到 initData。
-//      重建后补注入          —— 表格层兜底，挂在 MMTableViewInfo（不是 WCTableViewManager，
+//      reload 前补注入      —— 表格层主路径，挂在 MMTableViewInfo（不是 WCTableViewManager，
 //                              理由见实现处：子类覆写了 reloadTableView，挂父类接不到）。
+//                              插入放在 %orig 之前，让行在 reloadData 之前就回到数据里，
+//                              界面一次渲染到位 —— 这是不闪烁的关键。
+//      重建后补注入         —— 兜底，只在上面没接住时才真正生效。
 //    注入只挂这类「表格生命周期」事件；本插件自己不调 reloadTableData，
 //    保存/删除头像后也不手动补注入（那种场景要么行还在、要么已被上面入口接住）。
 //    导出文件为 Documents/DDProfileDiag.log。
@@ -189,6 +192,7 @@ static void DDShowErrorToast(NSString *text) {
 @interface AddContactToChatRoomViewController : UIViewController
 @property (retain, nonatomic) CContact *m_contact;
 - (void)dd_injectAvatarCellFrom:(NSString *)entry;
+- (void)dd_injectAvatarCellFrom:(NSString *)entry needsReload:(BOOL)needsReload;
 - (void)ddAvatarSwitchChanged:(UISwitch *)sender;
 @end
 
@@ -808,8 +812,16 @@ static NSMapTable *DDTableManagerToVC(void) {
     });
 }
 
+// needsReload=YES：表格已处于稳定态，插完得自己刷一次才能看见（viewWillAppear 等）。
+// needsReload=NO ：插完不刷，交给调用方紧接着的那次 reloadData 一起渲染 —— 用于
+//                  reloadTableView 的 %orig 之前，这样没有「行消失一帧」的中间态。
 %new
 - (void)dd_injectAvatarCellFrom:(NSString *)entry {
+    [self dd_injectAvatarCellFrom:entry needsReload:YES];
+}
+
+%new
+- (void)dd_injectAvatarCellFrom:(NSString *)entry needsReload:(BOOL)needsReload {
     DDProfileConfig *cfg = [DDProfileConfig shared];
     NSString *vcDesc = [NSString stringWithFormat:@"%@(%p)", NSStringFromClass([self class]), self];
 
@@ -897,12 +909,14 @@ static NSMapTable *DDTableManagerToVC(void) {
     [cell setUserInfo:kDDAvatarCellId];
     [firstSection insertCell:cell At:0];
 
-    // 这次刷新是我们自己发起的、数据也已经就位，没必要再让 MMTableViewInfo 的 hook
-    // 排一轮「重建后补注入」（下一帧跑进来也只会被去重挡掉，白白多一条日志）。
-    // 用同步标志让 hook 里的排期直接跳过：reloadTableView 同步返回，出作用域即清。
-    gDDInjecting = YES;
-    [info reloadTableView];
-    gDDInjecting = NO;
+    // needsReload=NO 时这里不刷：调用方（MMTableViewInfo.reloadTableView 的 %orig 之前）
+    // 紧接着就会 reloadData，行会被一起渲染出来。自己再刷一次不但多余，
+    // 还会重新进入 reloadTableView 的 hook，白绕一圈。
+    if (needsReload) {
+        gDDInjecting = YES;
+        [info reloadTableView];
+        gDDInjecting = NO;
+    }
 
     DDLOG(@"[头像·注入] 入口=%@ 成功：已插入首分组第0行  user=%@  已有图=%d  首分组原行数=%lu",
           entry, usrName, hasCustom, (unsigned long)cells.count);
@@ -984,22 +998,32 @@ static NSMapTable *DDTableManagerToVC(void) {
 // 现在改挂 MMTableViewInfo：它覆写了就抓它自己的；万一某版本没覆写，Substrate 也会在
 // 子类建 hook 再转发 super —— 两种情况都接得住。
 //
-// 三个入口都挂、统一延一帧再补：微信重建是多步流程
-// (clearAllSection -> 若干次 addSection: -> reloadTableView)，中途注入会被后面的步骤冲掉，
-// 得等这一轮跑完才稳。
+// 入口分工（刻意只留两个）：
+//   reloadTableView —— 主路径，插入放在 %orig 之前，零闪烁（见实现处说明）。
+//   clearAllSection —— 兜底，延一帧补，只在 reloadTableView 没接住时才真正生效。
+// 不再挂 addSection: —— 它是增量操作，一次重建会被连调十几次，而且它触发时重建还没完，
+// 插进去立刻被后面的步骤冲掉，纯属白做工（日志里那一串「重建后补注入 成功」就是它）。
 %hook MMTableViewInfo
 
+// 【为什么会一闪一闪】之前是「%orig 之后再延一帧补注入」。微信重建表格的链路是
+//   clearAllSection -> addSection ×N -> reloadTableView(内部 reloadData)
+// 行在第一步就被冲掉了，而我们要等到下一帧才插回去，中间那 16ms 界面上就是没有这一行 ——
+// 日志实证：一次进出详情页被冲掉又插回 11 次（与「头像开关创建 11 次」完全吻合），
+// 页面反复重建时，这个「消失一帧再回来」连起来就是肉眼可见的闪烁。
+//
+// 【怎么修】把插入挪到 %orig 之前：行在 reloadData 之前就回到 sections 里，
+//   紧接着的这次渲染一次性带上它，中间根本不存在「行不在」的帧，所以不会闪。
+//   并且 needsReload=NO —— 不再自己发起刷新，避免重入本 hook 白绕一圈。
 - (void)reloadTableView {
+    AddContactToChatRoomViewController *vc = [DDTableManagerToVC() objectForKey:self];
+    [vc dd_injectAvatarCellFrom:@"reload前补注入" needsReload:NO];
     %orig;
-    [self dd_scheduleAvatarReinject];
 }
 
+// 兜底：万一某条重建路径绕开 reloadTableView 直接 reloadData，上面就接不住。
+// clearAllSection 是重建的起点，在这排一次下一帧的补注入。正常情况下那一帧
+// reloadTableView 早把行补回来了，去重命中直接 return，不会重复刷、也不会闪。
 - (void)clearAllSection {
-    %orig;
-    [self dd_scheduleAvatarReinject];
-}
-
-- (void)addSection:(id)arg1 {
     %orig;
     [self dd_scheduleAvatarReinject];
 }
