@@ -30,7 +30,8 @@
 //      联系人资料页(CBaseContactInfoAssist.h:16 m_headView，同一个 MMHeadImageView 类)
 //      不走上面三个，实测补了这两个入口：
 //        setHeadImageByName:           (h:50) 最高频(75 次)，资料页走它 —— 实测命中替换
-//        doUpdateHeadImg:              (h:52) 低频(7 次)，防御用
+//        doUpdateHeadImg:              (h:52) 带头像重启微信时首屏必走，且原生实现不走
+//                                      updateHeadImage:，必须单独 hook（见实现处实测证据）
 //      另加 didMoveToWindow 兜底(UIView 通用，11 次)，它同时承担「登记进弱引用表」的职责，不能删。
 //      已实测两份日志均 0 次、故移除的入口：onHeadImageChange:(h:57)、onModifyContact:(h:71)
 //      —— 它们最终也要走 updateHeadImage: 写图，被上面拦住了，单独 hook 是冗余。
@@ -50,7 +51,12 @@
 //  诊断日志（DDLOG / DDJokerHit / 设置页「导出日志」）默认关闭：
 //    仅在设置页打开「记录运行日志」后，才在插件加载处与各功能 hook 命中处记录，
 //    并进入命中统计与导出文件；其余时候各模块静默运行，不写日志。
-//    开关由 viewWillAppear 入口创建（日志实证该 VC 不走 reloadTableData），入口名写进日志；
+//    开关由两个入口创建，缺一不可，入口名写进日志：
+//      viewWillAppear  —— 首次进入详情页时表格刚建好。
+//      reloadTableData —— 微信自己的开关(免打扰/置顶等)被点后会重建分组、把这一行冲掉，
+//                         且重建后不走 viewWillAppear，必须在这补回来（真机实测确认）。
+//    注入只挂这两个「表格生命周期」事件；本插件自己不调 reloadTableData，
+//    保存/删除头像后也不手动补注入（那种场景要么行还在、要么已被 reloadTableData 入口接住）。
 //    导出文件为 Documents/DDProfileDiag.log。
 // ============================================================
 
@@ -138,7 +144,7 @@ static void DDShowErrorToast(NSString *text) {
 @interface MMHeadImageView : UIView
 @property (readonly, nonatomic) NSString *nsUsrName;
 - (void)setHeadImageByName:(id)usrName;        // h:50 资料页入口，最高频
-- (void)doUpdateHeadImg:(BOOL)force;           // h:52 低频，防御用
+- (void)doUpdateHeadImg:(BOOL)force;           // h:52 重启后首屏必走，见实现处实测说明
 - (void)updateUsrName:(id)usrName withHeadImgUrl:(id)headImgUrl; // h:54
 - (void)updateHeadImage:(id)image;             // h:66 最终写图出口，所有路径必经
 - (void)ImageDidLoad:(id)image Url:(id)url;    // h:68 异步下载完成会覆盖，必须拦
@@ -161,7 +167,7 @@ static void DDShowErrorToast(NSString *text) {
 // 下面 %new 方法先声明以便 hook 内互相调用。
 @interface AddContactToChatRoomViewController : UIViewController
 @property (retain, nonatomic) CContact *m_contact;
-- (void)reloadTableData;
+- (void)reloadTableData;                       // h:114，微信重建表格走它，必须 hook 见下
 - (void)dd_injectAvatarCellFrom:(NSString *)entry;
 - (void)ddAvatarSwitchChanged:(UISwitch *)sender;
 @end
@@ -668,7 +674,10 @@ static BOOL DDTryApplyCustomAvatar(MMHeadImageView *view, NSString *usrName, NSS
     DDTryApplyCustomAvatar(self, usrName, @"头像替换·setHeadImageByName");
 }
 
-// 低频入口，只在特定刷新路径触发（实测：首轮日志 0 次、完整走一遍后 7 次），保留做防御。
+// 只在「带自定义头像重启微信」这条路径上才会命中替换，所以前几轮日志一直是 0，差点被当冗余删掉。
+// 实测(设好头像→杀进程→重开)：02:49:29.764 入口与替换各 1 次，紧跟的 updateHeadImage 第 2 次
+// 才是它写进去的——说明原生 doUpdateHeadImg: 内部并不走 updateHeadImage:，
+// 否则 %orig 期间就该有 updateHeadImage 命中了。所以这个入口必须单独 hook，删了首屏会漏。
 - (void)doUpdateHeadImg:(BOOL)force {
     %orig(force);
     DDJokerHit(@"头像入口·doUpdateHeadImg");
@@ -738,11 +747,21 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
 
 %hook AddContactToChatRoomViewController
 
-// 日志实证本版本只在 viewWillAppear 时构建完表格，reloadTableData 从未被微信主动调用，
-// 故只保留这一个入口（不再留 reloadTableData 兜底）；入口名进日志便于定位实际走的是哪条路。
+// 两个注入入口，缺一不可：
+//  viewWillAppear  —— 首次进入详情页时表格刚建好，在这里插第一行。
+//  reloadTableData —— 微信自己的开关（消息免打扰、置顶聊天等）被点后会重建分组，
+//                     把我们插入的行冲掉，而重建后不会再走 viewWillAppear，必须在这里补回来。
+// 注：早前据日志判断「微信不主动调 reloadTableData」是错的——当时根本没 hook 它，
+//     观察不到自然没有记录。真机实测点其它开关后行确实消失，故补上这个入口。
+// 另外：本插件自己绝不主动调 reloadTableData（会冲掉这一行），保存成功后改用补注入。
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
     [self dd_injectAvatarCellFrom:@"viewWillAppear"];
+}
+
+- (void)reloadTableData {
+    %orig;
+    [self dd_injectAvatarCellFrom:@"reloadTableData"];
 }
 
 %new
@@ -868,7 +887,7 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
             if (!strongSelf) return;
             if (!image) {
                 DDLOG(@"[头像·开关] 选图取消或取图失败 user=%@", usrName);
-                // 直接把开关弹回 off：不依赖表格重建（该 VC 的 reloadTableData 未必重建分组）。
+                // 直接把开关弹回 off：不靠重建表格来复位（重建会丢掉我们插入的行）。
                 [weakSw setOn:NO animated:YES];
                 return;
             }
@@ -879,7 +898,10 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
             } else {
                 DDLOG(@"[头像·开关] 保存成功 user=%@  图片尺寸=%@", usrName, NSStringFromCGSize(image.size));
                 DDShowDoneToast(@"头像已替换");
-                [strongSelf reloadTableData];
+                // 这里不要 reloadTableData（会把插入的行冲掉），也不要手动补注入：
+                // 表格没被重建时行本来就在，被重建时 reloadTableData 入口会自动补回来。
+                // 即注入只由表格生命周期事件驱动（viewWillAppear / reloadTableData），
+                // 不由「保存图片」这类业务事件驱动——后者要么空转、要么抢不过前者。
             }
         }];
     }
