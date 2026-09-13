@@ -126,7 +126,7 @@ static void DDShowErrorToast(NSString *text) {
 @property (retain, nonatomic) CContact *m_contact;
 - (void)reloadTableData;
 - (void)dd_injectAvatarCellFrom:(NSString *)entry;
-- (void)toggleCustomContactAvatar:(id)a0;
+- (void)ddAvatarSwitchChanged:(UISwitch *)sender;
 @end
 
 
@@ -601,7 +601,7 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
 
     UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(0, 0, 51, 31)];
     sw.on = hasCustom;
-    [sw addTarget:self action:@selector(toggleCustomContactAvatar:) forControlEvents:UIControlEventValueChanged];
+    [sw addTarget:self action:@selector(ddAvatarSwitchChanged:) forControlEvents:UIControlEventValueChanged];
 
     id cell = [cellCls normalCellForSel:nil
                                  target:nil
@@ -620,11 +620,15 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
     DDJokerHit(@"头像开关创建");
 }
 
-// 开关 action（方法名取自 AddContactToChatRoomViewController.h:66，保持原生命名）：
-// 由上面自建的 UISwitch 通过 addTarget:action: 直接绑定，不再依赖微信 cell 的 target-action。
-// UISwitch 的 ValueChanged 会把自己作为参数传进来，但这里不依赖它判断状态，
-// 改以「当前联系人是否已有本地头像」决定开/关，规避参数签名不确定的风险。
-- (void)toggleCustomContactAvatar:(id)a0 {
+// 开关 action：必须用 %new 显式添加，不能 %hook toggleCustomContactAvatar:。
+//   该方法虽在 dump 头文件(AddContactToChatRoomViewController.h:66)里有声明，但未必真实存在于
+//   当前微信——它可能是别的历史插件注入的。%hook 对不存在的方法不会兜底添加，
+//   于是 addTarget 绑定后一点击就 unrecognized selector 崩溃（实测闪退）。
+//   故改为 %new 自有方法，由 Logos 保证一定被添加进类。
+// 参数由 UISwitch 的 ValueChanged 传入，但这里不依赖它判断状态，
+//   改以「当前联系人是否已有本地头像」决定开/关。
+%new
+- (void)ddAvatarSwitchChanged:(UISwitch *)sender {
     CContact *contact = [self m_contact];
     NSString *usrName = [contact m_nsUsrName];
     if (usrName.length == 0) {
@@ -632,10 +636,8 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
         return;
     }
     DDJokerHit(@"头像开关点击");
-    // addTarget 绑定后这里拿到的一定是 UISwitch，记下类型和状态便于确认。
-    UISwitch *sw = [a0 isKindOfClass:[UISwitch class]] ? (UISwitch *)a0 : nil;
     DDLOG(@"[头像·开关] 点击 user=%@  参数类型=%@  on=%d", usrName,
-          a0 ? NSStringFromClass([a0 class]) : @"(nil)", sw ? (int)sw.isOn : -1);
+          sender ? NSStringFromClass([sender class]) : @"(nil)", sender ? (int)sender.isOn : -1);
 
     if (DDAvatarImageForUser(usrName)) {
         // 当前有图 -> 切换为关闭，删除本地图片。
@@ -646,19 +648,20 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
         // 当前无图 -> 切换为打开，调起相册选图并裁剪。
         DDLOG(@"[头像·开关] 打开：准备调起相册 user=%@", usrName);
         __weak typeof(self) weakSelf = self;
+        __weak UISwitch *weakSw = sender;
         [DDAvatarPicker presentFromViewController:self completion:^(UIImage *image) {
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
             if (!image) {
                 DDLOG(@"[头像·开关] 选图取消或取图失败 user=%@", usrName);
                 // 直接把开关弹回 off：不依赖表格重建（该 VC 的 reloadTableData 未必重建分组）。
-                [sw setOn:NO animated:YES];
+                [weakSw setOn:NO animated:YES];
                 return;
             }
             if (!DDAvatarSaveImage(image, usrName)) {
                 DDLOG(@"[头像·开关] 保存失败 user=%@  图片尺寸=%@", usrName, NSStringFromCGSize(image.size));
                 DDShowErrorToast(@"保存失败");
-                [sw setOn:NO animated:YES];
+                [weakSw setOn:NO animated:YES];
             } else {
                 DDLOG(@"[头像·开关] 保存成功 user=%@  图片尺寸=%@", usrName, NSStringFromCGSize(image.size));
                 DDShowDoneToast(@"头像已替换");
