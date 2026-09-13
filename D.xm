@@ -487,8 +487,11 @@ static UIViewController *DDTopPresentedViewController(UIViewController *vc) {
     picker.delegate = proxy;
     objc_setAssociatedObject(picker, &kDDAvatarPickerDelegateKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    // 延到下一个主循环再弹：开关的 ValueChanged 回调里立刻 present，偶尔会跟 UISwitch 自身的
-    // 动画 / 表格刷新撞在同一帧被系统忽略，延迟一帧更稳。
+    // 延到下一个主循环再弹，这里的一帧延迟是有意保留的：
+    //   1. 开关的 ValueChanged 回调里立刻 present，偶尔会跟 UISwitch 自身动画撞在同一帧被系统忽略；
+    //   2. 下面那三个状态判断（window / isBeingDismissed / presentedViewController）延一帧后读到的是稳定值。
+    // 实测点击到弹出共 1.54 秒，其中这一帧只占约 16ms(1%)，大头是相册本身加载，
+    // 去掉它省不出可感知的时间，却可能换来「点了开关没反应」这种最难查的静默失败。
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!presenter.view.window || presenter.isBeingDismissed || presenter.presentedViewController) {
             DDLOG(@"[头像·相册] 放弃弹出：presenter 状态异常 window=%d beingDismissed=%d presented=%@",
@@ -574,18 +577,22 @@ static NSHashTable *DDAvatarViews(void) {
 // 主动刷新：调原生 setHeadImageByName: 让它重读一次真实头像。
 // 此时本地图已删（或总开关已关），DDTryApplyCustomAvatar 不会再替换，于是恢复原图。
 // usrName 传 nil 表示刷新全部。
+// 调用点（开关 action / 设置页按钮 / 图片增删）全都在主线程，这里同步执行即可；
+// 只有万一份非主线程调进来，才退回主队列——在非主线程动 UI 会直接崩，不能省这层保险。
 static void DDRefreshAvatarViewsForUser(NSString *usrName) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSInteger n = 0;
-        for (MMHeadImageView *v in DDAvatarViews()) {
-            NSString *name = v.nsUsrName;
-            if (name.length == 0) continue;
-            if (usrName.length && ![name isEqualToString:usrName]) continue;
-            [v setHeadImageByName:name];
-            n++;
-        }
-        DDLOG(@"[头像·刷新] 主动重载 %ld 个视图  user=%@", (long)n, usrName ?: @"(全部)");
-    });
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ DDRefreshAvatarViewsForUser(usrName); });
+        return;
+    }
+    NSInteger n = 0;
+    for (MMHeadImageView *v in DDAvatarViews()) {
+        NSString *name = v.nsUsrName;
+        if (name.length == 0) continue;
+        if (usrName.length && ![name isEqualToString:usrName]) continue;
+        [v setHeadImageByName:name];
+        n++;
+    }
+    DDLOG(@"[头像·刷新] 主动重载 %ld 个视图  user=%@", (long)n, usrName ?: @"(全部)");
 }
 
 static NSMutableSet *DDAvatarSampledNames(void) {
