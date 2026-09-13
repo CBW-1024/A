@@ -25,6 +25,12 @@
 //      updateUsrName:withHeadImgUrl: (MMHeadImageView.h:54)
 //      ImageDidLoad:Url:           (MMHeadImageView.h:68，异步下载完成后会覆盖，必须拦)
 //    限制：不支持群聊，命中 [CBaseContact isChatroom] 直接跳过注入(CBaseContact.h:129)。
+//
+//  诊断日志（DDLOG / DDJokerHit / 设置页「导出日志」）默认关闭：
+//    仅在设置页打开「记录运行日志」后，才在插件加载处与各功能 hook 命中处记录，
+//    并进入命中统计与导出文件；其余时候各模块静默运行，不写日志。
+//    聊天详情页的「自定义头像」开关由哪个入口创建（reloadTableData / viewWillAppear）
+//    会写进日志，便于定位创建方法；导出文件为 Documents/DDProfileDiag.log。
 // ============================================================
 
 
@@ -37,6 +43,20 @@
 - (void)showDoneToastWithText:(id)a0;
 - (void)showErrorToastWithText:(id)a0;
 @end
+
+// 统一 toast 出口：设置页 VC 的 dd_showDoneToast: / dd_showErrorToast: 走这两个函数，
+// hook 内部（不在设置页 VC 里）直接调用，保证提示风格与主插件一致。
+static void DDShowDoneToast(NSString *text) {
+    if (!text.length) return;
+    WeToast *toast = [%c(WeToast) toast];
+    if (toast) [toast showDoneToastWithText:text];
+}
+
+static void DDShowErrorToast(NSString *text) {
+    if (!text.length) return;
+    WeToast *toast = [%c(WeToast) toast];
+    if (toast) [toast showErrorToastWithText:text];
+}
 
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
@@ -62,10 +82,14 @@
 - (id)getAllCells;
 @end
 
+// 与主插件声明保持一致（style 用 NSInteger、tableView 只读），另保留注入所需的分组访问方法。
 @interface WCTableViewManager : NSObject
-- (id)initWithFrame:(CGRect)frame style:(long long)style;
-@property (retain, nonatomic) UITableView *tableView;
+- (id)initWithFrame:(CGRect)frame style:(NSInteger)style;
+@property (nonatomic, readonly) UITableView *tableView;
+@property (nonatomic, weak) id delegate;
+- (void)clearAllSection;
 - (void)addSection:(id)arg1;
+- (id)cellInfoAtIndexPath:(NSIndexPath *)indexPath;
 - (unsigned long long)getSectionCount;
 - (id)getSectionAt:(unsigned long long)a0;
 - (id)getAllSections;
@@ -96,27 +120,12 @@
 - (void)ImageDidLoad:(id)image Url:(id)url;
 @end
 
-// 微信原生选图器(MMImagePickerManager.h:82/12)：optionObj 只列本插件用到的配置项；
-// m_delegate 是 weak，manager 由调用方强引用住(DDAvatarPicker.pickerManager)。
-@interface MMImagePickerManagerOptionObj : NSObject
-@property (nonatomic) long long maxImageCount;
-@property (nonatomic) BOOL canSendMultiImage;
-@property (nonatomic) BOOL disableVideoSelection;
-@property (nonatomic) BOOL imageDirectToEditMode;
-@property (nonatomic) BOOL m_directToFirstAlbum;
-@end
-
-@interface MMImagePickerManager : NSObject
-@property (weak, nonatomic) id m_delegate;
-- (void)showWithOptionObj:(id)option inViewController:(id)vc delegate:(id)delegate;
-@end
-
 // 单聊「聊天信息」页。m_contact 是当前联系人(AddContactToChatRoomViewController.h:24)。
 // 下面 %new 方法先声明以便 hook 内互相调用。
 @interface AddContactToChatRoomViewController : UIViewController
 @property (retain, nonatomic) CContact *m_contact;
 - (void)reloadTableData;
-- (void)dd_injectAvatarCellIfNeeded;
+- (void)dd_injectAvatarCellFrom:(NSString *)entry;
 - (void)toggleCustomContactAvatar:(id)a0;
 @end
 
@@ -127,13 +136,135 @@
 static NSString *const kDDWxidEnabledKey  = @"DDProfileWxidEnabled";
 static NSString *const kDDWxidValueKey    = @"DDProfileWxidValue";
 static NSString *const kDDAvatarEnabledKey = @"DDProfileAvatarEnabled";
+static NSString *const kDDDiagEnabledKey   = @"DDProfileDiagEnabled";
 
 @interface DDProfileConfig : NSObject
 + (instancetype)shared;
 @property (nonatomic) BOOL wxidEnabled;
 @property (nonatomic, copy) NSString *wxidValue;
 @property (nonatomic) BOOL avatarEnabled;
+@property (nonatomic) BOOL diagEnabled;
 @end
+
+
+#pragma mark - 诊断日志 · 采集
+// DDLOG 写内存缓冲（导出用）；DDJokerHit 做 hook 命中计数与节流。
+// 默认关闭：只有设置页打开「记录运行日志」后才记录，各功能模块静默运行。
+
+// DDAvatarDir 定义在下面的「头像文件管理」段，这里先声明，导出日志时用它盘点已替换头像。
+static NSString *DDAvatarDir(void);
+
+
+static NSDateFormatter *DDLogTimeFormatter(void) {
+    static NSDateFormatter *fmt = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        fmt.dateFormat = @"HH:mm:ss.SSS";
+    });
+    return fmt;
+}
+
+static NSMutableString *DDLogBuffer(void) {
+    static NSMutableString *buf = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ buf = [NSMutableString string]; });
+    return buf;
+}
+
+static NSMutableDictionary *DDLogHits(void) {
+    static NSMutableDictionary *hits = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ hits = [NSMutableDictionary dictionary]; });
+    return hits;
+}
+
+static void DDProfileLog(NSString *fmt, ...) {
+    if (![DDProfileConfig shared].diagEnabled) return;
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSString *line = [NSString stringWithFormat:@"%@  %@",
+                      [DDLogTimeFormatter() stringFromDate:[NSDate date]], msg];
+    NSLog(@"[DD小丑资料] %@", line);
+    NSMutableString *buf = DDLogBuffer();
+    @synchronized (buf) {
+        [buf appendFormat:@"%@\n", line];
+        if (buf.length > 300000) {
+            [buf deleteCharactersInRange:NSMakeRange(0, buf.length - 200000)];
+        }
+    }
+}
+
+#define DDLOG(...) DDProfileLog(__VA_ARGS__)
+
+// hook 命中计数，节流输出（前 3 次 + 每 50 次），避免刷屏。
+static void DDJokerHit(NSString *tag) {
+    NSMutableDictionary *hits = DDLogHits();
+    NSInteger n = 0;
+    @synchronized (hits) {
+        n = [hits[tag] integerValue] + 1;
+        hits[tag] = @(n);
+    }
+    if (n <= 3 || n % 50 == 0) DDLOG(@"HIT %@ 第 %ld 次", tag, (long)n);
+}
+
+static void DDProfileClearDiagLog(void) {
+    NSMutableString *buf = DDLogBuffer();
+    @synchronized (buf) { [buf setString:@""]; }
+    NSMutableDictionary *hits = DDLogHits();
+    @synchronized (hits) { [hits removeAllObjects]; }
+}
+
+static NSString *DDProfileDescribeHitStats(void) {
+    NSMutableDictionary *hits = DDLogHits();
+    if (!hits.count) return @"  (还没有任何 hook 被触发)\n";
+    NSMutableString *s = [NSMutableString string];
+    for (NSString *tag in [hits keysSortedByValueUsingComparator:^NSComparisonResult(id a, id b) {
+        return [b compare:a];
+    }]) {
+        [s appendFormat:@"  %-28@ %@ 次\n", tag, hits[tag]];
+    }
+    return s;
+}
+
+static NSString *DDProfileExportDiagLog(void) {
+    NSMutableString *out = [NSMutableString string];
+    [out appendString:@"===== DD小丑资料 诊断日志 =====\n"];
+
+    DDProfileConfig *c = [DDProfileConfig shared];
+    [out appendFormat:@"开关状态 : 微信号=%d 头像=%d 诊断=%d\n",
+     c.wxidEnabled, c.avatarEnabled, c.diagEnabled];
+    [out appendFormat:@"微信号值 : %@\n", c.wxidValue.length ? c.wxidValue : @"(空)"];
+    [out appendString:@"复现步骤 : 清空日志 → 复现问题 → 回本页导出，把日志发出去即可定位\n"];
+
+    // 已替换头像盘点：Documents/DDAvatar/ 下的 png。
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:DDAvatarDir() error:nil];
+    NSMutableArray *avatars = [NSMutableArray array];
+    for (NSString *f in files) {
+        if ([f.pathExtension isEqualToString:@"png"]) [avatars addObject:f];
+    }
+    [out appendFormat:@"已替换头像 : %lu 个%@\n", (unsigned long)avatars.count,
+     avatars.count ? [NSString stringWithFormat:@"（%@）", [avatars componentsJoinedByString:@", "]] : @""];
+
+    [out appendString:@"\n----- hook 命中统计 -----\n"];
+    [out appendString:DDProfileDescribeHitStats()];
+
+    [out appendString:@"\n----- 日志正文 -----\n"];
+    NSMutableString *buf = DDLogBuffer();
+    NSString *body = nil;
+    @synchronized (buf) { body = [buf copy]; }
+    [out appendString:body.length ? body : @"(空：诊断开关没开，或还没触发过相关 hook)\n"];
+
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *file = [paths.firstObject stringByAppendingPathComponent:@"DDProfileDiag.log"];
+    NSError *err = nil;
+    [out writeToFile:file atomically:YES encoding:NSUTF8StringEncoding error:&err];
+    if (err) { NSLog(@"[DD小丑资料] 写诊断日志失败: %@", err); return nil; }
+    return file;
+}
 
 
 #pragma mark - 头像文件管理
@@ -220,74 +351,56 @@ static NSInteger DDAvatarRemoveAll(void) {
 }
 
 
-#pragma mark - 选图（微信原生 MMImagePickerManager）
-// 走微信自己的选图 + 裁剪链路：MMImagePickerManager + MMImagePickerManagerOptionObj
-//   (MMImagePickerManager.h:82  showWithOptionObj:inViewController:delegate:)
-// 回调方法名由两处原生实现确证：TakeOrSelectHeadImageLogic.h:17、NewRemarkViewController.h:290
-//   MMImagePickerManager:didFinishPickingImageWithInfo: / MMImagePickerManagerDidCancel:
-// 仍用独立代理对象承接，不往微信 VC 上加同名 %new 方法——该 VC 自己已有
-// imagePickerController:didFinishPickingMediaWithInfo:(AddContactToChatRoomViewController.h:76)。
-// 注意 m_delegate 是 weak(MMImagePickerManager.h:12)，manager 必须自己强引用住。
+#pragma mark - 选图（系统 UIImagePickerController）
+// 与主插件同款：独立 delegate 类 + 系统相册，不往 AddContactToChatRoomViewController 上加同名
+// %new 方法（该 VC 自己已有 imagePickerController:didFinishPickingMediaWithInfo:，见头文件 h:76）。
+// delegate 用关联对象挂在 picker 上持有，而不是全局静态变量，picker 释放时自动释放。
+// 与主插件的差异：头像需要方形，故开启 allowsEditing 并优先取 EditedImage。
 
 
 typedef void (^DDAvatarPickCompletion)(UIImage *image);
 
-// info 的 key 由微信内部决定，做通用提取：先按系统 key 取，取不到就遍历值找 UIImage。
-static UIImage *DDExtractImageFromInfo(id info) {
-    if (!info) return nil;
-    if ([info isKindOfClass:[UIImage class]]) return (UIImage *)info;
-    if (![info isKindOfClass:[NSDictionary class]]) return nil;
-    NSDictionary *dic = (NSDictionary *)info;
-    UIImage *img = dic[UIImagePickerControllerEditedImage] ?: dic[UIImagePickerControllerOriginalImage];
-    if (img) return img;
-    for (id value in dic.allValues) {
-        if ([value isKindOfClass:[UIImage class]]) return (UIImage *)value;
-    }
-    return nil;
-}
-
-@interface DDAvatarPicker : NSObject
+@interface DDAvatarPicker : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 @property (nonatomic, copy) DDAvatarPickCompletion completion;
-@property (nonatomic, strong) MMImagePickerManager *pickerManager;
 + (void)presentFromViewController:(UIViewController *)vc completion:(DDAvatarPickCompletion)completion;
 @end
 
 @implementation DDAvatarPicker
 
-// 强引用持有：代理和 manager 都得活到选图结束。
-static DDAvatarPicker *gDDAvatarPicker = nil;
+static char kDDAvatarPickerDelegateKey;
 
 + (void)presentFromViewController:(UIViewController *)vc completion:(DDAvatarPickCompletion)completion {
     if (!vc) return;
+    if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypePhotoLibrary]) {
+        if (completion) completion(nil);
+        return;
+    }
+    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+    picker.allowsEditing = YES;
+    picker.title = @"头像修改";
 
-    MMImagePickerManagerOptionObj *option = [[%c(MMImagePickerManagerOptionObj) alloc] init];
-    option.maxImageCount = 1;            // 头像只要一张
-    option.canSendMultiImage = NO;
-    option.disableVideoSelection = YES;  // 只要图片，不要视频
-    option.imageDirectToEditMode = YES;  // 选完直接进裁剪页
-    option.m_directToFirstAlbum = YES;
-
-    MMImagePickerManager *manager = [[%c(MMImagePickerManager) alloc] init];
     DDAvatarPicker *proxy = [[DDAvatarPicker alloc] init];
     proxy.completion = completion;
-    proxy.pickerManager = manager;       // 强引用，否则 m_delegate(weak) 一放就断
-    manager.m_delegate = (id)proxy;
-    gDDAvatarPicker = proxy;
+    picker.delegate = proxy;
+    objc_setAssociatedObject(picker, &kDDAvatarPickerDelegateKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    [manager showWithOptionObj:option inViewController:vc delegate:(id)proxy];
+    [vc presentViewController:picker animated:YES completion:nil];
 }
 
-- (void)MMImagePickerManager:(id)manager didFinishPickingImageWithInfo:(id)info {
-    UIImage *image = DDExtractImageFromInfo(info);
+- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<NSString *,id> *)info {
+    UIImage *image = info[UIImagePickerControllerEditedImage] ?: info[UIImagePickerControllerOriginalImage];
     DDAvatarPickCompletion cb = self.completion;
-    gDDAvatarPicker = nil;
-    if (cb) cb(image);
+    [picker dismissViewControllerAnimated:YES completion:^{
+        if (cb) cb(image);
+    }];
 }
 
-- (void)MMImagePickerManagerDidCancel:(id)manager {
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
     DDAvatarPickCompletion cb = self.completion;
-    gDDAvatarPicker = nil;
-    if (cb) cb(nil);
+    [picker dismissViewControllerAnimated:YES completion:^{
+        if (cb) cb(nil);
+    }];
 }
 
 @end
@@ -309,7 +422,10 @@ static NSString *DDCustomWxid(void) {
 
 - (id)m_nsAliasName {
     NSString *custom = DDCustomWxid();
-    if (custom) return custom;
+    if (custom) {
+        DDJokerHit(@"微信号替换·CSetting");
+        return custom;
+    }
     return %orig;
 }
 
@@ -319,7 +435,10 @@ static NSString *DDCustomWxid(void) {
 
 - (id)m_nsAliasName {
     NSString *custom = DDCustomWxid();
-    if (custom && [self isSelf]) return custom;
+    if (custom && [self isSelf]) {
+        DDJokerHit(@"微信号替换·CBaseContact");
+        return custom;
+    }
     return %orig;
 }
 
@@ -332,8 +451,10 @@ static NSString *DDCustomWxid(void) {
 %hook MMHeadImageView
 
 // 同步写图入口：命中本地图就直接换成本地图，不再显示网络头像。
+// 这三个入口刷新非常频繁，只在真正命中替换时记命中数（节流输出），不逐次写日志。
 - (void)updateHeadImage:(id)image {
     UIImage *custom = DDAvatarImageForUser([self nsUsrName]);
+    if (custom) DDJokerHit(@"头像替换·updateHeadImage");
     %orig(custom ?: image);
 }
 
@@ -341,14 +462,20 @@ static NSString *DDCustomWxid(void) {
 - (void)updateUsrName:(id)usrName withHeadImgUrl:(id)headImgUrl {
     %orig(usrName, headImgUrl);
     UIImage *custom = DDAvatarImageForUser(usrName ?: [self nsUsrName]);
-    if (custom) [self updateHeadImage:custom];
+    if (custom) {
+        DDJokerHit(@"头像替换·updateUsrName");
+        [self updateHeadImage:custom];
+    }
 }
 
 // 网络头像异步下载完成会走这里，不拦的话本地图会被真头像盖掉。
 - (void)ImageDidLoad:(id)image Url:(id)url {
     %orig(image, url);
     UIImage *custom = DDAvatarImageForUser([self nsUsrName]);
-    if (custom) [self updateHeadImage:custom];
+    if (custom) {
+        DDJokerHit(@"头像替换·ImageDidLoad");
+        [self updateHeadImage:custom];
+    }
 }
 
 %end
@@ -362,29 +489,44 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
 %hook AddContactToChatRoomViewController
 
 // 微信不同版本构建聊天详情页的时机不同：有的走 reloadTableData，有的只在 viewWillAppear 之后才算构建完。
-// 这里双入口注入，靠 cell 的 userInfo 去重，不会重复插行。
+// 这里双入口注入，靠 cell 的 userInfo 去重，不会重复插行；入口名进日志，便于定位实际走的是哪条路。
 - (void)reloadTableData {
     %orig;
-    [self dd_injectAvatarCellIfNeeded];
+    [self dd_injectAvatarCellFrom:@"reloadTableData"];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
-    [self dd_injectAvatarCellIfNeeded];
+    [self dd_injectAvatarCellFrom:@"viewWillAppear"];
 }
 
 %new
-- (void)dd_injectAvatarCellIfNeeded {
+- (void)dd_injectAvatarCellFrom:(NSString *)entry {
+    DDProfileConfig *cfg = [DDProfileConfig shared];
+    NSString *vcDesc = [NSString stringWithFormat:@"%@(%p)", NSStringFromClass([self class]), self];
+
     // 全局总开关关闭时不注入聊天详情页入口。
-    if (![DDProfileConfig shared].avatarEnabled) return;
+    if (!cfg.avatarEnabled) {
+        DDLOG(@"[头像·注入] 入口=%@ 跳过：总开关未开  VC=%@", entry, vcDesc);
+        return;
+    }
 
     CContact *contact = [self m_contact];
-    if (!contact) return;
+    if (!contact) {
+        DDLOG(@"[头像·注入] 入口=%@ 跳过：m_contact 为空  VC=%@", entry, vcDesc);
+        return;
+    }
     // 群聊不支持，直接跳过。
-    if ([contact isChatroom]) return;
+    if ([contact isChatroom]) {
+        DDLOG(@"[头像·注入] 入口=%@ 跳过：群聊  VC=%@", entry, vcDesc);
+        return;
+    }
 
     NSString *usrName = [contact m_nsUsrName];
-    if (usrName.length == 0) return;
+    if (usrName.length == 0) {
+        DDLOG(@"[头像·注入] 入口=%@ 跳过：usrName 为空  VC=%@", entry, vcDesc);
+        return;
+    }
 
     WCTableViewManager *info = nil;
     @try {
@@ -392,7 +534,10 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
     } @catch (NSException *e) {
         info = nil;
     }
-    if (!info) return;
+    if (!info) {
+        DDLOG(@"[头像·注入] 入口=%@ 跳过：m_tableViewInfo 取不到  VC=%@", entry, vcDesc);
+        return;
+    }
 
     // 详情页第一个分组：把「自定义头像」开关作为它的首行插入。
     id firstSection = nil;
@@ -401,11 +546,19 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
     } @catch (NSException *e) {
         firstSection = nil;
     }
-    if (!firstSection) return;
+    if (!firstSection) {
+        DDLOG(@"[头像·注入] 入口=%@ 跳过：首分组为空(sectionCount=%llu)  VC=%@",
+              entry, [info respondsToSelector:@selector(getSectionCount)] ? [info getSectionCount] : 0, vcDesc);
+        return;
+    }
 
     // 已注入则跳过（每次 reloadTableData 都会走到，靠 cell 的 userInfo 去重）。
-    for (id c in [firstSection getAllCells]) {
-        if ([[c userInfo] isEqual:kDDAvatarCellId]) return;
+    NSArray *cells = [firstSection respondsToSelector:@selector(getAllCells)] ? [firstSection getAllCells] : nil;
+    for (id c in cells) {
+        if ([[c userInfo] isEqual:kDDAvatarCellId]) {
+            DDLOG(@"[头像·注入] 入口=%@ 跳过：已注入过  user=%@", entry, usrName);
+            return;
+        }
     }
 
     // 原生 switchCell：on 状态取决于当前联系人是否已保存本地头像(WCTableViewCellManager.h:55)。
@@ -415,9 +568,17 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
                                 target:self
                                  title:@"自定义头像"
                                     on:hasCustom];
+    if (!cell) {
+        DDLOG(@"[头像·注入] 入口=%@ 失败：switchCell 创建返回 nil  user=%@", entry, usrName);
+        return;
+    }
     [cell setUserInfo:kDDAvatarCellId];
     [firstSection insertCell:cell At:0];
     [info reloadTableView];
+
+    DDLOG(@"[头像·注入] 入口=%@ 成功：已插入首分组第0行  user=%@  已有图=%d  首分组原行数=%lu",
+          entry, usrName, hasCustom, (unsigned long)cells.count);
+    DDJokerHit(@"头像开关创建");
 }
 
 // 复用微信原生的「自定义头像」开关 action（AddContactToChatRoomViewController.h:66）：
@@ -426,26 +587,38 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
 - (void)toggleCustomContactAvatar:(id)a0 {
     CContact *contact = [self m_contact];
     NSString *usrName = [contact m_nsUsrName];
-    if (usrName.length == 0) return;
+    if (usrName.length == 0) {
+        DDLOG(@"[头像·开关] 跳过：usrName 为空");
+        return;
+    }
+    DDJokerHit(@"头像开关点击");
+    // 传入参数类型不确定，记下来便于确认微信实际传的是什么（UISwitch / cellInfo / 其它）。
+    DDLOG(@"[头像·开关] 点击 user=%@  参数类型=%@", usrName,
+          a0 ? NSStringFromClass([a0 class]) : @"(nil)");
 
     if (DDAvatarImageForUser(usrName)) {
         // 当前有图 -> 切换为关闭，删除本地图片。
-        DDAvatarRemoveForUser(usrName);
-        [[%c(WeToast) toast] showDoneToastWithText:@"已恢复默认头像"];
+        BOOL ok = DDAvatarRemoveForUser(usrName);
+        DDLOG(@"[头像·开关] 关闭：删除本地图 user=%@  结果=%d", usrName, ok);
+        DDShowDoneToast(@"已恢复默认头像");
     } else {
         // 当前无图 -> 切换为打开，调起微信相册选图并裁剪。
+        DDLOG(@"[头像·开关] 打开：准备调起相册 user=%@", usrName);
         __weak typeof(self) weakSelf = self;
         [DDAvatarPicker presentFromViewController:self completion:^(UIImage *image) {
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
             if (!image) {
+                DDLOG(@"[头像·开关] 选图取消或取图失败 user=%@", usrName);
                 [strongSelf reloadTableData];
                 return;
             }
             if (!DDAvatarSaveImage(image, usrName)) {
-                [[%c(WeToast) toast] showErrorToastWithText:@"保存失败"];
+                DDLOG(@"[头像·开关] 保存失败 user=%@  图片尺寸=%@", usrName, NSStringFromCGSize(image.size));
+                DDShowErrorToast(@"保存失败");
             } else {
-                [[%c(WeToast) toast] showDoneToastWithText:@"头像已替换"];
+                DDLOG(@"[头像·开关] 保存成功 user=%@  图片尺寸=%@", usrName, NSStringFromCGSize(image.size));
+                DDShowDoneToast(@"头像已替换");
             }
             [strongSelf reloadTableData];
         }];
@@ -458,11 +631,29 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
 #pragma mark - 设置页
 
 
-@interface DDProfileSettingsViewController : UIViewController
+@interface DDProfileSettingsViewController : UIViewController <UITableViewDelegate>
+@property (nonatomic, strong) WCTableViewManager *tableViewManager;
+- (void)buildTable;
+- (void)rebuild;
+- (UIView *)inputRowWithField:(UITextField *)field
+                       action:(SEL)action
+                  placeholder:(NSString *)placeholder
+                         text:(NSString *)text
+                     keyboard:(UIKeyboardType)keyboard;
+- (UIButton *)dd_actionButton:(NSString *)title action:(SEL)action x:(CGFloat)x;
+- (void)wxidSwitchChanged:(id)sender;
+- (void)wxidConfirm:(id)sender;
+- (void)avatarSwitchChanged:(id)sender;
+- (void)clearAllAvatarTapped:(id)sender;
+- (void)diagSwitchChanged:(id)sender;
+- (void)clearDiagLogTapped:(id)sender;
+- (void)exportDiagLogTapped:(id)sender;
+- (void)dd_showDoneToast:(NSString *)text;
+- (void)dd_showErrorToast:(NSString *)text;
 @end
 
 @implementation DDProfileSettingsViewController {
-    WCTableViewManager *_tableViewManager;
+    id<UITableViewDelegate> _originalDelegate;
     UITextField *_wxidField;
 }
 
@@ -483,7 +674,36 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
     _tableViewManager.tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
     [self.view addSubview:_tableViewManager.tableView];
 
+    // 接管 delegate 后再转发给微信原生 manager，用于处理子行缩进（与主插件同款写法）。
+    _originalDelegate = _tableViewManager.delegate;
+    _tableViewManager.delegate = self;
+
     [self buildTable];
+}
+
+// 表视图委托转发：保持微信原生行为，只额外处理带 SubCell 标记的子行缩进。
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:willDisplayCell:forRowAtIndexPath:)]) {
+        [_originalDelegate tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
+    }
+    WCTableViewCellManager *cellInfo = [_tableViewManager cellInfoAtIndexPath:indexPath];
+    if ([cellInfo.userInfo isEqual:@"SubCell"]) {
+        cell.indentationLevel = 1;
+        cell.indentationWidth = 16.0;
+    }
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)]) {
+        [_originalDelegate tableView:tableView didSelectRowAtIndexPath:indexPath];
+    }
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:heightForRowAtIndexPath:)]) {
+        return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
+    }
+    return UITableViewAutomaticDimension;
 }
 
 - (UIView *)inputRowWithField:(UITextField *)field
@@ -524,7 +744,22 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
     return container;
 }
 
+// 带背景的小按钮（参考主插件风格）：放在 cell 右侧，不带箭头。
+- (UIButton *)dd_actionButton:(NSString *)title action:(SEL)action x:(CGFloat)x {
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    btn.frame = CGRectMake(x, 0, 52, 34);
+    [btn setTitle:title forState:UIControlStateNormal];
+    [btn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
+    btn.backgroundColor = [UIColor systemGray5Color];
+    btn.layer.cornerRadius = 6.0;
+    btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
+    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    return btn;
+}
+
 - (void)buildTable {
+    [_tableViewManager clearAllSection];
+
     DDProfileConfig *cfg = [DDProfileConfig shared];
     Class cellCls = %c(WCTableViewCellManager);
 
@@ -541,10 +776,13 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
                                    placeholder:@"例如：wxid_abc123"
                                           text:cfg.wxidValue ?: @""
                                       keyboard:UIKeyboardTypeASCIICapable];
-        [wxidSection addCell:[cellCls normalCellForSel:nil
-                                               target:nil
-                                                title:@"↳目标微信号"
-                                            rightView:right]];
+        // 打上 SubCell 标记，tableView:willDisplayCell: 里据此缩进，与主插件子行样式一致。
+        WCTableViewCellManager *wxidSubCell = [cellCls normalCellForSel:nil
+                                                               target:nil
+                                                                title:@"↳目标微信号"
+                                                            rightView:right];
+        wxidSubCell.userInfo = @"SubCell";
+        [wxidSection addCell:wxidSubCell];
     }
     [_tableViewManager addSection:wxidSection];
 
@@ -554,11 +792,31 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
                                                target:self
                                                 title:@"备注用户头像"
                                                    on:cfg.avatarEnabled]];
-    [avatarSection addCell:[cellCls normalCellForSel:@selector(clearAllAvatarTapped:)
-                                               target:self
-                                                title:@"一键全部还原"
-                                           rightValue:@"清理"]];
+    // 清理按钮放进右侧容器：cell 的 sel 传 nil，避免整行出现微信原生的跳转箭头。
+    UIButton *clearBtn = [self dd_actionButton:@"清理" action:@selector(clearAllAvatarTapped:) x:0];
+    UIView *clearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
+    [clearRight addSubview:clearBtn];
+    [avatarSection addCell:[cellCls normalCellForSel:nil
+                                              target:nil
+                                               title:@"一键全部还原"
+                                           rightView:clearRight]];
     [_tableViewManager addSection:avatarSection];
+
+    WCTableViewSectionManager *diagSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"诊断日志"];
+    diagSection.footerTitle = @"默认仅在插件启动时记录一条。排查问题时打开「记录运行日志」，复现后点下方「导出日志」即可";
+    [diagSection addCell:[cellCls switchCellForSel:@selector(diagSwitchChanged:)
+                                            target:self
+                                             title:@"记录运行日志"
+                                                on:cfg.diagEnabled]];
+    UIButton *exportBtn = [self dd_actionButton:@"导出" action:@selector(exportDiagLogTapped:) x:0];
+    UIButton *logClearBtn = [self dd_actionButton:@"清空" action:@selector(clearDiagLogTapped:) x:60];
+    UIView *logRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 112, 34)];
+    [logRight addSubview:exportBtn];
+    [logRight addSubview:logClearBtn];
+    [diagSection addCell:[cellCls normalCellForSel:nil target:nil title:@"导出日志" rightView:logRight]];
+    [_tableViewManager addSection:diagSection];
+
+    [_tableViewManager reloadTableView];
 }
 
 - (void)wxidSwitchChanged:(id)sender {
@@ -571,7 +829,7 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
     NSString *text = [_wxidField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     [DDProfileConfig shared].wxidValue = text;
     [_wxidField resignFirstResponder];
-    [[%c(WeToast) toast] showDoneToastWithText:(text.length ? @"已保存" : @"已清空")];
+    [self dd_showDoneToast:(text.length ? @"已保存" : @"已清空")];
     [self rebuild];
 }
 
@@ -583,21 +841,55 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
 
 - (void)clearAllAvatarTapped:(id)sender {
     NSInteger n = DDAvatarRemoveAll();
-    [[%c(WeToast) toast] showDoneToastWithText:(n > 0 ? [NSString stringWithFormat:@"已清除 %ld 个", (long)n] : @"暂无替换")];
+    DDLOG(@"[头像·清理] 一键全部还原：清除 %ld 个", (long)n);
+    [self dd_showDoneToast:(n > 0 ? [NSString stringWithFormat:@"已清除 %ld 个", (long)n] : @"暂无替换")];
 }
 
-- (void)rebuild {
-    // 开关 / 输入变化后重建整表：移除旧 tableView，重建 manager 再灌数据。
-    for (UIView *v in self.view.subviews) {
-        if ([v isKindOfClass:[UITableView class]]) [v removeFromSuperview];
+- (void)diagSwitchChanged:(id)sender {
+    UISwitch *sw = (UISwitch *)sender;
+    [DDProfileConfig shared].diagEnabled = sw.on;
+    if (sw.on) DDLOG(@"[诊断] 日志开关已打开");
+    [self rebuild];
+}
+
+- (void)clearDiagLogTapped:(id)sender {
+    DDProfileClearDiagLog();
+    [self dd_showDoneToast:@"日志已清空"];
+}
+
+- (void)exportDiagLogTapped:(id)sender {
+    NSString *path = DDProfileExportDiagLog();
+    if (!path.length) {
+        [self dd_showErrorToast:@"导出失败"];
+        return;
     }
-    _tableViewManager = [(WCTableViewManager *)[%c(WCTableViewManager) alloc] initWithFrame:[[UIScreen mainScreen] bounds]
-                                                                                     style:UITableViewStyleInsetGrouped];
-    _tableViewManager.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    _tableViewManager.tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
-    [self.view addSubview:_tableViewManager.tableView];
+    NSURL *url = [NSURL fileURLWithPath:path];
+    UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    if (av.popoverPresentationController) {
+        UIView *anchor = [sender isKindOfClass:[UIView class]] ? (UIView *)sender : self.view;
+        av.popoverPresentationController.sourceView = anchor;
+        av.popoverPresentationController.sourceRect = anchor.bounds;
+    }
+    __weak typeof(self) weakSelf = self;
+    av.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *error) {
+        [weakSelf dd_showDoneToast:(completed ? @"日志已导出" : @"已取消")];
+    };
+    [self presentViewController:av animated:YES completion:nil];
+}
+
+// toast 出口与主插件同名同形：内部转发到全局函数，hook 内部也用同一套提示。
+- (void)dd_showDoneToast:(NSString *)text {
+    DDShowDoneToast(text);
+}
+
+- (void)dd_showErrorToast:(NSString *)text {
+    DDShowErrorToast(text);
+}
+
+// 与主插件一致：开关 / 输入变化后只重建表格内容（buildTable 内部 clearAllSection），
+// 不重建 manager —— 既避免 tableView 被反复移除重建，也不会弄丢接管后的 delegate 转发。
+- (void)rebuild {
     [self buildTable];
-    [_tableViewManager reloadTableView];
 }
 
 @end
@@ -621,6 +913,8 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
         _wxidEnabled = [def boolForKey:kDDWxidEnabledKey];
         _wxidValue = [def stringForKey:kDDWxidValueKey] ?: @"";
         _avatarEnabled = [def boolForKey:kDDAvatarEnabledKey];
+        // 日志默认关闭，与功能开关默认值保持一致的处理：没存过就是 NO。
+        _diagEnabled = [def objectForKey:kDDDiagEnabledKey] ? [def boolForKey:kDDDiagEnabledKey] : NO;
     }
     return self;
 }
@@ -646,6 +940,13 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
     [def synchronize];
 }
 
+- (void)setDiagEnabled:(BOOL)diagEnabled {
+    _diagEnabled = diagEnabled;
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    [def setBool:diagEnabled forKey:kDDDiagEnabledKey];
+    [def synchronize];
+}
+
 @end
 
 
@@ -658,5 +959,7 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
         [mgr registerControllerWithTitle:@"DD小丑资料"
                                  version:@"1.0.0"
                               controller:@"DDProfileSettingsViewController"];
+        DDLOG(@"=== 插件加载 ===");
+        DDJokerHit(@"插件加载");
     }
 }
