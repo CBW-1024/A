@@ -361,8 +361,14 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
 
 %hook AddContactToChatRoomViewController
 
-// 表格重建后注入，靠 cell 的 userInfo 标记去重，避免 reload 多次重复插行。
+// 微信不同版本构建聊天详情页的时机不同：有的走 reloadTableData，有的只在 viewWillAppear 之后才算构建完。
+// 这里双入口注入，靠 cell 的 userInfo 去重，不会重复插行。
 - (void)reloadTableData {
+    %orig;
+    [self dd_injectAvatarCellIfNeeded];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
     %orig;
     [self dd_injectAvatarCellIfNeeded];
 }
