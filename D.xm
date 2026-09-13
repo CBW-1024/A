@@ -369,12 +369,35 @@ typedef void (^DDAvatarPickCompletion)(UIImage *image);
 
 static char kDDAvatarPickerDelegateKey;
 
+// 找最上层可 present 的 VC：当前 VC 若已在呈现别的控制器，就从被呈现的那个继续往下找。
+// 直接在已被遮挡的 VC 上 present，系统会静默丢弃并打 "already presenting" 警告。
+static UIViewController *DDTopPresentedViewController(UIViewController *vc) {
+    UIViewController *top = vc;
+    NSInteger guard = 0;
+    while (top.presentedViewController && !top.presentedViewController.isBeingDismissed && guard++ < 8) {
+        top = top.presentedViewController;
+    }
+    return top;
+}
+
 + (void)presentFromViewController:(UIViewController *)vc completion:(DDAvatarPickCompletion)completion {
-    if (!vc) return;
-    if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypePhotoLibrary]) {
+    if (!vc) {
+        DDLOG(@"[头像·相册] 失败：源 VC 为空");
         if (completion) completion(nil);
         return;
     }
+    if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypePhotoLibrary]) {
+        DDLOG(@"[头像·相册] 失败：相册源不可用");
+        if (completion) completion(nil);
+        return;
+    }
+
+    UIViewController *presenter = DDTopPresentedViewController(vc);
+    DDLOG(@"[头像·相册] 准备弹出 presenter=%@  window=%d  presented=%@",
+          NSStringFromClass([presenter class]),
+          presenter.view.window ? 1 : 0,
+          presenter.presentedViewController ? NSStringFromClass([presenter.presentedViewController class]) : @"(无)");
+
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
     picker.allowsEditing = YES;
@@ -385,7 +408,20 @@ static char kDDAvatarPickerDelegateKey;
     picker.delegate = proxy;
     objc_setAssociatedObject(picker, &kDDAvatarPickerDelegateKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    [vc presentViewController:picker animated:YES completion:nil];
+    // 延到下一个主循环再弹：开关的 ValueChanged 回调里立刻 present，偶尔会跟 UISwitch 自身的
+    // 动画 / 表格刷新撞在同一帧被系统忽略，延迟一帧更稳。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!presenter.view.window || presenter.isBeingDismissed || presenter.presentedViewController) {
+            DDLOG(@"[头像·相册] 放弃弹出：presenter 状态异常 window=%d beingDismissed=%d presented=%@",
+                  presenter.view.window ? 1 : 0, presenter.isBeingDismissed,
+                  presenter.presentedViewController ? NSStringFromClass([presenter.presentedViewController class]) : @"(无)");
+            if (completion) completion(nil);
+            return;
+        }
+        [presenter presentViewController:picker animated:YES completion:^{
+            DDLOG(@"[头像·相册] 已弹出");
+        }];
+    });
 }
 
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<NSString *,id> *)info {
@@ -488,13 +524,8 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
 
 %hook AddContactToChatRoomViewController
 
-// 微信不同版本构建聊天详情页的时机不同：有的走 reloadTableData，有的只在 viewWillAppear 之后才算构建完。
-// 这里双入口注入，靠 cell 的 userInfo 去重，不会重复插行；入口名进日志，便于定位实际走的是哪条路。
-- (void)reloadTableData {
-    %orig;
-    [self dd_injectAvatarCellFrom:@"reloadTableData"];
-}
-
+// 日志实证本版本只在 viewWillAppear 时构建完表格，reloadTableData 从未被微信主动调用，
+// 故只保留这一个入口（不再留 reloadTableData 兜底）；入口名进日志便于定位实际走的是哪条路。
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
     [self dd_injectAvatarCellFrom:@"viewWillAppear"];
@@ -561,15 +592,23 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
         }
     }
 
-    // 原生 switchCell：on 状态取决于当前联系人是否已保存本地头像(WCTableViewCellManager.h:55)。
+    // 自建 UISwitch：日志实证微信 switchCellForSel:target:title:on: 的 sel 在本版本不回调
+    // （开关能显示、能滑动，但「头像开关点击」从未命中），故改用 normalCellForSel + 自定义
+    // UISwitch，用 addTarget 直接绑定 action，确保点击一定触发。
+    // 视觉上微信原生 switch cell 右侧也是 UISwitch，样式一致；sel 传 nil 避免整行出现箭头。
     Class cellCls = %c(WCTableViewCellManager);
     BOOL hasCustom = DDAvatarImageForUser(usrName) != nil;
-    id cell = [cellCls switchCellForSel:@selector(toggleCustomContactAvatar:)
-                                target:self
-                                 title:@"自定义头像"
-                                    on:hasCustom];
+
+    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(0, 0, 51, 31)];
+    sw.on = hasCustom;
+    [sw addTarget:self action:@selector(toggleCustomContactAvatar:) forControlEvents:UIControlEventValueChanged];
+
+    id cell = [cellCls normalCellForSel:nil
+                                 target:nil
+                                  title:@"自定义头像"
+                               rightView:sw];
     if (!cell) {
-        DDLOG(@"[头像·注入] 入口=%@ 失败：switchCell 创建返回 nil  user=%@", entry, usrName);
+        DDLOG(@"[头像·注入] 入口=%@ 失败：cell 创建返回 nil  user=%@", entry, usrName);
         return;
     }
     [cell setUserInfo:kDDAvatarCellId];
@@ -581,9 +620,10 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
     DDJokerHit(@"头像开关创建");
 }
 
-// 复用微信原生的「自定义头像」开关 action（AddContactToChatRoomViewController.h:66）：
-// 上面插入的开关 cell 把 sel 指向它，逻辑统一在这里实现，不再自己起 dd_ 前缀方法。
-// 不依赖传入参数判断状态，改以「当前联系人是否已有本地头像」决定开/关，规避参数签名不确定的风险。
+// 开关 action（方法名取自 AddContactToChatRoomViewController.h:66，保持原生命名）：
+// 由上面自建的 UISwitch 通过 addTarget:action: 直接绑定，不再依赖微信 cell 的 target-action。
+// UISwitch 的 ValueChanged 会把自己作为参数传进来，但这里不依赖它判断状态，
+// 改以「当前联系人是否已有本地头像」决定开/关，规避参数签名不确定的风险。
 - (void)toggleCustomContactAvatar:(id)a0 {
     CContact *contact = [self m_contact];
     NSString *usrName = [contact m_nsUsrName];
@@ -592,9 +632,10 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
         return;
     }
     DDJokerHit(@"头像开关点击");
-    // 传入参数类型不确定，记下来便于确认微信实际传的是什么（UISwitch / cellInfo / 其它）。
-    DDLOG(@"[头像·开关] 点击 user=%@  参数类型=%@", usrName,
-          a0 ? NSStringFromClass([a0 class]) : @"(nil)");
+    // addTarget 绑定后这里拿到的一定是 UISwitch，记下类型和状态便于确认。
+    UISwitch *sw = [a0 isKindOfClass:[UISwitch class]] ? (UISwitch *)a0 : nil;
+    DDLOG(@"[头像·开关] 点击 user=%@  参数类型=%@  on=%d", usrName,
+          a0 ? NSStringFromClass([a0 class]) : @"(nil)", sw ? (int)sw.isOn : -1);
 
     if (DDAvatarImageForUser(usrName)) {
         // 当前有图 -> 切换为关闭，删除本地图片。
@@ -602,7 +643,7 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
         DDLOG(@"[头像·开关] 关闭：删除本地图 user=%@  结果=%d", usrName, ok);
         DDShowDoneToast(@"已恢复默认头像");
     } else {
-        // 当前无图 -> 切换为打开，调起微信相册选图并裁剪。
+        // 当前无图 -> 切换为打开，调起相册选图并裁剪。
         DDLOG(@"[头像·开关] 打开：准备调起相册 user=%@", usrName);
         __weak typeof(self) weakSelf = self;
         [DDAvatarPicker presentFromViewController:self completion:^(UIImage *image) {
@@ -610,17 +651,19 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
             if (!strongSelf) return;
             if (!image) {
                 DDLOG(@"[头像·开关] 选图取消或取图失败 user=%@", usrName);
-                [strongSelf reloadTableData];
+                // 直接把开关弹回 off：不依赖表格重建（该 VC 的 reloadTableData 未必重建分组）。
+                [sw setOn:NO animated:YES];
                 return;
             }
             if (!DDAvatarSaveImage(image, usrName)) {
                 DDLOG(@"[头像·开关] 保存失败 user=%@  图片尺寸=%@", usrName, NSStringFromCGSize(image.size));
                 DDShowErrorToast(@"保存失败");
+                [sw setOn:NO animated:YES];
             } else {
                 DDLOG(@"[头像·开关] 保存成功 user=%@  图片尺寸=%@", usrName, NSStringFromCGSize(image.size));
                 DDShowDoneToast(@"头像已替换");
+                [strongSelf reloadTableData];
             }
-            [strongSelf reloadTableData];
         }];
     }
 }
@@ -841,8 +884,9 @@ static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
 
 - (void)clearAllAvatarTapped:(id)sender {
     NSInteger n = DDAvatarRemoveAll();
+    // 提示统一为「已清理」（与主插件一致）；清除了几个只在日志里记。
     DDLOG(@"[头像·清理] 一键全部还原：清除 %ld 个", (long)n);
-    [self dd_showDoneToast:(n > 0 ? [NSString stringWithFormat:@"已清除 %ld 个", (long)n] : @"暂无替换")];
+    [self dd_showDoneToast:@"已清理"];
 }
 
 - (void)diagSwitchChanged:(id)sender {
