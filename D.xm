@@ -6,12 +6,16 @@
 static NSString *const kDDWxidEnabledKey   = @"DDProfileWxidEnabled";
 static NSString *const kDDWxidValueKey     = @"DDProfileWxidValue";
 static NSString *const kDDAvatarEnabledKey = @"DDProfileAvatarEnabled";
+static NSString *const kDDHideWxidKey      = @"DDProfileHideFriendWxid";
+static NSString *const kDDHideChatNameKey  = @"DDProfileHideChatName";
 
 @interface DDProfileConfig : NSObject
 + (instancetype)shared;
 @property (nonatomic) BOOL wxidEnabled;
 @property (nonatomic, copy) NSString *wxidValue;
 @property (nonatomic) BOOL avatarEnabled;
+@property (nonatomic) BOOL hideFriendWxid;
+@property (nonatomic) BOOL hideChatName;
 @end
 
 #pragma mark - 微信类声明
@@ -97,6 +101,26 @@ static void DDShowDoneToast(NSString *text) {
 @property (retain, nonatomic) CContact *m_contact;
 - (void)ddAvatarSwitchChanged:(UISwitch *)sender;
 - (void)dd_injectAvatarCell;
+@end
+
+// MMCPLabel.h:4 —— @interface MMCPLabel : MMUILabel（MMUILabel 继承 UILabel）
+// 微信号用的是可复制的 MMCPLabel，靠 tag == 90224 认人。
+@interface MMCPLabel : UILabel
+@end
+
+// BaseMsgContentLogicController.h:329/332/348
+@interface BaseMsgContentLogicController : NSObject
+- (id)GetUsrTitle;
+- (id)getSubTitle;
+- (id)GetTitleTailImageView;
+@end
+
+// RoomContentLogicController.h:3 继承 BaseMsgContentLogicController；:72/74/75/109
+@interface RoomContentLogicController : BaseMsgContentLogicController
+- (id)GetUsrTitle;
+- (id)getSubTitle;
+- (id)getDefaultTitleTailSubViews;
+- (id)getMemeberCountLabel;
 @end
 
 #pragma mark - 配置
@@ -565,6 +589,89 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
 
 %end
 
+#pragma mark - 隐藏好友微信号（MMCPLabel）
+
+static BOOL DDHideFriendWxid(void) {
+    return [DDProfileConfig shared].hideFriendWxid;
+}
+
+%hook MMCPLabel
+
+- (void)setText:(NSString *)text {
+    if (DDHideFriendWxid() && self.tag == 90224) {
+        %orig(@"");
+        return;
+    }
+    %orig;
+}
+
+- (void)setAttributedText:(NSAttributedString *)text {
+    if (DDHideFriendWxid() && self.tag == 90224) {
+        %orig(nil);
+        return;
+    }
+    %orig;
+}
+
+- (void)setTag:(NSInteger)tag {
+    %orig;
+    if (DDHideFriendWxid() && tag == 90224) {
+        if (self.text.length) self.text = @"";
+        if (self.attributedText.length) self.attributedText = nil;
+    }
+}
+
+%end
+
+#pragma mark - 隐藏聊天顶栏名字（单聊 / 群聊）
+
+static BOOL DDHideChatName(void) {
+    return [DDProfileConfig shared].hideChatName;
+}
+
+%hook BaseMsgContentLogicController
+
+- (id)GetUsrTitle {
+    if (DDHideChatName()) return @"";
+    return %orig;
+}
+
+- (id)getSubTitle {
+    if (DDHideChatName()) return @"";
+    return %orig;
+}
+
+- (id)GetTitleTailImageView {
+    if (DDHideChatName()) return nil;
+    return %orig;
+}
+
+%end
+
+%hook RoomContentLogicController
+
+- (id)GetUsrTitle {
+    if (DDHideChatName()) return @"";
+    return %orig;
+}
+
+- (id)getSubTitle {
+    if (DDHideChatName()) return @"";
+    return %orig;
+}
+
+- (id)getDefaultTitleTailSubViews {
+    if (DDHideChatName()) return nil;
+    return %orig;
+}
+
+- (id)getMemeberCountLabel {
+    if (DDHideChatName()) return nil;
+    return %orig;
+}
+
+%end
+
 #pragma mark - 设置页
 
 @interface DDProfileSettingsViewController : UIViewController <UITableViewDelegate>
@@ -578,6 +685,8 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
 - (void)wxidSwitchChanged:(id)sender;
 - (void)wxidConfirm:(id)sender;
 - (void)avatarSwitchChanged:(id)sender;
+- (void)hideFriendWxidSwitch:(id)sender;
+- (void)hideChatNameSwitch:(id)sender;
 - (void)clearAllAvatarTapped:(id)sender;
 @end
 
@@ -708,6 +817,15 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
         [profileSection addCell:wxidSubCell];
     }
 
+    [profileSection addCell:[cellCls switchCellForSel:@selector(hideFriendWxidSwitch:)
+                                               target:self
+                                                title:@"隐藏好友微信号"
+                                                   on:cfg.hideFriendWxid]];
+    [profileSection addCell:[cellCls switchCellForSel:@selector(hideChatNameSwitch:)
+                                               target:self
+                                                title:@"隐藏聊天顶栏名字"
+                                                   on:cfg.hideChatName]];
+
     [profileSection addCell:[cellCls switchCellForSel:@selector(avatarSwitchChanged:)
                                                target:self
                                                 title:@"备注用户头像"
@@ -744,6 +862,16 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     [self buildTable];
 }
 
+- (void)hideFriendWxidSwitch:(id)sender {
+    UISwitch *sw = (UISwitch *)sender;
+    [DDProfileConfig shared].hideFriendWxid = sw.on;
+}
+
+- (void)hideChatNameSwitch:(id)sender {
+    UISwitch *sw = (UISwitch *)sender;
+    [DDProfileConfig shared].hideChatName = sw.on;
+}
+
 - (void)clearAllAvatarTapped:(id)sender {
     (void)DDAvatarRemoveAll();
     DDShowDoneToast(@"头像已清理");
@@ -768,6 +896,8 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
         _wxidEnabled = [def boolForKey:kDDWxidEnabledKey];
         _wxidValue = [def stringForKey:kDDWxidValueKey] ?: @"";
         _avatarEnabled = [def boolForKey:kDDAvatarEnabledKey];
+        _hideFriendWxid = [def boolForKey:kDDHideWxidKey];
+        _hideChatName = [def boolForKey:kDDHideChatNameKey];
     }
     return self;
 }
@@ -790,6 +920,20 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     _avatarEnabled = avatarEnabled;
     NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
     [def setBool:avatarEnabled forKey:kDDAvatarEnabledKey];
+    [def synchronize];
+}
+
+- (void)setHideFriendWxid:(BOOL)hideFriendWxid {
+    _hideFriendWxid = hideFriendWxid;
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    [def setBool:hideFriendWxid forKey:kDDHideWxidKey];
+    [def synchronize];
+}
+
+- (void)setHideChatName:(BOOL)hideChatName {
+    _hideChatName = hideChatName;
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    [def setBool:hideChatName forKey:kDDHideChatNameKey];
     [def synchronize];
 }
 
