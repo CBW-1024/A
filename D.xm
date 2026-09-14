@@ -15,12 +15,12 @@
 //
 //  功能二 · 单聊联系人头像替换
 //    总开关：设置页「自定义用户头像」→「备注用户头像」。
-//    入口：单聊「聊天信息」页(AddContactToChatRoomViewController)第一个分组第二行插入「自定义头像」开关，
+//    入口：单聊「聊天信息」页(AddContactToChatRoomViewController)表格的第 1 个分组(section 1)末尾追加「自定义头像」开关，
 //      打开即调起系统相册选图并裁剪，关闭则删除本地图片。
 //      该 VC 的表格是 MMTableViewInfo，它继承 WCTableViewManager(MMTableViewInfo.h:1)，
 //      所以直接复用 WCTableViewSectionManager / WCTableViewCellManager 建行。
-//      开关是自建 UISwitch + addTarget 绑定 action：微信的 switchCellForSel:target:title:on:
-//      在本版本不回调传入的 sel（日志实证），故不能用它承载点击。
+//      开关用微信自带的 [WCTableViewNormalCellManager switchCellForSel:target:title:on:] 建「带回调」开关
+//      cell，action 落回 VC 的 %new 方法 ddAvatarSwitchChanged:（Logos %new 保证方法一定存在，可正常回调）。
 //    存储：Documents/DDAvatar/<userName>.png，按用户名一一对应，不额外维护映射表。
 //    显示：hook MMHeadImageView 的全部写图入口，命中本地图就替换
 //      会话列表/聊天页走这三个：
@@ -53,12 +53,12 @@
 //    仅在设置页打开「记录运行日志」后，才在插件加载处与各功能 hook 命中处记录，
 //    并进入命中统计与导出文件；其余时候各模块静默运行，不写日志。
 //    「自定义头像」开关行采用「真插行」方案（完全照搬 信息屏蔽.txt 的 injectSwitchIntoTable）：
-//      仅 hook 单聊详情页 VC(AddContactToChatRoomViewController)的 reloadTableData，在 %orig 之后
-//      用 [controller valueForKey:@"m_tableViewInfo"] 拿 MMTableViewInfo → getAllSections 取分组 →
-//      用微信自带 [WCTableViewNormalCellManager switchCellForSel:target:title:on:] 建「带回调」开关
-//      cell（target=VC，点击落回 VC 的 %new 方法 ddAvatarSwitchChanged:）→ [section addCell:] 追加到
-//      section 1 末尾(避开 section 0 资料卡区，原生 reloadTableView 会重建它 → 插这必丢) → [tableView reloadData]。
-//      不挂 MMTableViewInfo.reloadTableView、不去重：%orig 全量重建后补插，每次原生刷新都重跑、行永远在。
+//      单 hook 单聊详情页 VC(AddContactToChatRoomViewController)的 viewDidAppear:，进页动画结束后
+//      表格必已装配好，此时用 [controller valueForKey:@"m_tableViewInfo"] 拿 MMTableViewInfo →
+//      getAllSections 取分组 → 用微信自带 [WCTableViewNormalCellManager switchCellForSel:target:title:on:]
+//      建「带回调」开关 cell（target=VC，点击落回 VC 的 %new 方法 ddAvatarSwitchChanged:）→
+//      [section addCell:] 追加到 section 1 末尾(避开 section 0 资料卡区，原生 reloadTableView 会重建它
+//      → 插这必丢) → [tableView reloadData]。单一入口、不去重（每次进页只插一次，无重复风险）。
 //      底层数据模型真有这一行，所有数据源方法查 cellInfo 都不会越界(早先「+1 虚拟化」造的幽灵行
 //      会让 canEditRow/editingStyle 等按越界索引取 cellInfo 而 NSRangeException 闪退，已根治)。
 //      不 hook 基类 WCTableViewManager / MMTableViewInfo：基类是全 app 表格共用，挂它会把插件管理页/
@@ -790,8 +790,9 @@ static const NSInteger kDDAvatarPreferSection = 1;
 // 做法：valueForKey:m_tableViewInfo → getAllSections → sections[kDDAvatarPreferSection] →
 //   [WCTableViewNormalCellManager switchCellForSel:target:title:on:] 建带回调的开关 cell
 //   （target=vc，回调落回 VC 的 %new 方法 ddAvatarSwitchChanged:）→ [section addCell:cell] → reloadData。
-//   只 hook reloadTableData 一个入口（信息屏蔽方法）：%orig 把整张表从零重建，之后立即补插，
-//   所以每次原生刷新都会重跑、行永远在；不挂 MMTableViewInfo.reloadTableView、不去重。
+//   单入口：由 VC.viewDidAppear 在进页动画结束后调用一次。插在 section 1 末尾（避开被原生
+//   reloadTableView 重建的 section 0）；section 1 不在重建范围，故点原生开关后行不受影响，无需
+//   多入口补回、无需去重。
 static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc) {
     if (![DDProfileConfig shared].avatarEnabled) { DDLOG(@"[头像·插行] 跳过：总开关关"); return; }
     if (![vc m_contact]) { DDLOG(@"[头像·插行] 跳过：无 m_contact"); return; }
@@ -817,17 +818,14 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     DDJokerHit(@"头像开关创建");
 }
 
-// （已移除 MMTableViewInfo.reloadTableView 钩子：改用信息屏蔽方法——只 hook VC.reloadTableData 一个入口，
-//   插 section 1 避开会被原生 reloadTableView 重建的 section 0，无需此钩子，整条路径更干净。）
-
 %hook AddContactToChatRoomViewController
 
-// 唯一入口（信息屏蔽方法）：hook VC.reloadTableData —— %orig 把整张表从零重建，之后立即补插。
-//   点原生开关若走 MMTableViewInfo.reloadTableView 且只重建 section 0，我们插在 section 1 不受影响；
-//   若点开关导致 reloadTableData 重跑，%orig 清空旧行后我们照样补回，永不消失。
-// 不 hook initData：那时 m_tableViewInfo 还是 nil(早先实测)，插不进；reloadTableData 时 %orig 已建好表格。
-- (void)reloadTableData {
+// 唯一入口：进页面动画结束后表格必已装配好（sections 非空、m_tableViewInfo 有效），此时插入「自定义头像」开关。
+//   插在 section 1 末尾（避开会被原生 reloadTableView 重建的 section 0）；section 1 不在重建范围，
+//   故点原生开关后行不受影响，无需多入口补回、无需去重。
+- (void)viewDidAppear:(BOOL)animated {
     %orig;
+    DDLOG(@"[头像·入口] viewDidAppear HIT");
     [self dd_injectAvatarCell];
 }
 
