@@ -202,6 +202,7 @@ static NSString *const kDDWxidEnabledKey  = @"DDProfileWxidEnabled";
 static NSString *const kDDWxidValueKey    = @"DDProfileWxidValue";
 static NSString *const kDDAvatarEnabledKey = @"DDProfileAvatarEnabled";
 static NSString *const kDDDiagEnabledKey   = @"DDProfileDiagEnabled";
+static NSString *const kDDAvatarCellId      = @"DDProfileAvatarCell";  // 注入行的去重标识，setUserInfo 写入、getUserInfo 读取
 
 @interface DDProfileConfig : NSObject
 + (instancetype)shared;
