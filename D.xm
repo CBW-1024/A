@@ -862,9 +862,9 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
 
 - (void)reloadTableView {
     %orig;
-    DDLOG(@"[头像·入口] reloadTableView HIT  self=%@", NSStringFromClass([self class]));
+    DDLOG(@"[头像·入口] reloadTableView HIT  self=%@", NSStringFromClass([(id)self class]));
     id owner = nil;
-    @try { owner = [self valueForKey:@"delegate"]; } @catch (NSException *e) { owner = nil; }
+    @try { owner = [(id)self valueForKey:@"delegate"]; } @catch (NSException *e) { owner = nil; }
     if ([owner isKindOfClass:%c(AddContactToChatRoomViewController)]) {
         AddContactToChatRoomViewController *vc = (AddContactToChatRoomViewController *)owner;
         if ([vc m_contact]) DDInjectAvatarSwitchIntoTable(vc);
