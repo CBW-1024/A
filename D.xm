@@ -15,7 +15,7 @@
 //
 //  功能二 · 单聊联系人头像替换
 //    总开关：设置页「自定义用户头像」→「备注用户头像」。
-//    入口：单聊「聊天信息」页(AddContactToChatRoomViewController)表格的「第 0 个分组(section 0，资料卡 m_headerView 正下方)」末尾追加「自定义头像」开关，
+//    入口：单聊「聊天信息」页(AddContactToChatRoomViewController)表格，用微信原生 WCTableViewManager.insertSection:At: 在资料卡(m_headerView)正下方插入独立 section，内放「自定义头像」开关，
 //      打开即调起系统相册选图并裁剪，关闭则删除本地图片。
 //      该 VC 的表格是 MMTableViewInfo，它继承 WCTableViewManager(MMTableViewInfo.h:1)，
 //      所以直接复用 WCTableViewSectionManager / WCTableViewCellManager 建行。
@@ -52,13 +52,12 @@
 //  诊断日志（DDLOG / DDJokerHit / 设置页「导出日志」）默认关闭：
 //    仅在设置页打开「记录运行日志」后，才在插件加载处与各功能 hook 命中处记录，
 //    并进入命中统计与导出文件；其余时候各模块静默运行，不写日志。
-//    「自定义头像」开关行采用「真插行」方案（完全照搬 信息屏蔽.txt 的 injectSwitchIntoTable）：
-//      用 [controller valueForKey:@"m_tableViewInfo"] 拿 MMTableViewInfo → getAllSections 取分组 →
-//      用微信自带 [WCTableViewNormalCellManager switchCellForSel:target:title:on:] 建「带回调」开关
-//      cell（target=VC，点击落回 VC 的 %new 方法 ddAvatarSwitchChanged:）→ [section addCell:] 追加到
-//      section 0 末尾（资料卡 m_headerView 正下方第一组；点原生开关只重建 section 1，不动 section 0 → 行天然不丢）→
-//      [tableView reloadData]。三个入口协同补回、靠 DDSectionHasAvatarCell 去重保证只一行：
-//        · 主入口 VC.reloadTableData（信息屏蔽同款：点原生开关整表重建后 %orig 补回）；
+//    「自定义头像」开关用微信原生 API 插行（真插行，底层模型真有这一行）：
+//      WCTableViewManager.insertSection:At: 在资料卡(m_headerView)正下方插独立 section，
+//      WCTableViewCellManager.switchCellForSel:target:title:on: 建带回调开关 cell
+//      （target=VC，点击落回 VC 的 %new 方法 ddAvatarSwitchChanged:）。三个入口协同补回、
+//      靠 DDSectionHasAvatarCell 去重保证只一行：
+//        · 主入口 VC.reloadTableData（点原生开关整表重建后 %orig 补回）；
 //        · VC.viewDidAppear:（首次进页兜底）；
 //        · MMTableViewInfo.reloadTableView（实测本版本不触发，留作保险）。
 //      底层数据模型真有这一行，所有数据源方法查 cellInfo 都不会越界(早先「+1 虚拟化」造的幽灵行
@@ -115,6 +114,7 @@ static void DDShowErrorToast(NSString *text) {
 
 @interface WCTableViewSectionManager : NSObject
 + (id)sectionWithHeader:(NSString *)header;
++ (id)defaultSection;
 @property (nonatomic, copy) NSString *footerTitle;
 @property (retain, nonatomic) NSMutableArray *cells;
 - (void)addCell:(id)arg1;
@@ -136,10 +136,11 @@ static void DDShowErrorToast(NSString *text) {
 - (unsigned long long)getSectionCount;
 - (id)getSectionAt:(unsigned long long)a0;
 - (void)reloadTableView;
-// 真插行方案用到的取数接口（WCTableViewManager.h:23 getTableView / h:32 getAllSections），
+// 真插行方案用到的取数接口（WCTableViewManager.h:23 getTableView / h:32 getAllSections / h:27 insertSection:At:），
 // 签名保持一致以免 -Werror。
 - (id)getTableView;
 - (id)getAllSections;
+- (void)insertSection:(id)arg1 At:(unsigned int)a1;
 @end
 
 // 联系人数据模型。CContact 继承 CBaseContact(CContact.h:3)，字段都在基类。
@@ -763,28 +764,24 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 
 #pragma mark - 头像修改入口（单聊「聊天信息」页）
 
-// 做法：在微信「建好的成品表格」里往 section 0 末尾真实追加一行（完全照搬 信息屏蔽.txt 的 injectSwitchIntoTable）：
-//   ① [controller valueForKey:@"m_tableViewInfo"] 拿 manager，getAllSections 取分组；
-//   ② 用微信自带 [WCTableViewNormalCellManager switchCellForSel:target:title:on:] 建「带回调」开关 cell
-//      （target=VC，点击落回 VC 的 %new 方法 ddAvatarSwitchChanged:，比自建 UISwitch+addTarget 更稳）；
-//   ③ [targetSection addCell:cell] 追加到 section 0 末尾（资料卡 m_headerView 正下方第一组），[tableView reloadData]。
-//   既不是往 section 数组硬插(会被 clearAllSection 冲掉)，也不是「+1 虚拟化」(会造幽灵行越界闪退)。
+// 注入方案（全部用微信原生 API，不碰 UITableView 数据源虚拟化）：
+//   ① [controller valueForKey:@"m_tableViewInfo"] 拿 MMTableViewInfo（继承 WCTableViewManager，MMTableViewInfo.h:1）；
+//   ② [WCTableViewCellManager switchCellForSel:target:title:on:] 建「带回调」开关 cell
+//      （WCTableViewCellManager.h:55；target=VC，点击落回 %new 方法 ddAvatarSwitchChanged:，比自建 UISwitch+addTarget 更稳）；
+//   ③ [WCTableViewSectionManager defaultSection] 建独立 section（WCTableViewSectionManager.h:28）→ addCell:（h:43）→
+//      [WCTableViewManager insertSection:At:] 插到资料卡(m_headerView)正下方（WCTableViewManager.h:27）→ reloadData。
+//   既不是往 sections 数组硬插(会被 clearAllSection 冲掉)，也不是「+1 虚拟化」(会造幽灵行越界闪退)。
 //   行由三个入口协同补回、靠 DDSectionHasAvatarCell 去重保证只一行：
-//     · 主入口 VC.reloadTableData（信息屏蔽同款：点原生开关整表重建后 %orig 补回）；
+//     · 主入口 VC.reloadTableData（点原生开关整表重建后 %orig 补回）；
 //     · VC.viewDidAppear:（首次进页兜底，表格已装配好）；
 //     · MMTableViewInfo.reloadTableView（实测本版本点原生开关不触发，留作保险，且 MMTableViewInfo 全 app
 //       共用，靠 delegate 只认单聊详情页 VC、且有 m_contact）。
-//   之所以稳：插在 section 0（资料卡 m_headerView 正下方第一组），点原生开关(免打扰/置顶/提醒)在 section 1，
-//   重建 section 1 不动 section 0；即使微信走整表重建(reloadTableData)也会在 %orig 后由主入口立即补回。
-//   之前各版失败的根因都是插在原生开关区(section 1)或入口/去重逻辑脆弱，而非「真插行」本身有问题。
+//   之所以稳：独立 section 落在资料卡正下方，点原生开关只重建其余分组；即使微信走整表重建(reloadTableData)
+//   也会在 %orig 后由主入口立即补回。
 
-// 插入的目标分组下标。按截图实际结构：
-//   valueForKey:m_tableViewInfo → getAllSections → sections[0] → addCell: 追加到末尾。
-//   section 0=查找聊天内容（资料卡 m_headerView 正下方第一组，不会被原生开关重建）;
-//   section 1=消息免打扰/置顶聊天/提醒（原生开关组，点开关会重建本组）;
-//   section 2=设置当前聊天背景 等更靠后的独立分组。
-//   把开关插在 section 0，既在原生头像正下方，又避开原生开关重建区 → 行稳定。
-static const NSInteger kDDAvatarPreferSection = 0;
+// 注入位置：用原生 WCTableViewManager.insertSection:At: 把独立 section 插到资料卡(m_headerView)正下方（下标 0）。
+// 不往原生已有 section 里 addCell:——那样要么离头像远、要么和「查找聊天内容」挤一组；独立 section 干净且不被原生重建冲掉。
+// 去重靠 DDSectionHasAvatarCell 扫描所有 section 的 cell，已含我们的开关则跳过（只插一次）。
 // 自己开关切换（存图/删图）成功后发送，触发 viewDidLoad 注册的 observer → reloadTableData → 补回开关 + 刷新状态。
 #define kDDAvatarChangedNotification @"DDProfileAvatarChanged"
 
@@ -804,14 +801,12 @@ static BOOL DDSectionHasAvatarCell(id section) {
     return NO;
 }
 
-// 把「自定义头像」开关行插进 section 0 末尾（真实 addCell:，底层模型真有这一行，照搬信息屏蔽）。
-// 做法：valueForKey:m_tableViewInfo → getAllSections → sections[0] →
-//   [WCTableViewNormalCellManager switchCellForSel:target:title:on:] 建带回调的开关 cell
-//   （target=vc，回调落回 VC 的 %new 方法 ddAvatarSwitchChanged:）→ [section addCell:cell] → reloadData。
-//   入口：由 VC.reloadTableData(点原生开关整表重建后补回) / MMTableViewInfo.reloadTableView(兜底保险) /
-//   VC.viewDidAppear(首次进页) 三处调用。插在 section 0 末尾（资料卡 m_headerView 正下方第一组，
-//   避开原生开关区 section 1，点原生开关重建 section 1 不动 section 0 → 不丢)。每次调用都可能触发，
-//   靠 DDSectionHasAvatarCell 去重保证只插一行。
+// 用微信原生 API 在资料卡(m_headerView)正下方插入「自定义头像」开关 section：
+//   WCTableViewManager.insertSection:At:        (WCTableViewManager.h:27)  原生插 section
+//   WCTableViewSectionManager.defaultSection    (WCTableViewSectionManager.h:28)  原生建 section
+//   WCTableViewSectionManager.addCell:          (WCTableViewSectionManager.h:43)  原生加 cell
+//   WCTableViewCellManager.switchCellForSel:target:title:on:  (WCTableViewCellManager.h:55)  原生带回调开关
+// 三个入口(VC.reloadTableData / MMTableViewInfo.reloadTableView / VC.viewDidAppear)都调它；去重保证只插一次。
 static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc) {
     if (![DDProfileConfig shared].avatarEnabled) { DDLOG(@"[头像·插行] 跳过：总开关关"); return; }
     if (![vc m_contact]) { DDLOG(@"[头像·插行] 跳过：无 m_contact"); return; }
@@ -819,23 +814,23 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     if (!tableViewInfo) { DDLOG(@"[头像·插行] 跳过：m_tableViewInfo 为空（表格尚未装配好）"); return; }
     NSArray *sections = [tableViewInfo getAllSections];
     if (sections.count == 0) { DDLOG(@"[头像·插行] 跳过：sections 为空（表格尚未装配好）"); return; }
-    if (kDDAvatarPreferSection >= (NSInteger)sections.count) {
-        DDLOG(@"[头像·插行] 跳过：仅有 %lu 个分组，无 section %ld", (unsigned long)sections.count, (long)kDDAvatarPreferSection);
-        return;
+    // 去重：任一 section 已含我们的开关 cell 则跳过（独立 section，只插一次，避免多入口重复）
+    for (id s in sections) {
+        if (DDSectionHasAvatarCell(s)) { DDLOG(@"[头像·插行] 跳过：已存在自定义头像 section（去重）"); return; }
     }
-    id targetSection = [sections objectAtIndex:kDDAvatarPreferSection];
-    if (DDSectionHasAvatarCell(targetSection)) { DDLOG(@"[头像·插行] 跳过：targetSection 已有我们的 cell（去重）"); return; }
     NSString *usrName = [[vc m_contact] m_nsUsrName];
     BOOL hasCustom = DDAvatarImageForUser(usrName) != nil;
-    id cell = [%c(WCTableViewNormalCellManager) switchCellForSel:@selector(ddAvatarSwitchChanged:)
-                                                         target:vc
-                                                          title:@"自定义头像"
-                                                             on:hasCustom];
+    id cell = [%c(WCTableViewCellManager) switchCellForSel:@selector(ddAvatarSwitchChanged:)
+                                                   target:vc
+                                                    title:@"自定义头像"
+                                                       on:hasCustom];
     if (!cell) { DDLOG(@"[头像·插行] 创建失败：cell 返回 nil  user=%@", usrName); return; }
     objc_setAssociatedObject(cell, kDDAvatarCellMarker, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    [targetSection addCell:cell];
+    id section = [%c(WCTableViewSectionManager) defaultSection];
+    [section addCell:cell];
+    [tableViewInfo insertSection:section At:0];   // 资料卡(m_headerView)正下方
     [[tableViewInfo getTableView] reloadData];
-    DDLOG(@"[头像·插行] 已插入 section%ld 末尾  user=%@  on=%d", (long)kDDAvatarPreferSection, usrName, hasCustom);
+    DDLOG(@"[头像·插行] 已插入资料卡下方独立 section  user=%@  on=%d", usrName, hasCustom);
     DDJokerHit(@"头像开关创建");
 }
 
@@ -863,9 +858,9 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
 
 %hook AddContactToChatRoomViewController
 
-// 主入口（信息屏蔽同款）：VC 的 reloadTableData 是单聊详情页「整表重建」入口。点原生开关(免打扰/置顶/
-//   提醒/保存到聊天框)时微信会重建整张表，%orig 清空旧行后我们立即在 section 0 补回 → 行不消失；即使微信只局部
-//   重建 section 1，不动 section 0，行也照样在。插 section 0 末尾，靠 DDSectionHasAvatarCell 去重保证只一行。
+// 主入口：VC 的 reloadTableData 是单聊详情页「整表重建」入口。点原生开关(免打扰/置顶/提醒/保存到聊天框)
+//   时微信会重建整张表，%orig 清空旧 section 后我们立即用 insertSection:At:0 把独立「自定义头像」section 补回
+//   → 行不消失；即使微信只局部重建其余分组，资料卡下方的独立 section 也照样在。靠 DDSectionHasAvatarCell 去重保证只一行。
 - (void)reloadTableData {
     %orig;
     DDLOG(@"[头像·入口] reloadTableData HIT  self=%@", NSStringFromClass([self class]));
@@ -888,7 +883,7 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
 }
 
 // 入口(首次进页兜底)：进页面动画结束后表格必已装配好(sections 非空、m_tableViewInfo 有效)，保证首次显示一定出现。
-//   与 reloadTableData / MMTableViewInfo.reloadTableView 靠 DDSectionHasAvatarCell 去重保证只插一行；插在 section 0 末尾。
+//   与 reloadTableData / MMTableViewInfo.reloadTableView 靠 DDSectionHasAvatarCell 去重保证只插一个独立 section。
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     DDLOG(@"[头像·入口] viewDidAppear HIT");
@@ -900,11 +895,8 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     DDInjectAvatarSwitchIntoTable(self);
 }
 
-// 开关 action：必须用 %new 显式添加，不能 %hook toggleCustomContactAvatar:。
-//   该方法虽在 dump 头文件(AddContactToChatRoomViewController.h:66)里有声明，但未必真实存在于
-//   当前微信——它可能是别的历史插件注入的。%hook 对不存在的方法不会兜底添加，
-//   于是 addTarget 绑定后一点击就 unrecognized selector 崩溃（实测闪退）。
-//   故改为 %new 自有方法，由 Logos 保证一定被添加进类。
+// 开关 action：用 Logos %new 自有方法，不 %hook toggleCustomContactAvatar:（AddContactToChatRoomViewController.h:66）。
+//   后者是微信自身声明的方法、行为未知；我们自己的 %new 方法由 Logos 保证一定被加进类，回调稳定可控。
 // 参数由 UISwitch 的 ValueChanged 传入，但这里不依赖它判断状态，
 //   改以「当前联系人是否已有本地头像」决定开/关。
 // 开关行的「开/关」状态由 DDInjectAvatarSwitchIntoTable 建 cell 时按本地图有无配置(on:hasCustom)；
