@@ -6,7 +6,7 @@
 static NSString *const kDDWxidEnabledKey   = @"DDProfileWxidEnabled";
 static NSString *const kDDWxidValueKey     = @"DDProfileWxidValue";
 static NSString *const kDDAvatarEnabledKey = @"DDProfileAvatarEnabled";
-static NSString *const kDDHideWxidKey      = @"DDProfileHideFriendWxid";
+static NSString *const kDDFriendWxidKey     = @"DDProfileFriendWxidEnabled";
 static NSString *const kDDHideChatNameKey  = @"DDProfileHideChatName";
 
 @interface DDProfileConfig : NSObject
@@ -14,7 +14,7 @@ static NSString *const kDDHideChatNameKey  = @"DDProfileHideChatName";
 @property (nonatomic) BOOL wxidEnabled;
 @property (nonatomic, copy) NSString *wxidValue;
 @property (nonatomic) BOOL avatarEnabled;
-@property (nonatomic) BOOL hideFriendWxid;
+@property (nonatomic) BOOL friendWxidEnabled;
 @property (nonatomic) BOOL hideChatName;
 @end
 
@@ -100,12 +100,20 @@ static void DDShowDoneToast(NSString *text) {
 @interface AddContactToChatRoomViewController : UIViewController
 @property (retain, nonatomic) CContact *m_contact;
 - (void)ddAvatarSwitchChanged:(UISwitch *)sender;
-- (void)dd_injectAvatarCell;
+- (void)dd_injectProfileSection;
+- (void)ddWxidSwitchChanged:(UISwitch *)sender;
 @end
 
-// MMCPLabel.h:4 —— @interface MMCPLabel : MMUILabel（MMUILabel 继承 UILabel）
-// 微信号用的是可复制的 MMCPLabel，靠 tag == 90224 认人。
-@interface MMCPLabel : UILabel
+// WCUIAlertView.h —— 微信原生弹窗，:30 开输入框、:32 取文本、:35 填默认值
+@interface WCUIAlertView : NSObject
+- (id)initWithTitle:(id)title message:(id)message;
+- (void)showTextFieldWithMaxLen:(unsigned int)len;
+- (id)getTextField;
+- (id)getTextFieldText;
+- (void)setTextFieldDefaultText:(id)text;
+- (void)addBtnTitle:(id)title handler:(id)handler;
+- (void)addCancelBtnTitle:(id)title handler:(id)handler;
+- (void)show;
 @end
 
 // BaseMsgContentLogicController.h:329/332/348
@@ -185,6 +193,45 @@ static UIImage *DDAvatarImageForUser(NSString *usrName) {
     if (!(img && img.size.width > 0 && img.size.height > 0)) img = nil;
     [cache setObject:(img ?: (UIImage *)[NSNull null]) forKey:usrName];
     return img;
+}
+
+#pragma mark - 好友微信号备注存储（按用户名，一个 plist）
+
+static NSString *DDAliasStorePath(void) {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *doc = paths.firstObject;
+    if (doc.length == 0) doc = @"/var/mobile/Documents";
+    return [doc stringByAppendingPathComponent:@"DDAlias.plist"];
+}
+
+static NSMutableDictionary *DDAliasMap(void) {
+    static NSMutableDictionary *map = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSDictionary *disk = [NSDictionary dictionaryWithContentsOfFile:DDAliasStorePath()];
+        map = [disk mutableCopy];
+        if (!map) map = [NSMutableDictionary dictionary];
+    });
+    return map;
+}
+
+static NSString *DDAliasForUser(NSString *usrName) {
+    if (![DDProfileConfig shared].friendWxidEnabled) return nil;
+    if (usrName.length == 0) return nil;
+    NSString *value = DDAliasMap()[usrName];
+    return [value isKindOfClass:[NSString class]] ? value : nil;   // 存了空串也算，效果＝隐藏
+}
+
+static void DDAliasSetForUser(NSString *value, NSString *usrName) {
+    if (usrName.length == 0) return;
+    DDAliasMap()[usrName] = value ?: @"";
+    [DDAliasMap() writeToFile:DDAliasStorePath() atomically:YES];
+}
+
+static void DDAliasRemoveForUser(NSString *usrName) {
+    if (usrName.length == 0) return;
+    [DDAliasMap() removeObjectForKey:usrName];
+    [DDAliasMap() writeToFile:DDAliasStorePath() atomically:YES];
 }
 
 static UIImage *DDScaledImage(UIImage *image, CGFloat maxSide) {
@@ -334,11 +381,16 @@ static NSString *DDCustomWxid(void) {
 
 %hook CBaseContact
 
+// CBaseContact.h:12 —— @property (retain, nonatomic) NSString *m_nsAliasName;（即「微信号」）
+// 自己：走自定义微信号；好友：查备注表，命中返回备注值（存了空串就是隐藏），未命中回原值。
 - (id)m_nsAliasName {
-    NSString *custom = DDCustomWxid();
-    if (custom && [self isSelf]) {
-        return custom;
+    if ([self isSelf]) {
+        NSString *custom = DDCustomWxid();
+        if (custom) return custom;
+        return %orig;
     }
+    NSString *alias = DDAliasForUser([self m_nsUsrName]);
+    if (alias) return alias;
     return %orig;
 }
 
@@ -455,16 +507,16 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 
 #pragma mark - 头像修改入口（单聊「聊天信息」页）
 
-#define kDDAvatarChangedNotification @"DDProfileAvatarChanged"
+#define kDDProfileChangedNotification @"DDProfileContentChanged"
 
-static const void *kDDAvatarCellMarker = &kDDAvatarCellMarker;
+static const void *kDDInjectedCellMarker = &kDDInjectedCellMarker;
 
-static BOOL DDSectionHasAvatarCell(id section) {
+static BOOL DDSectionHasInjectedCell(id section) {
     @try {
         unsigned long long n = [section getCellCount];
         for (unsigned long long i = 0; i < n; i++) {
             id c = [section getCellAt:i];
-            if (objc_getAssociatedObject(c, kDDAvatarCellMarker) != nil) return YES;
+            if (objc_getAssociatedObject(c, kDDInjectedCellMarker) != nil) return YES;
         }
     } @catch (NSException *e) {}
     return NO;
@@ -481,26 +533,43 @@ static AddContactToChatRoomViewController *DDCurrentProfileVCForTable(id tableVi
     return vc;
 }
 
-static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc, BOOL reloadNow) {
-    if (![DDProfileConfig shared].avatarEnabled) return;
-    if (![vc m_contact]) return;
+static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *vc, BOOL reloadNow) {
+    DDProfileConfig *cfg = [DDProfileConfig shared];
+    if (!cfg.avatarEnabled && !cfg.friendWxidEnabled) return;
+    CContact *contact = [vc m_contact];
+    if (!contact) return;
     id tableViewInfo = [vc valueForKey:@"m_tableViewInfo"];
     if (!tableViewInfo) return;
     NSArray *sections = [tableViewInfo getAllSections];
     if (sections.count == 0) return;
     for (id s in sections) {
-        if (DDSectionHasAvatarCell(s)) return;
+        if (DDSectionHasInjectedCell(s)) return;
     }
-    NSString *usrName = [[vc m_contact] m_nsUsrName];
-    BOOL hasCustom = DDAvatarImageForUser(usrName) != nil;
-    id cell = [%c(WCTableViewCellManager) switchCellForSel:@selector(ddAvatarSwitchChanged:)
-                                                   target:vc
-                                                    title:@"自定义头像"
-                                                       on:hasCustom];
-    if (!cell) return;
-    objc_setAssociatedObject(cell, kDDAvatarCellMarker, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    NSString *usrName = [contact m_nsUsrName];
     id section = [%c(WCTableViewSectionManager) defaultSection];
-    [section addCell:cell];
+    id firstCell = nil;
+
+    if (cfg.avatarEnabled) {
+        BOOL hasCustom = DDAvatarImageForUser(usrName) != nil;
+        id cell = [%c(WCTableViewCellManager) switchCellForSel:@selector(ddAvatarSwitchChanged:)
+                                                       target:vc
+                                                        title:@"自定义头像"
+                                                           on:hasCustom];
+        if (cell) { [section addCell:cell]; if (!firstCell) firstCell = cell; }
+    }
+    if (cfg.friendWxidEnabled) {
+        BOOL hasCustom = DDAliasForUser(usrName) != nil;
+        id cell = [%c(WCTableViewCellManager) switchCellForSel:@selector(ddWxidSwitchChanged:)
+                                                       target:vc
+                                                        title:@"自定义微信号"
+                                                           on:hasCustom];
+        if (cell) { [section addCell:cell]; if (!firstCell) firstCell = cell; }
+    }
+    if (!firstCell) return;
+
+    // 只给第一行打标记：查重靠它，两行始终同进同退
+    objc_setAssociatedObject(firstCell, kDDInjectedCellMarker, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [tableViewInfo insertSection:section At:1];
     if (reloadNow) [[tableViewInfo getTableView] reloadData];
 }
@@ -515,7 +584,7 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     if (!a0) return;
     AddContactToChatRoomViewController *vc = DDCurrentProfileVCForTable(self);
     if (!vc || ![vc m_contact]) return;
-    DDInjectAvatarSwitchIntoTable(vc, NO);
+    DDInjectProfileSectionIntoTable(vc, NO);
 }
 
 %end
@@ -532,9 +601,9 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     s_currentProfileVC = self;
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(reloadTableData)
-                                                 name:kDDAvatarChangedNotification
+                                                 name:kDDProfileChangedNotification
                                                object:nil];
-    [self dd_injectAvatarCell];   // 表格已装配完、页面尚未显示，首帧即带开关
+    [self dd_injectProfileSection];   // 表格已装配完、页面尚未显示，首帧即带开关
 }
 
 // 转场动画开始前再确认一次：若微信在 %orig 里又重建了一次表格，此处补回；
@@ -543,18 +612,18 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     s_currentProfileVC = self;
     %orig;
     s_currentProfileVC = self;
-    [self dd_injectAvatarCell];
+    [self dd_injectProfileSection];
 }
 
 - (void)dealloc {
     if (s_currentProfileVC == self) s_currentProfileVC = nil;
-    [[NSNotificationCenter defaultCenter] removeObserver:self name:kDDAvatarChangedNotification object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:kDDProfileChangedNotification object:nil];
     %orig;
 }
 
 %new
-- (void)dd_injectAvatarCell {
-    DDInjectAvatarSwitchIntoTable(self, YES);
+- (void)dd_injectProfileSection {
+    DDInjectProfileSectionIntoTable(self, YES);
 }
 
 %new
@@ -567,7 +636,7 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
 
     if (DDAvatarImageForUser(usrName)) {
         (void)DDAvatarRemoveForUser(usrName);
-        [[NSNotificationCenter defaultCenter] postNotificationName:kDDAvatarChangedNotification object:nil];
+        [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
     } else {
         __weak typeof(self) weakSelf = self;
         __weak UISwitch *weakSw = sender;
@@ -581,44 +650,51 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
             if (!DDAvatarSaveImage(image, usrName)) {
                 [weakSw setOn:NO animated:YES];
             } else {
-                [[NSNotificationCenter defaultCenter] postNotificationName:kDDAvatarChangedNotification object:nil];
+                [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
             }
         }];
     }
 }
 
-%end
+// 与「自定义头像」对称：开 → 微信原生输入弹窗；关 → 清掉该好友的备注。
+// 弹窗里留空直接确定 = 存空串，效果等同隐藏。
+%new
+- (void)ddWxidSwitchChanged:(UISwitch *)sender {
+    CContact *contact = [self m_contact];
+    NSString *usrName = [contact m_nsUsrName];
+    if (usrName.length == 0) return;
 
-#pragma mark - 隐藏好友微信号（MMCPLabel）
-
-static BOOL DDHideFriendWxid(void) {
-    return [DDProfileConfig shared].hideFriendWxid;
-}
-
-%hook MMCPLabel
-
-- (void)setText:(NSString *)text {
-    if (DDHideFriendWxid() && self.tag == 90224) {
-        %orig(@"");
+    if (DDAliasForUser(usrName)) {
+        DDAliasRemoveForUser(usrName);
+        [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
         return;
     }
-    %orig;
-}
 
-- (void)setAttributedText:(NSAttributedString *)text {
-    if (DDHideFriendWxid() && self.tag == 90224) {
-        %orig(nil);
+    WCUIAlertView *alert = [[%c(WCUIAlertView) alloc] initWithTitle:@"自定义微信号" message:nil];
+    if (!alert) {
+        [sender setOn:NO animated:YES];
         return;
     }
-    %orig;
-}
+    [alert showTextFieldWithMaxLen:32];
+    [alert setTextFieldDefaultText:[contact m_nsAliasName] ?: @""];
 
-- (void)setTag:(NSInteger)tag {
-    %orig;
-    if (DDHideFriendWxid() && tag == 90224) {
-        if (self.text.length) self.text = @"";
-        if (self.attributedText.length) self.attributedText = nil;
-    }
+    // 写法对齐 DD小丑助手（已实测）：无参 block + __block 强持有，回调末尾置 nil 打破循环。
+    // 注意 getTextField 必须等 show 之后才拿得到，这里直接用 getTextFieldText 取文本，绕开该时序。
+    __block WCUIAlertView *blockAlert = alert;
+    __weak UISwitch *weakSw = sender;
+
+    [alert addCancelBtnTitle:@"取消" handler:^{
+        [weakSw setOn:NO animated:YES];
+        blockAlert = nil;
+    }];
+    [alert addBtnTitle:@"确定" handler:^{
+        NSString *text = [blockAlert getTextFieldText] ?: @"";
+        text = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        DDAliasSetForUser(text, usrName);
+        [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
+        blockAlert = nil;
+    }];
+    [alert show];
 }
 
 %end
@@ -685,7 +761,7 @@ static BOOL DDHideChatName(void) {
 - (void)wxidSwitchChanged:(id)sender;
 - (void)wxidConfirm:(id)sender;
 - (void)avatarSwitchChanged:(id)sender;
-- (void)hideFriendWxidSwitch:(id)sender;
+- (void)friendWxidSwitch:(id)sender;
 - (void)hideChatNameSwitch:(id)sender;
 - (void)clearAllAvatarTapped:(id)sender;
 @end
@@ -797,7 +873,7 @@ static BOOL DDHideChatName(void) {
     Class cellCls = %c(WCTableViewCellManager);
 
     WCTableViewSectionManager *profileSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"资料自定义"];
-    profileSection.footerTitle = @"微信号仅改本地显示，不修改服务器数据；头像开启后可在单聊「聊天信息」页替换联系人头像";
+    profileSection.footerTitle = @"微信号均只改本地显示，不动服务器数据；开启后可在单聊「聊天信息」页逐人设置头像与微信号，微信号留空即隐藏";
 
     [profileSection addCell:[cellCls switchCellForSel:@selector(wxidSwitchChanged:)
                                                target:self
@@ -817,10 +893,10 @@ static BOOL DDHideChatName(void) {
         [profileSection addCell:wxidSubCell];
     }
 
-    [profileSection addCell:[cellCls switchCellForSel:@selector(hideFriendWxidSwitch:)
+    [profileSection addCell:[cellCls switchCellForSel:@selector(friendWxidSwitch:)
                                                target:self
-                                                title:@"隐藏好友微信号"
-                                                   on:cfg.hideFriendWxid]];
+                                                title:@"备注好友微信号"
+                                                   on:cfg.friendWxidEnabled]];
     [profileSection addCell:[cellCls switchCellForSel:@selector(hideChatNameSwitch:)
                                                target:self
                                                 title:@"隐藏聊天顶栏名字"
@@ -862,9 +938,9 @@ static BOOL DDHideChatName(void) {
     [self buildTable];
 }
 
-- (void)hideFriendWxidSwitch:(id)sender {
+- (void)friendWxidSwitch:(id)sender {
     UISwitch *sw = (UISwitch *)sender;
-    [DDProfileConfig shared].hideFriendWxid = sw.on;
+    [DDProfileConfig shared].friendWxidEnabled = sw.on;
 }
 
 - (void)hideChatNameSwitch:(id)sender {
@@ -896,7 +972,7 @@ static BOOL DDHideChatName(void) {
         _wxidEnabled = [def boolForKey:kDDWxidEnabledKey];
         _wxidValue = [def stringForKey:kDDWxidValueKey] ?: @"";
         _avatarEnabled = [def boolForKey:kDDAvatarEnabledKey];
-        _hideFriendWxid = [def boolForKey:kDDHideWxidKey];
+        _friendWxidEnabled = [def boolForKey:kDDFriendWxidKey];
         _hideChatName = [def boolForKey:kDDHideChatNameKey];
     }
     return self;
@@ -923,10 +999,10 @@ static BOOL DDHideChatName(void) {
     [def synchronize];
 }
 
-- (void)setHideFriendWxid:(BOOL)hideFriendWxid {
-    _hideFriendWxid = hideFriendWxid;
+- (void)setFriendWxidEnabled:(BOOL)friendWxidEnabled {
+    _friendWxidEnabled = friendWxidEnabled;
     NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    [def setBool:hideFriendWxid forKey:kDDHideWxidKey];
+    [def setBool:friendWxidEnabled forKey:kDDFriendWxidKey];
     [def synchronize];
 }
 
