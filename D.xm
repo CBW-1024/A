@@ -53,9 +53,11 @@
 //    仅在设置页打开「记录运行日志」后，才在插件加载处与各功能 hook 命中处记录，
 //    并进入命中统计与导出文件；其余时候各模块静默运行，不写日志。
 //    「自定义头像」开关行采用「虚拟化数据源」方案（对应需求「绑在第一个分组后面」）：
-//      直接 hook 父类 WCTableViewManager 的数据源方法（它是 UITableViewDataSource/Delegate，
-//      MMTableViewInfo 只覆写了 reloadTableView，其余数据源方法继承自它，故 hook 父类能稳稳
-//      抓到详情页表格实例），在「第一个分组(section 0)的最后一行」由我们兜底提供该行：
+//      直接 hook 子类 MMTableViewInfo 的数据源方法（它是聊天详情页表格的真实类型
+//      AddContactToChatRoomViewController.h:7 `MMTableViewInfo *m_tableViewInfo;`，仅覆写了
+//      reloadTableView，其余数据源方法继承自 WCTableViewManager），在「第一个分组(section 0)
+//      的最后一行」由我们兜底提供该行。挂子类而非基类：基类是全 app 表格共用，挂它会把
+//      插件管理页/群聊页/朋友圈…全卷进来导致整片闪退，挂子类则只命中详情页这一张表：
 //        numberOfRowsInSection:   section==0 时 +1
 //        cellForRowAtIndexPath:    该最后一行返回我们的开关 cell，其余 %orig
 //        heightForRowAtIndexPath:  该行返回相邻真实行的高度，其余 %orig
@@ -63,8 +65,8 @@
 //        didSelectRowAtIndexPath:  该行不转发 %orig，其余 %orig
 //      行永远由数据源兜底，微信每次重建表格(点免打扰/置顶/保存到聊天框会 clearAllSection)
 //      都和我们无关 —— 这是彻底根治「行被冲掉、需重进页面」的写法（详见下方 hook 注释）。
-//      仅在「单聊聊天信息页(AddContactToChatRoomViewController) 且总开关开、有联系人」时虚拟化，
-//      其余表格(设置页/群聊页/朋友圈…)走 %orig 原样返回。
+//      仅在「单聊聊天信息页(AddContactToChatRoomViewController) 且是离 tableView 最近的 VC、
+//      总开关开、有联系人」时虚拟化，其余表格(设置页/群聊页/朋友圈/插件管理…)走 %orig 原样返回。
 //    导出文件为 Documents/DDProfileDiag.log。
 // ============================================================
 
@@ -127,8 +129,10 @@ static void DDShowErrorToast(NSString *text) {
 - (id)getSectionAt:(unsigned long long)a0;
 - (void)reloadTableView;
 // 下面 5 个是我们「虚拟化数据源」方案 hook 的方法（WCTableViewManager.h:36-40）。
-// 注意：MMTableViewInfo 只覆写了 reloadTableView，这 5 个都继承自 WCTableViewManager，
-// 所以 hook 父类即可同时抓到 MMTableViewInfo 实例（消息沿继承链落到父类被替换的 IMP）。
+// 注意：MMTableViewInfo 只覆写了 reloadTableView，这 5 个都继承自 WCTableViewManager。
+//   我们最终是「直接 hook 子类 MMTableViewInfo」(见下方 %hook MMTableViewInfo)，而不是挂基类
+//   WCTableViewManager —— 基类是全 app 表格共用的，挂它等于把每个页面都卷进来，正是上一版
+//   插件管理页/聊天详情页闪退的根因。挂子类则只有聊天详情页这张表被命中，其余页面不沾。
 - (long long)tableView:(id)a0 numberOfRowsInSection:(long long)a1;
 - (id)tableView:(id)a0 cellForRowAtIndexPath:(id)a1;
 - (double)tableView:(id)a0 heightForRowAtIndexPath:(id)a1;
@@ -138,10 +142,11 @@ static void DDShowErrorToast(NSString *text) {
 
 // 聊天详情页的表格真实类型是 MMTableViewInfo(AddContactToChatRoomViewController.h:7
 //   `MMTableViewInfo *m_tableViewInfo;`)，它是 WCTableViewManager 的子类。
-// 我们只 hook 父类 WCTableViewManager 的数据源方法：MMTableViewInfo 没覆写那 5 个，
-// 实例收到消息会沿继承链走到父类被替换的 IMP；而 reloadTableView 被 MMTableViewInfo 覆写，
-// 所以挂父类接不到它（早期「点免打扰后一条日志都没有」正是因为挂错了层）。
-// 保留 MMTableViewInfo 声明仅作类型参考。
+// 这 5 个数据源方法由它继承 WCTableViewManager 而来、自身没覆写，所以「直接 hook MMTableViewInfo」
+// 时 Logos 会把方法加到 MMTableViewInfo 自己的类上(覆盖继承来的那份)，只影响这张表；
+// 而 reloadTableView 被 MMTableViewInfo 覆写了，挂数据源方法接不到它(早期「点免打扰后一条日志
+// 都没有」正是因为那时想从 reloadTableView 入手)——这也是我们改走「虚拟化数据源」的原因。
+// 保留 MMTableViewInfo 声明，既作类型参考，也作为 %hook 的目标类。
 @interface MMTableViewInfo : WCTableViewManager
 @end
 
@@ -778,8 +783,11 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 //   详情页表格真实类型是它的子类 MMTableViewInfo，但 MMTableViewInfo 只覆写了 reloadTableView
 //   （MMTableViewInfo.h:10），其余数据源方法( numberOfRowsInSection / cellForRowAtIndexPath /
 //   heightForRowAtIndexPath / didSelectRowAtIndexPath )全部继承自 WCTableViewManager。
-//   于是直接 hook 父类的数据源方法：MMTableViewInfo 实例的消息沿继承链走到我们替换的 IMP，
-//   这次稳稳接得住（和 reloadTableView 恰恰相反 —— 那个被覆写了接不到，这些没有）。
+//   于是「直接 hook 子类 MMTableViewInfo」这 5 个数据源方法：Logos 把它们加到 MMTableViewInfo
+//   自己的类上(覆盖继承来的那份)，只有聊天详情页这张 MMTableViewInfo 表被命中；reloadTableView
+//   被 MMTableViewInfo 覆写了接不到，恰恰是改走「虚拟化数据源」的原因。注意是挂「子类」不是「基类」：
+//   基类 WCTableViewManager 是全 app 表格共用，挂它会把插件管理页/群聊页/朋友圈…全卷进来，
+//   上一版因此整片闪退；挂子类则其余页面根本不进我们的 hook。
 //
 //   我们在「第一个分组(section 0)的最后一行」虚拟化出「自定义头像」开关行：
 //     numberOfRowsInSection:   section==0 时 +1 —— 行永远由我们兜底，微信重建多少次都无关；
@@ -789,22 +797,30 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 //     willDisplayCell:          该行不转发 %orig（同上），其余 %orig。
 //   行固定在 section 0 末尾 = 「绑在第一个分组后面」。
 //
-//   作用域：只有「单聊聊天信息页」(AddContactToChatRoomViewController) 且总开关开、有联系人时
-//   才虚拟化；其余所有表格(设置页/群聊页/朋友圈…)走 %orig 原样返回。
-//   判断靠从 tableView 沿 responder 链找 VC（O(链长)，只在 section==0 时才做）。
+//   作用域双重保险：
+//   1) hook 挂在 MMTableViewInfo 子类上 —— 非此类型的表格(插件管理/群聊/朋友圈/设置页)根本不进 hook；
+//   2) 即使同是 MMTableViewInfo，DDChatDetailVCForManager 也只认「离 tableView 最近的那个
+//      UIViewController 且正好是 AddContactToChatRoomViewController」才虚拟化 —— 杜绝从聊天详情
+//      页 modal 出别的页面时，被误判成它的表格而去虚拟化(那样会取不到真实 cellInfo / 索引越界闪退)。
+//   其余情况一律 %orig 原样返回。
 
 // 从 manager 找到归属的「单聊聊天信息页」VC；不是 / 总开关关 / 无联系人 都返回 nil。
+// 关键：只认「离 tableView 最近的那个 UIViewController」(即真正持有本表格的 VC)。
+//   不能沿 responder 链往上找任意 AddContactToChatRoomViewController —— 从聊天详情页里
+//   modal 出别的页面(如插件管理)时，那个页面的 tableView 的 responder 链也能爬到作为
+//   presenting VC 的聊天详情页，会被误判成它自己的表格而去虚拟化行，结果取不到真实
+//   cellInfo / 索引越界 → 闪退。先截到最近的 VC，再判断它是不是聊天详情页即可彻底规避。
 static AddContactToChatRoomViewController *DDChatDetailVCForManager(WCTableViewManager *mgr) {
     if (![DDProfileConfig shared].avatarEnabled) return nil;
     UIResponder *r = [mgr tableView];
+    UIViewController *owner = nil;
     while (r) {
-        if ([r isKindOfClass:%c(AddContactToChatRoomViewController)]) {
-            AddContactToChatRoomViewController *vc = (AddContactToChatRoomViewController *)r;
-            if ([vc m_contact]) return vc;
-            return nil;
-        }
+        if ([r isKindOfClass:[UIViewController class]]) { owner = (UIViewController *)r; break; }
         r = [r nextResponder];
     }
+    if (![owner isKindOfClass:%c(AddContactToChatRoomViewController)]) return nil;
+    AddContactToChatRoomViewController *vc = (AddContactToChatRoomViewController *)owner;
+    if ([vc m_contact]) return vc;
     return nil;
 }
 
@@ -841,7 +857,16 @@ static id DDAvatarVirtualCell(AddContactToChatRoomViewController *vc) {
     return cell;
 }
 
-%hook WCTableViewManager
+// 注意：挂的是「子类 MMTableViewInfo」，不是基类 WCTableViewManager。
+//   WCTableViewManager 是微信几乎所有表格共用的数据源/代理基类，挂它等于把全 app 的
+//   表格都卷进我们的 hook —— 正是上一版「插件管理页打不开、聊天详情页闪退」的根因
+//   (别的页面 tableView 的 responder 链爬得到作为 presenting VC 的聊天详情页，被误虚拟化)。
+//   改成只挂 MMTableViewInfo：聊天详情页的 m_tableViewInfo 就是它(MMTableViewInfo.h:1 /
+//   AddContactToChatRoomViewController.h:7)，而其余页面(插件管理/群聊/朋友圈…)都不是
+//   这个类，根本不会被我们的 hook 碰到。MMTableViewInfo 只覆写了 reloadTableView，
+//   这 5 个数据源方法它继承自 WCTableViewManager —— 类级 hook 会落到这个类自己身上，
+//   实例被微信重建也不影响(早先「实例被换」的坑是插 section 数组才有的，虚拟化数据源不沾)。
+%hook MMTableViewInfo
 
 - (long long)tableView:(id)tv numberOfRowsInSection:(long long)section {
     long long orig = %orig;
