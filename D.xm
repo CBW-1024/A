@@ -6,89 +6,13 @@
 static NSString *const kDDWxidEnabledKey   = @"DDProfileWxidEnabled";
 static NSString *const kDDWxidValueKey     = @"DDProfileWxidValue";
 static NSString *const kDDAvatarEnabledKey = @"DDProfileAvatarEnabled";
-static NSString *const kDDDiagEnabledKey   = @"DDProfileDiagEnabled";
 
 @interface DDProfileConfig : NSObject
 + (instancetype)shared;
 @property (nonatomic) BOOL wxidEnabled;
 @property (nonatomic, copy) NSString *wxidValue;
 @property (nonatomic) BOOL avatarEnabled;
-@property (nonatomic) BOOL diagEnabled;
 @end
-
-#pragma mark - 通用诊断日志 · 采集
-
-static NSDateFormatter *DDLogTimeFormatter(void) {
-    static NSDateFormatter *fmt = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        fmt = [[NSDateFormatter alloc] init];
-        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-        fmt.dateFormat = @"HH:mm:ss.SSS";
-    });
-    return fmt;
-}
-
-static NSMutableString *DDLogBuffer(void) {
-    static NSMutableString *buf = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ buf = [NSMutableString string]; });
-    return buf;
-}
-
-static NSMutableDictionary *DDLogHits(void) {
-    static NSMutableDictionary *hits = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ hits = [NSMutableDictionary dictionary]; });
-    return hits;
-}
-
-static void DDJokerLog(NSString *fmt, ...) {
-    if (![DDProfileConfig shared].diagEnabled) return;
-    va_list ap;
-    va_start(ap, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    NSString *line = [NSString stringWithFormat:@"%@  %@",
-                      [DDLogTimeFormatter() stringFromDate:[NSDate date]], msg];
-    NSLog(@"[DD资料助手] %@", line);
-    NSMutableString *buf = DDLogBuffer();
-    @synchronized (buf) {
-        [buf appendFormat:@"%@\n", line];
-        if (buf.length > 300000) {
-            [buf deleteCharactersInRange:NSMakeRange(0, buf.length - 200000)];
-        }
-    }
-}
-
-#define DDLOG(...) DDJokerLog(__VA_ARGS__)
-
-static void DDJokerHit(NSString *tag) {
-    NSMutableDictionary *hits = DDLogHits();
-    NSInteger n = 0;
-    @synchronized (hits) {
-        n = [hits[tag] integerValue] + 1;
-        hits[tag] = @(n);
-    }
-    if (n <= 3 || n % 50 == 0) DDLOG(@"HIT %@ 第 %ld 次", tag, (long)n);
-}
-
-static void DDJokerClearDiagLog(void) {
-    NSMutableString *buf = DDLogBuffer();
-    @synchronized (buf) { [buf setString:@""]; }
-    NSMutableDictionary *hits = DDLogHits();
-    @synchronized (hits) { [hits removeAllObjects]; }
-}
-
-static NSString *DDJokerDescribeHitStats(void) {
-    NSMutableDictionary *hits = DDLogHits();
-    if (!hits.count) return @"  (还没有任何 hook 被触发)\n";
-    NSMutableString *s = [NSMutableString string];
-    for (NSString *k in [[hits allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
-        [s appendFormat:@"  %@ : %@ 次\n", k, hits[k]];
-    }
-    return s;
-}
 
 #pragma mark - 微信类声明
 
@@ -534,14 +458,14 @@ static AddContactToChatRoomViewController *DDCurrentProfileVCForTable(id tableVi
 }
 
 static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc, BOOL reloadNow) {
-    if (![DDProfileConfig shared].avatarEnabled) { DDLOG(@"[头像·插行] 跳过：总开关关"); return; }
-    if (![vc m_contact]) { DDLOG(@"[头像·插行] 跳过：无 m_contact"); return; }
+    if (![DDProfileConfig shared].avatarEnabled) return;
+    if (![vc m_contact]) return;
     id tableViewInfo = [vc valueForKey:@"m_tableViewInfo"];
-    if (!tableViewInfo) { DDLOG(@"[头像·插行] 跳过：m_tableViewInfo 为空（表格尚未装配好）"); return; }
+    if (!tableViewInfo) return;
     NSArray *sections = [tableViewInfo getAllSections];
-    if (sections.count == 0) { DDLOG(@"[头像·插行] 跳过：sections 为空（表格尚未装配好）"); return; }
+    if (sections.count == 0) return;
     for (id s in sections) {
-        if (DDSectionHasAvatarCell(s)) { DDLOG(@"[头像·插行] 跳过：已存在自定义头像 section（去重）"); return; }
+        if (DDSectionHasAvatarCell(s)) return;
     }
     NSString *usrName = [[vc m_contact] m_nsUsrName];
     BOOL hasCustom = DDAvatarImageForUser(usrName) != nil;
@@ -549,25 +473,15 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
                                                    target:vc
                                                     title:@"自定义头像"
                                                        on:hasCustom];
-    if (!cell) { DDLOG(@"[头像·插行] 创建失败：cell 返回 nil  user=%@", usrName); return; }
+    if (!cell) return;
     objc_setAssociatedObject(cell, kDDAvatarCellMarker, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     id section = [%c(WCTableViewSectionManager) defaultSection];
     [section addCell:cell];
     [tableViewInfo insertSection:section At:1];
     if (reloadNow) [[tableViewInfo getTableView] reloadData];
-    DDJokerHit(@"头像开关创建");
-    DDLOG(@"[头像·插行] 已插入资料卡下方  当前分组数=%lu  user=%@  on=%d",
-          (unsigned long)[[tableViewInfo getAllSections] count], usrName, hasCustom);
 }
 
 %hook WCTableViewManager
-
-- (void)clearAllSection {
-    %orig;
-    AddContactToChatRoomViewController *vc = DDCurrentProfileVCForTable(self);
-    if (!vc) return;
-    DDJokerHit(@"入口·clearAllSection");
-}
 
 // 主力路径：微信重建表格走 clearAllSection → addSection ×N。
 // 首个 addSection 回调时资料卡已加回，此刻同步插到 At:1，
@@ -577,9 +491,6 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     if (!a0) return;
     AddContactToChatRoomViewController *vc = DDCurrentProfileVCForTable(self);
     if (!vc || ![vc m_contact]) return;
-    DDJokerHit(@"入口·addSection");
-    DDLOG(@"[头像·重建] addSection 回调  当前分组数=%lu",
-          (unsigned long)[[self getAllSections] count]);
     DDInjectAvatarSwitchIntoTable(vc, NO);
 }
 
@@ -599,7 +510,6 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
                                              selector:@selector(reloadTableData)
                                                  name:kDDAvatarChangedNotification
                                                object:nil];
-    DDJokerHit(@"入口·viewDidLoad");
     [self dd_injectAvatarCell];   // 表格已装配完、页面尚未显示，首帧即带开关
 }
 
@@ -609,7 +519,6 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     s_currentProfileVC = self;
     %orig;
     s_currentProfileVC = self;
-    DDJokerHit(@"入口·viewWillAppear");
     [self dd_injectAvatarCell];
 }
 
@@ -631,13 +540,9 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     if (usrName.length == 0) {
         return;
     }
-    DDJokerHit(@"头像开关点击");
-    DDLOG(@"[头像·开关] 点击  user=%@  senderClass=%@  on=%d",
-          usrName, sender ? NSStringFromClass([sender class]) : @"(nil)", sender ? (int)sender.isOn : -1);
 
     if (DDAvatarImageForUser(usrName)) {
-        BOOL ok = DDAvatarRemoveForUser(usrName);
-        DDLOG(@"[头像·开关] 已恢复默认头像，发通知触发重插  user=%@  ok=%d", usrName, ok);
+        (void)DDAvatarRemoveForUser(usrName);
         [[NSNotificationCenter defaultCenter] postNotificationName:kDDAvatarChangedNotification object:nil];
     } else {
         __weak typeof(self) weakSelf = self;
@@ -652,7 +557,6 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
             if (!DDAvatarSaveImage(image, usrName)) {
                 [weakSw setOn:NO animated:YES];
             } else {
-                DDLOG(@"[头像·开关] 头像已替换，发通知触发重插  user=%@", usrName);
                 [[NSNotificationCenter defaultCenter] postNotificationName:kDDAvatarChangedNotification object:nil];
             }
         }];
@@ -660,48 +564,6 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
 }
 
 %end
-
-#pragma mark - 通用诊断日志 · 快照与导出
-
-static NSString *DDProfileExportLogText(void) {
-    NSMutableString *out = [NSMutableString string];
-    [out appendString:@"===== DD小丑资料助手 诊断日志 =====\n"];
-
-    NSDateFormatter *f = [[NSDateFormatter alloc] init];
-    f.locale = [NSLocale localeWithLocaleIdentifier:@"zh_CN"];
-    f.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-    [out appendFormat:@"导出时间 : %@\n", [f stringFromDate:[NSDate date]]];
-    [out appendFormat:@"系统版本 : %@ %@\n", [UIDevice currentDevice].systemName, [UIDevice currentDevice].systemVersion];
-    NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
-    [out appendFormat:@"微信版本 : %@ (%@)\n", info[@"CFBundleShortVersionString"], info[@"CFBundleVersion"]];
-
-    DDProfileConfig *c = [DDProfileConfig shared];
-    [out appendFormat:@"开关状态 : 微信号=%d 头像=%d 诊断=%d 微信号值=%@\n",
-     c.wxidEnabled, c.avatarEnabled, c.diagEnabled, (c.wxidValue.length ? c.wxidValue : @"-")];
-    [out appendString:@"复现步骤 : 清空日志 → 进单聊「聊天信息」页复现（开关出现/消失）→ 回本页点「导出」\n"];
-
-    [out appendString:@"\n----- hook 命中统计 -----\n"];
-    [out appendString:DDJokerDescribeHitStats()];
-
-    [out appendString:@"\n----- 日志正文 -----\n"];
-    NSMutableString *buf = DDLogBuffer();
-    NSString *body = @"";
-    @synchronized (buf) { body = [buf copy]; }
-    [out appendString:body.length ? body : @"(空：诊断开关没开，或还没触发过相关 hook)\n"];
-    return out;
-}
-
-static NSString *DDProfileWriteDiagLog(void) {
-    NSString *text = DDProfileExportLogText();
-    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    if (!dir.length) return nil;
-    NSString *path = [dir stringByAppendingPathComponent:@"DDProfileDiag.log"];
-    NSError *err = nil;
-    (void)[text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
-    if (err) { NSLog(@"[DD资料助手] 写诊断日志失败: %@", err); return nil; }
-    [[UIPasteboard generalPasteboard] setString:path];
-    return path;
-}
 
 #pragma mark - 设置页
 
@@ -717,9 +579,6 @@ static NSString *DDProfileWriteDiagLog(void) {
 - (void)wxidConfirm:(id)sender;
 - (void)avatarSwitchChanged:(id)sender;
 - (void)clearAllAvatarTapped:(id)sender;
-- (void)diagSwitchChanged:(UISwitch *)sender;
-- (void)clearDiagLogTapped:(id)sender;
-- (void)exportDiagLogTapped:(id)sender;
 @end
 
 @implementation DDProfileSettingsViewController {
@@ -828,12 +687,13 @@ static NSString *DDProfileWriteDiagLog(void) {
     DDProfileConfig *cfg = [DDProfileConfig shared];
     Class cellCls = %c(WCTableViewCellManager);
 
-    WCTableViewSectionManager *wxidSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"微信号"];
-    wxidSection.footerTitle = @"开启后只改变你自己的微信号显示，不修改服务器数据；关闭开关即恢复真实微信号";
-    [wxidSection addCell:[cellCls switchCellForSel:@selector(wxidSwitchChanged:)
-                                            target:self
-                                             title:@"自定义微信号"
-                                                on:cfg.wxidEnabled]];
+    WCTableViewSectionManager *profileSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"资料自定义"];
+    profileSection.footerTitle = @"微信号仅改本地显示，不修改服务器数据；头像开启后可在单聊「聊天信息」页替换联系人头像";
+
+    [profileSection addCell:[cellCls switchCellForSel:@selector(wxidSwitchChanged:)
+                                               target:self
+                                                title:@"自定义微信号"
+                                                   on:cfg.wxidEnabled]];
     if (cfg.wxidEnabled) {
         _wxidField = [[UITextField alloc] init];
         UIView *right = [self inputRowWithField:_wxidField
@@ -841,42 +701,25 @@ static NSString *DDProfileWriteDiagLog(void) {
                                            text:cfg.wxidValue ?: @""
                                        keyboard:UIKeyboardTypeASCIICapable];
         WCTableViewCellManager *wxidSubCell = [cellCls normalCellForSel:nil
-                                                               target:nil
-                                                                title:@"↳目标微信号"
-                                                            rightView:right];
+                                                              target:nil
+                                                               title:@"↳目标微信号"
+                                                           rightView:right];
         wxidSubCell.userInfo = @"SubCell";
-        [wxidSection addCell:wxidSubCell];
+        [profileSection addCell:wxidSubCell];
     }
-    [_tableViewManager addSection:wxidSection];
 
-    WCTableViewSectionManager *avatarSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"自定义用户头像"];
-    avatarSection.footerTitle = @"开启后可在单聊「聊天信息」页替换联系人头像；关闭后不再显示替换入口，也不替换头像";
-    [avatarSection addCell:[cellCls switchCellForSel:@selector(avatarSwitchChanged:)
+    [profileSection addCell:[cellCls switchCellForSel:@selector(avatarSwitchChanged:)
                                                target:self
                                                 title:@"备注用户头像"
                                                    on:cfg.avatarEnabled]];
     UIButton *clearBtn = [self dd_actionButton:@"清理" action:@selector(clearAllAvatarTapped:) x:0];
     UIView *clearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
     [clearRight addSubview:clearBtn];
-    [avatarSection addCell:[cellCls normalCellForSel:nil
+    [profileSection addCell:[cellCls normalCellForSel:nil
                                               target:nil
                                                title:@"清理全部头像"
                                            rightView:clearRight]];
-    [_tableViewManager addSection:avatarSection];
-
-    WCTableViewSectionManager *diagSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"诊断日志"];
-    diagSection.footerTitle = @"默认开启。排查「自定义头像」开关消失：清空日志 → 进单聊「聊天信息」页复现（点免打扰/置顶/提醒）→ 回本页点「导出」";
-    [diagSection addCell:[cellCls switchCellForSel:@selector(diagSwitchChanged:)
-                                            target:self
-                                             title:@"记录运行日志"
-                                                on:cfg.diagEnabled]];
-    UIButton *exportBtn = [self dd_actionButton:@"导出" action:@selector(exportDiagLogTapped:) x:0];
-    UIButton *logClearBtn = [self dd_actionButton:@"清空" action:@selector(clearDiagLogTapped:) x:60];
-    UIView *logRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 112, 34)];
-    [logRight addSubview:exportBtn];
-    [logRight addSubview:logClearBtn];
-    [diagSection addCell:[cellCls normalCellForSel:nil target:nil title:@"导出日志" rightView:logRight]];
-    [_tableViewManager addSection:diagSection];
+    [_tableViewManager addSection:profileSection];
 
     [_tableViewManager reloadTableView];
 }
@@ -906,30 +749,6 @@ static NSString *DDProfileWriteDiagLog(void) {
     DDShowDoneToast(@"头像已清理");
 }
 
-- (void)diagSwitchChanged:(UISwitch *)sender {
-    [DDProfileConfig shared].diagEnabled = sender.isOn;
-    [self buildTable];
-}
-
-- (void)clearDiagLogTapped:(id)sender {
-    DDJokerClearDiagLog();
-    DDShowDoneToast(@"日志已清空");
-}
-
-- (void)exportDiagLogTapped:(id)sender {
-    NSString *path = DDProfileWriteDiagLog();
-    if (!path.length) { return; }
-    NSURL *url = [NSURL fileURLWithPath:path];
-    UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[url]
-                                                                     applicationActivities:nil];
-    if (av.popoverPresentationController) {
-        UIView *anchor = [sender isKindOfClass:[UIView class]] ? (UIView *)sender : self.view;
-        av.popoverPresentationController.sourceView = anchor;
-        av.popoverPresentationController.sourceRect = anchor.bounds;
-    }
-    [self presentViewController:av animated:YES completion:nil];
-}
-
 @end
 
 #pragma mark - 配置实现
@@ -949,11 +768,6 @@ static NSString *DDProfileWriteDiagLog(void) {
         _wxidEnabled = [def boolForKey:kDDWxidEnabledKey];
         _wxidValue = [def stringForKey:kDDWxidValueKey] ?: @"";
         _avatarEnabled = [def boolForKey:kDDAvatarEnabledKey];
-        if ([def objectForKey:kDDDiagEnabledKey]) {
-            _diagEnabled = [def boolForKey:kDDDiagEnabledKey];
-        } else {
-            _diagEnabled = YES;
-        }
     }
     return self;
 }
@@ -976,13 +790,6 @@ static NSString *DDProfileWriteDiagLog(void) {
     _avatarEnabled = avatarEnabled;
     NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
     [def setBool:avatarEnabled forKey:kDDAvatarEnabledKey];
-    [def synchronize];
-}
-
-- (void)setDiagEnabled:(BOOL)diagEnabled {
-    _diagEnabled = diagEnabled;
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    [def setBool:diagEnabled forKey:kDDDiagEnabledKey];
     [def synchronize];
 }
 
