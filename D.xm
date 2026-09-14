@@ -266,9 +266,6 @@ static UIViewController *DDTopPresentedViewController(UIViewController *vc) {
     }
 
     UIViewController *presenter = DDTopPresentedViewController(vc);
-          NSStringFromClass([presenter class]),
-          presenter.view.window ? 1 : 0,
-          presenter.presentedViewController ? NSStringFromClass([presenter.presentedViewController class]) : @"(无)");
 
     UIImagePickerController *picker = [[UIImagePickerController alloc] init];
     picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
@@ -282,8 +279,6 @@ static UIViewController *DDTopPresentedViewController(UIViewController *vc) {
 
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!presenter.view.window || presenter.isBeingDismissed || presenter.presentedViewController) {
-                  presenter.view.window ? 1 : 0, presenter.isBeingDismissed,
-                  presenter.presentedViewController ? NSStringFromClass([presenter.presentedViewController class]) : @"(无)");
             if (completion) completion(nil);
             return;
         }
@@ -471,6 +466,17 @@ static BOOL DDSectionHasAvatarCell(id section) {
     return NO;
 }
 
+static __weak AddContactToChatRoomViewController *s_currentProfileVC = nil;
+
+static AddContactToChatRoomViewController *DDCurrentProfileVCForTable(id tableViewInfo) {
+    AddContactToChatRoomViewController *vc = s_currentProfileVC;
+    if (!vc || !tableViewInfo) return nil;
+    id tv = nil;
+    @try { tv = [vc valueForKey:@"m_tableViewInfo"]; } @catch (NSException *e) { tv = nil; }
+    if (tv != tableViewInfo) return nil;
+    return vc;
+}
+
 static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc) {
     if (![DDProfileConfig shared].avatarEnabled) { DDLOG(@"[头像·插行] 跳过：总开关关"); return; }
     if (![vc m_contact]) { DDLOG(@"[头像·插行] 跳过：无 m_contact"); return; }
@@ -495,20 +501,24 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     [[tableViewInfo getTableView] reloadData];
 }
 
-%hook MMTableViewInfo
+%hook WCTableViewManager
 
 - (void)reloadTableView {
     %orig;
-    DDLOG(@"[头像·入口] MMTableViewInfo.reloadTableView HIT");
-    id owner = nil;
-    @try { owner = [(id)self valueForKey:@"delegate"]; } @catch (NSException *e) { owner = nil; }
-    if ([owner isKindOfClass:%c(AddContactToChatRoomViewController)]) {
-        AddContactToChatRoomViewController *vc = (AddContactToChatRoomViewController *)owner;
-        if ([vc m_contact]) {
-            DDLOG(@"[头像·入口] reloadTableView 命中单聊详情页，准备插行");
-            DDInjectAvatarSwitchIntoTable(vc);
-        }
-    }
+    AddContactToChatRoomViewController *vc = DDCurrentProfileVCForTable(self);
+    if (!vc) return;
+    DDLOG(@"[头像·入口] WCTableViewManager.reloadTableView HIT");
+    if ([vc m_contact]) DDInjectAvatarSwitchIntoTable(vc);
+}
+
+- (void)clearAllSection {
+    %orig;
+    AddContactToChatRoomViewController *vc = DDCurrentProfileVCForTable(self);
+    if (!vc) return;
+    DDLOG(@"[头像·入口] WCTableViewManager.clearAllSection HIT（表格被清空，延迟补回）");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([vc m_contact]) DDInjectAvatarSwitchIntoTable(vc);
+    });
 }
 
 %end
@@ -523,6 +533,7 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
 
 - (void)viewDidLoad {
     %orig;
+    s_currentProfileVC = self;
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(reloadTableData)
                                                  name:kDDAvatarChangedNotification
@@ -530,12 +541,14 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
 }
 
 - (void)dealloc {
+    if (s_currentProfileVC == self) s_currentProfileVC = nil;
     [[NSNotificationCenter defaultCenter] removeObserver:self name:kDDAvatarChangedNotification object:nil];
     %orig;
 }
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
+    s_currentProfileVC = self;
     DDLOG(@"[头像·入口] VC.viewDidAppear HIT");
     [self dd_injectAvatarCell];
 }
