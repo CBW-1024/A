@@ -95,19 +95,12 @@ static NSString *DDJokerDescribeHitStats(void) {
 @interface WeToast : NSObject
 + (id)toast;
 - (void)showDoneToastWithText:(id)a0;
-- (void)showErrorToastWithText:(id)a0;
 @end
 
 static void DDShowDoneToast(NSString *text) {
     if (!text.length) return;
     WeToast *toast = [%c(WeToast) toast];
     if (toast) [toast showDoneToastWithText:text];
-}
-
-static void DDShowErrorToast(NSString *text) {
-    if (!text.length) return;
-    WeToast *toast = [%c(WeToast) toast];
-    if (toast) [toast showErrorToastWithText:text];
 }
 
 @interface WCPluginsMgr : NSObject
@@ -644,7 +637,6 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
 
     if (DDAvatarImageForUser(usrName)) {
         BOOL ok = DDAvatarRemoveForUser(usrName);
-        DDShowDoneToast(@"已恢复默认头像");
         DDLOG(@"[头像·开关] 已恢复默认头像，发通知触发重插  user=%@  ok=%d", usrName, ok);
         [[NSNotificationCenter defaultCenter] postNotificationName:kDDAvatarChangedNotification object:nil];
     } else {
@@ -658,10 +650,8 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
                 return;
             }
             if (!DDAvatarSaveImage(image, usrName)) {
-                DDShowErrorToast(@"保存失败");
                 [weakSw setOn:NO animated:YES];
             } else {
-                DDShowDoneToast(@"头像已替换");
                 DDLOG(@"[头像·开关] 头像已替换，发通知触发重插  user=%@", usrName);
                 [[NSNotificationCenter defaultCenter] postNotificationName:kDDAvatarChangedNotification object:nil];
             }
@@ -720,7 +710,6 @@ static NSString *DDProfileWriteDiagLog(void) {
 - (void)buildTable;
 - (UIView *)inputRowWithField:(UITextField *)field
                        action:(SEL)action
-                  placeholder:(NSString *)placeholder
                          text:(NSString *)text
                      keyboard:(UIKeyboardType)keyboard;
 - (UIButton *)dd_actionButton:(NSString *)title action:(SEL)action x:(CGFloat)x;
@@ -787,7 +776,6 @@ static NSString *DDProfileWriteDiagLog(void) {
 
 - (UIView *)inputRowWithField:(UITextField *)field
                        action:(SEL)action
-                  placeholder:(NSString *)placeholder
                          text:(NSString *)text
                      keyboard:(UIKeyboardType)keyboard {
     UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 220, 34)];
@@ -795,7 +783,6 @@ static NSString *DDProfileWriteDiagLog(void) {
 
     field.frame = CGRectMake(0, 0, 160, 34);
     field.borderStyle = UITextBorderStyleNone;
-    field.placeholder = placeholder;
     field.text = text;
     field.textAlignment = NSTextAlignmentRight;
     field.keyboardType = keyboard;
@@ -851,9 +838,8 @@ static NSString *DDProfileWriteDiagLog(void) {
         _wxidField = [[UITextField alloc] init];
         UIView *right = [self inputRowWithField:_wxidField
                                         action:@selector(wxidConfirm:)
-                                   placeholder:@"例如：wxid_abc123"
-                                          text:cfg.wxidValue ?: @""
-                                      keyboard:UIKeyboardTypeASCIICapable];
+                                           text:cfg.wxidValue ?: @""
+                                       keyboard:UIKeyboardTypeASCIICapable];
         WCTableViewCellManager *wxidSubCell = [cellCls normalCellForSel:nil
                                                                target:nil
                                                                 title:@"↳目标微信号"
@@ -874,7 +860,7 @@ static NSString *DDProfileWriteDiagLog(void) {
     [clearRight addSubview:clearBtn];
     [avatarSection addCell:[cellCls normalCellForSel:nil
                                               target:nil
-                                               title:@"一键全部还原"
+                                               title:@"清理全部头像"
                                            rightView:clearRight]];
     [_tableViewManager addSection:avatarSection];
 
@@ -905,7 +891,6 @@ static NSString *DDProfileWriteDiagLog(void) {
     NSString *text = [_wxidField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     [DDProfileConfig shared].wxidValue = text;
     [_wxidField resignFirstResponder];
-    DDShowDoneToast(text.length ? @"已保存" : @"已清空");
     [self buildTable];
 }
 
@@ -918,7 +903,7 @@ static NSString *DDProfileWriteDiagLog(void) {
 
 - (void)clearAllAvatarTapped:(id)sender {
     (void)DDAvatarRemoveAll();
-    DDShowDoneToast(@"已清理");
+    DDShowDoneToast(@"头像已清理");
 }
 
 - (void)diagSwitchChanged:(UISwitch *)sender {
@@ -933,7 +918,7 @@ static NSString *DDProfileWriteDiagLog(void) {
 
 - (void)exportDiagLogTapped:(id)sender {
     NSString *path = DDProfileWriteDiagLog();
-    if (!path.length) { DDShowErrorToast(@"导出失败"); return; }
+    if (!path.length) { return; }
     NSURL *url = [NSURL fileURLWithPath:path];
     UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[url]
                                                                      applicationActivities:nil];
@@ -942,9 +927,6 @@ static NSString *DDProfileWriteDiagLog(void) {
         av.popoverPresentationController.sourceView = anchor;
         av.popoverPresentationController.sourceRect = anchor.bounds;
     }
-    av.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *error) {
-        DDShowDoneToast(completed ? @"日志已导出" : @"已取消");
-    };
     [self presentViewController:av animated:YES completion:nil];
 }
 
