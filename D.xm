@@ -352,13 +352,11 @@ static void DDRefreshAvatarViewsForUser(NSString *usrName) {
         dispatch_async(dispatch_get_main_queue(), ^{ DDRefreshAvatarViewsForUser(usrName); });
         return;
     }
-    NSInteger n = 0;
     for (MMHeadImageView *v in DDAvatarViews()) {
         NSString *name = v.nsUsrName;
         if (name.length == 0) continue;
         if (usrName.length && ![name isEqualToString:usrName]) continue;
         [v setHeadImageByName:name];
-        n++;
     }
 }
 
@@ -787,7 +785,7 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
 }
 
 - (void)clearAllAvatarTapped:(id)sender {
-    NSInteger n = DDAvatarRemoveAll();
+    (void)DDAvatarRemoveAll();
     [self dd_showDoneToast:@"已清理"];
 }
 
