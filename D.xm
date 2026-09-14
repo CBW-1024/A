@@ -121,18 +121,11 @@ static void DDShowErrorToast(NSString *text) {
 @property (nonatomic, retain) id userInfo;
 @end
 
-@interface WCTableViewNormalCellManager : WCTableViewCellManager
-+ (id)switchCellForSel:(SEL)sel target:(id)target title:(id)title on:(BOOL)on;
-@end
-
 @interface WCTableViewSectionManager : NSObject
 + (id)sectionWithHeader:(NSString *)header;
 + (id)defaultSection;
 @property (nonatomic, copy) NSString *footerTitle;
-@property (retain, nonatomic) NSMutableArray *cells;
 - (void)addCell:(id)arg1;
-- (void)insertCell:(id)a0 At:(unsigned int)a1;
-- (id)getAllCells;
 - (unsigned long long)getCellCount;
 - (id)getCellAt:(unsigned long long)a0;
 @end
@@ -144,8 +137,6 @@ static void DDShowErrorToast(NSString *text) {
 - (void)clearAllSection;
 - (void)addSection:(id)arg1;
 - (id)cellInfoAtIndexPath:(NSIndexPath *)indexPath;
-- (unsigned long long)getSectionCount;
-- (id)getSectionAt:(unsigned long long)a0;
 - (void)reloadTableView;
 - (id)getTableView;
 - (id)getAllSections;
@@ -182,7 +173,7 @@ static void DDShowErrorToast(NSString *text) {
 @property (retain, nonatomic) CBaseContact *m_contact;
 - (void)updateHead;
 - (void)updateHDHead;
-- (void)dd_applyCustomHDHead:(NSString *)tag;
+- (void)dd_applyCustomHDHead;
 @end
 
 @interface AddContactToChatRoomViewController : UIViewController
@@ -434,7 +425,7 @@ static void DDRefreshAvatarViewsForUser(NSString *usrName) {
     }
 }
 
-static BOOL DDTryApplyCustomAvatar(MMHeadImageView *view, NSString *usrName, NSString *tag) {
+static BOOL DDTryApplyCustomAvatar(MMHeadImageView *view, NSString *usrName) {
     NSString *name = usrName.length ? usrName : view.nsUsrName;
     UIImage *custom = DDAvatarImageForUser(name);
     if (!custom) return NO;
@@ -467,19 +458,19 @@ static BOOL DDTryApplyCustomAvatar(MMHeadImageView *view, NSString *usrName, NSS
 
 - (void)setHeadImageByName:(id)usrName {
     %orig(usrName);
-    DDTryApplyCustomAvatar(self, usrName, @"头像替换·setHeadImageByName");
+    DDTryApplyCustomAvatar(self, usrName);
 }
 
 - (void)doUpdateHeadImg:(BOOL)force {
     %orig(force);
-    DDTryApplyCustomAvatar(self, nil, @"头像替换·doUpdateHeadImg");
+    DDTryApplyCustomAvatar(self, nil);
 }
 
 - (void)didMoveToWindow {
     %orig;
     if (!self.window) return;
     [DDAvatarViews() addObject:self];
-    DDTryApplyCustomAvatar(self, nil, @"头像替换·didMoveToWindow");
+    DDTryApplyCustomAvatar(self, nil);
 }
 
 %end
@@ -501,7 +492,7 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 %hook MMHDHeadImageView
 
 %new
-- (void)dd_applyCustomHDHead:(NSString *)tag {
+- (void)dd_applyCustomHDHead {
     UIImage *custom = DDAvatarImageForUser([self.m_contact m_nsUsrName]);
     if (!custom) return;
     ImageScrollView *sv = (ImageScrollView *)DDFindImageScrollViewIn(self);
@@ -511,12 +502,12 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 
 - (void)updateHead {
     %orig;
-    [self dd_applyCustomHDHead:@"头像替换·HD·updateHead"];
+    [self dd_applyCustomHDHead];
 }
 
 - (void)updateHDHead {
     %orig;
-    [self dd_applyCustomHDHead:@"头像替换·HD·updateHDHead"];
+    [self dd_applyCustomHDHead];
 }
 
 %end
@@ -727,7 +718,6 @@ static NSString *DDProfileWriteDiagLog(void) {
 @interface DDProfileSettingsViewController : UIViewController <UITableViewDelegate>
 @property (nonatomic, strong) WCTableViewManager *tableViewManager;
 - (void)buildTable;
-- (void)rebuild;
 - (UIView *)inputRowWithField:(UITextField *)field
                        action:(SEL)action
                   placeholder:(NSString *)placeholder
@@ -741,8 +731,6 @@ static NSString *DDProfileWriteDiagLog(void) {
 - (void)diagSwitchChanged:(UISwitch *)sender;
 - (void)clearDiagLogTapped:(id)sender;
 - (void)exportDiagLogTapped:(id)sender;
-- (void)dd_showDoneToast:(NSString *)text;
-- (void)dd_showErrorToast:(NSString *)text;
 @end
 
 @implementation DDProfileSettingsViewController {
@@ -910,27 +898,27 @@ static NSString *DDProfileWriteDiagLog(void) {
 - (void)wxidSwitchChanged:(id)sender {
     UISwitch *sw = (UISwitch *)sender;
     [DDProfileConfig shared].wxidEnabled = sw.on;
-    [self rebuild];
+    [self buildTable];
 }
 
 - (void)wxidConfirm:(id)sender {
     NSString *text = [_wxidField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     [DDProfileConfig shared].wxidValue = text;
     [_wxidField resignFirstResponder];
-    [self dd_showDoneToast:(text.length ? @"已保存" : @"已清空")];
-    [self rebuild];
+    DDShowDoneToast(text.length ? @"已保存" : @"已清空");
+    [self buildTable];
 }
 
 - (void)avatarSwitchChanged:(id)sender {
     UISwitch *sw = (UISwitch *)sender;
     [DDProfileConfig shared].avatarEnabled = sw.on;
     if (!sw.on) DDRefreshAvatarViewsForUser(nil);
-    [self rebuild];
+    [self buildTable];
 }
 
 - (void)clearAllAvatarTapped:(id)sender {
     (void)DDAvatarRemoveAll();
-    [self dd_showDoneToast:@"已清理"];
+    DDShowDoneToast(@"已清理");
 }
 
 - (void)diagSwitchChanged:(UISwitch *)sender {
@@ -940,12 +928,12 @@ static NSString *DDProfileWriteDiagLog(void) {
 
 - (void)clearDiagLogTapped:(id)sender {
     DDJokerClearDiagLog();
-    [self dd_showDoneToast:@"日志已清空"];
+    DDShowDoneToast(@"日志已清空");
 }
 
 - (void)exportDiagLogTapped:(id)sender {
     NSString *path = DDProfileWriteDiagLog();
-    if (!path.length) { [self dd_showErrorToast:@"导出失败"]; return; }
+    if (!path.length) { DDShowErrorToast(@"导出失败"); return; }
     NSURL *url = [NSURL fileURLWithPath:path];
     UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[url]
                                                                      applicationActivities:nil];
@@ -954,23 +942,10 @@ static NSString *DDProfileWriteDiagLog(void) {
         av.popoverPresentationController.sourceView = anchor;
         av.popoverPresentationController.sourceRect = anchor.bounds;
     }
-    __weak DDProfileSettingsViewController *weakSelf = self;
     av.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *error) {
-        [weakSelf dd_showDoneToast:completed ? @"日志已导出" : @"已取消"];
+        DDShowDoneToast(completed ? @"日志已导出" : @"已取消");
     };
     [self presentViewController:av animated:YES completion:nil];
-}
-
-- (void)dd_showDoneToast:(NSString *)text {
-    DDShowDoneToast(text);
-}
-
-- (void)dd_showErrorToast:(NSString *)text {
-    DDShowErrorToast(text);
-}
-
-- (void)rebuild {
-    [self buildTable];
 }
 
 @end
