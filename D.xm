@@ -52,7 +52,7 @@
 //  诊断日志（DDLOG / DDJokerHit / 设置页「导出日志」）默认关闭：
 //    仅在设置页打开「记录运行日志」后，才在插件加载处与各功能 hook 命中处记录，
 //    并进入命中统计与导出文件；其余时候各模块静默运行，不写日志。
-//    开关由三个入口创建，入口名写进日志：
+//    开关由这些入口创建，入口名写进日志：
 //      viewWillAppear        —— 首次进入详情页时表格刚建好。
 //      initData 后补注入     —— 详情页重建分组的总入口(h:92)。免打扰/置顶/保存到聊天框
 //                              这些原生开关改完状态后都会重跑它，我们的行就在这被冲掉。
@@ -60,11 +60,10 @@
 //                              DelaySwitchSettingLogic(h:11) 还是异步延迟提交的，
 //                              联系人变更还会从 IContactMgrExt(h:141/142) 进来，
 //                              但所有路径最终都收敛到 initData。
-//      reload 前补注入      —— 表格层主路径，挂在 MMTableViewInfo（不是 WCTableViewManager，
+//      reload 后补注入       —— 表格层主路径，挂在 MMTableViewInfo（不是 WCTableViewManager，
 //                              理由见实现处：子类覆写了 reloadTableView，挂父类接不到）。
-//                              插入放在 %orig 之前，让行在 reloadData 之前就回到数据里，
-//                              界面一次渲染到位 —— 这是不闪烁的关键。
-//      重建后补注入         —— 兜底，只在上面没接住时才真正生效。
+//                              插入放在 %orig 之后 + 自己 reloadData，同一 runloop 同步完成，
+//                              不闪（详见实现处踩坑记录）。
 //    注入只挂这类「表格生命周期」事件；本插件自己不调 reloadTableData，
 //    保存/删除头像后也不手动补注入（那种场景要么行还在、要么已被上面入口接住）。
 //    导出文件为 Documents/DDProfileDiag.log。
@@ -127,7 +126,6 @@ static void DDShowErrorToast(NSString *text) {
 - (unsigned long long)getSectionCount;
 - (id)getSectionAt:(unsigned long long)a0;
 - (void)reloadTableView;
-- (void)dd_scheduleAvatarReinject;  // 本插件 %new，先声明以便 hook 内调用
 @end
 
 // 聊天详情页的表格真实类型是 MMTableViewInfo(AddContactToChatRoomViewController.h:7
@@ -767,14 +765,8 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 #pragma mark - 头像修改入口（单聊「聊天信息」页）
 
 
-static NSString *const kDDAvatarCellId = @"DDProfileAvatarCell";
-
-// 注入过程中置 YES，用于抑制「注入自己发起的 reloadTableView」再触发一轮补注入排期。
-// reloadTableView 是同步调用，出作用域立即置回，不存在跨帧泄漏。
-static BOOL gDDInjecting = NO;
-
 // manager -> 详情页 VC 的弱引用映射（两边都是弱引用，任一方释放条目自动失效）。
-// 用途：reloadTableView / addSection: 是表格基类的方法，全 app 的表格都走它，
+// 用途：reloadTableView 是表格基类的方法，全 app 的表格都走它，
 // 得判断「这个 manager 是不是聊天详情页的」才敢注入。
 // 映射由 dd_injectAvatarCellFrom: 在注入时建立（归属清楚，属于详情页自己），
 // 查表是 O(1)，不用每次遍历 VC 列表去反查。
@@ -812,9 +804,10 @@ static NSMapTable *DDTableManagerToVC(void) {
     });
 }
 
-// needsReload=YES：表格已处于稳定态，插完得自己刷一次才能看见（viewWillAppear 等）。
-// needsReload=NO ：插完不刷，交给调用方紧接着的那次 reloadData 一起渲染 —— 用于
-//                  reloadTableView 的 %orig 之前，这样没有「行消失一帧」的中间态。
+// needsReload=YES：插完调 [[info tableView] reloadData] 让自己显示出来（viewWillAppear、
+//   initData 兜底、reloadTableView hook 都用这个）。注意是 reloadData 不是 reloadTableView，
+//   reloadTableView 内部会 clearAllSection 把刚插的行冲掉，且会递归进本 hook。
+// needsReload=NO ：插完不刷，留给后续逻辑（保留接口，当前调用方都传 YES）。
 %new
 - (void)dd_injectAvatarCellFrom:(NSString *)entry {
     [self dd_injectAvatarCellFrom:entry needsReload:YES];
@@ -909,13 +902,14 @@ static NSMapTable *DDTableManagerToVC(void) {
     [cell setUserInfo:kDDAvatarCellId];
     [firstSection insertCell:cell At:0];
 
-    // needsReload=NO 时这里不刷：调用方（MMTableViewInfo.reloadTableView 的 %orig 之前）
-    // 紧接着就会 reloadData，行会被一起渲染出来。自己再刷一次不但多余，
-    // 还会重新进入 reloadTableView 的 hook，白绕一圈。
+    // needsReload=NO：插入后由调用方紧紧接着的 reloadData 一起渲染（reloadTableView hook 里
+    //   用这个模式，%orig 之后插入、紧接着 tableView reloadData，没有「行不在」的中间帧）。
+    // needsReload=YES：自己刷一次让行显示出来。这里用 [[info tableView] reloadData] 而非
+    //   [info reloadTableView] —— 后者会递归进本 hook，且 reloadTableView 内部又会
+    //   clearAllSection 把刚插的行冲掉，前功尽弃。reloadData 只是纯 UI 刷新，
+    //   重新向 dataSource 要 cell，不触发任何重建。
     if (needsReload) {
-        gDDInjecting = YES;
-        [info reloadTableView];
-        gDDInjecting = NO;
+        [[info tableView] reloadData];
     }
 
     DDLOG(@"[头像·注入] 入口=%@ 成功：已插入首分组第0行  user=%@  已有图=%d  首分组原行数=%lu",
@@ -998,51 +992,23 @@ static NSMapTable *DDTableManagerToVC(void) {
 // 现在改挂 MMTableViewInfo：它覆写了就抓它自己的；万一某版本没覆写，Substrate 也会在
 // 子类建 hook 再转发 super —— 两种情况都接得住。
 //
-// 入口分工（刻意只留两个）：
-//   reloadTableView —— 主路径，插入放在 %orig 之前，零闪烁（见实现处说明）。
-//   clearAllSection —— 兜底，延一帧补，只在 reloadTableView 没接住时才真正生效。
-// 不再挂 addSection: —— 它是增量操作，一次重建会被连调十几次，而且它触发时重建还没完，
-// 插进去立刻被后面的步骤冲掉，纯属白做工（日志里那一串「重建后补注入 成功」就是它）。
+// 【踩坑记录 · 为什么还一闪一闪】第一版把插入放在 %orig 之前，以为「reloadData 之前行就位、
+// 渲染一次到位」。但日志打脸：reload前补注入 每次都是「跳过：已注入过」，而同一轮延一帧
+// 的兜底却是「成功插入」—— 说明 %orig 跑完之后行没了。推论：MMTableViewInfo.reloadTableView
+// 的 %orig 内部自己会 clearAllSection + 重建 sections + reloadData，它把我们 %orig 之前
+// 插的行又清掉了。真正救场的变成了 clearAllSection 延一帧的兜底，于是每轮都「消失一帧再补回」。
+//
+// 【怎么修】插入一律放在 %orig 之后，且只用 [[self tableView] reloadData]（纯 UI 刷新，
+//   不递归进本 hook、不会再 clearAll）。%orig 内部清完也重建完了，sections 已是最终态，
+//   我们在这之后插入、紧接着自己 reloadData，整个操作在同一 runloop 同步完成，
+//   不会给屏幕留出「行不在」的中间帧，因此不闪。
 %hook MMTableViewInfo
 
-// 【为什么会一闪一闪】之前是「%orig 之后再延一帧补注入」。微信重建表格的链路是
-//   clearAllSection -> addSection ×N -> reloadTableView(内部 reloadData)
-// 行在第一步就被冲掉了，而我们要等到下一帧才插回去，中间那 16ms 界面上就是没有这一行 ——
-// 日志实证：一次进出详情页被冲掉又插回 11 次（与「头像开关创建 11 次」完全吻合），
-// 页面反复重建时，这个「消失一帧再回来」连起来就是肉眼可见的闪烁。
-//
-// 【怎么修】把插入挪到 %orig 之前：行在 reloadData 之前就回到 sections 里，
-//   紧接着的这次渲染一次性带上它，中间根本不存在「行不在」的帧，所以不会闪。
-//   并且 needsReload=NO —— 不再自己发起刷新，避免重入本 hook 白绕一圈。
 - (void)reloadTableView {
-    AddContactToChatRoomViewController *vc = [DDTableManagerToVC() objectForKey:self];
-    [vc dd_injectAvatarCellFrom:@"reload前补注入" needsReload:NO];
     %orig;
-}
-
-// 兜底：万一某条重建路径绕开 reloadTableView 直接 reloadData，上面就接不住。
-// clearAllSection 是重建的起点，在这排一次下一帧的补注入。正常情况下那一帧
-// reloadTableView 早把行补回来了，去重命中直接 return，不会重复刷、也不会闪。
-- (void)clearAllSection {
-    %orig;
-    [self dd_scheduleAvatarReinject];
-}
-
-%new
-- (void)dd_scheduleAvatarReinject {
-    if (gDDInjecting) return;    // 注入自己发起的刷新，不再回灌
-
+    // %orig 之后 sections 已是重建后的最终态。此时插入 + 自己 reloadData，行随这次刷新一起出来。
     AddContactToChatRoomViewController *vc = [DDTableManagerToVC() objectForKey:self];
-    if (!vc) return;   // 不是详情页的表格（比如设置页那个裸 manager），直接放过
-
-    // 同一轮重建只排一次：addSection: 一轮会被连着调十几次，不去重就是十几个 block 排队。
-    if ([objc_getAssociatedObject(self, @selector(dd_scheduleAvatarReinject)) boolValue]) return;
-    objc_setAssociatedObject(self, @selector(dd_scheduleAvatarReinject), @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        objc_setAssociatedObject(self, @selector(dd_scheduleAvatarReinject), nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [vc dd_injectAvatarCellFrom:@"重建后补注入"];
-    });
+    [vc dd_injectAvatarCellFrom:@"reload后补注入" needsReload:YES];
 }
 
 %end
