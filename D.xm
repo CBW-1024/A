@@ -150,7 +150,6 @@ static void DDShowErrorToast(NSString *text) {
 - (id)getTableView;
 - (id)getAllSections;
 - (void)insertSection:(id)arg1 At:(unsigned int)a1;
-- (long long)numberOfSectionsInTableView:(id)arg1;
 @end
 
 @interface CBaseContact : NSObject
@@ -541,13 +540,6 @@ static BOOL DDSectionHasAvatarCell(id section) {
 
 static __weak AddContactToChatRoomViewController *s_currentProfileVC = nil;
 
-// 防止我们自己插入时递归进入重建钩子
-static BOOL s_injectingSection = NO;
-
-// clearAllSection 后等待补回（正常由 addSection 同步补回；兜底由 numberOfSections 补）
-static BOOL s_rebuildPending = NO;
-static int  s_rebuildRetry   = 0;
-
 static AddContactToChatRoomViewController *DDCurrentProfileVCForTable(id tableViewInfo) {
     AddContactToChatRoomViewController *vc = s_currentProfileVC;
     if (!vc || !tableViewInfo) return nil;
@@ -577,13 +569,7 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     objc_setAssociatedObject(cell, kDDAvatarCellMarker, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     id section = [%c(WCTableViewSectionManager) defaultSection];
     [section addCell:cell];
-    s_injectingSection = YES;
-    @try {
-        [tableViewInfo insertSection:section At:1];
-    } @finally {
-        s_injectingSection = NO;
-    }
-    s_rebuildPending = NO;
+    [tableViewInfo insertSection:section At:1];
     if (reloadNow) [[tableViewInfo getTableView] reloadData];
     DDJokerHit(@"头像开关创建");
     DDLOG(@"[头像·插行] 已插入资料卡下方  当前分组数=%lu  user=%@  on=%d",
@@ -592,26 +578,19 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
 
 %hook WCTableViewManager
 
-- (void)reloadTableView {
-    %orig;
-    AddContactToChatRoomViewController *vc = DDCurrentProfileVCForTable(self);
-    if (!vc) return;
-    DDJokerHit(@"入口·reloadTableView");
-    if ([vc m_contact]) DDInjectAvatarSwitchIntoTable(vc, YES);
-}
-
 - (void)clearAllSection {
     %orig;
     AddContactToChatRoomViewController *vc = DDCurrentProfileVCForTable(self);
     if (!vc) return;
     DDJokerHit(@"入口·clearAllSection");
-    s_rebuildPending = YES;
-    s_rebuildRetry = 0;
 }
 
+// 主力路径：微信重建表格走 clearAllSection → addSection ×N。
+// 首个 addSection 回调时资料卡已加回，此刻同步插到 At:1，
+// 与重建在同一 runloop 内完成，微信随后的一次 reloadData 即带出该行，不产生第二帧。
 - (void)addSection:(id)a0 {
     %orig;
-    if (s_injectingSection || !a0) return;
+    if (!a0) return;
     AddContactToChatRoomViewController *vc = DDCurrentProfileVCForTable(self);
     if (!vc || ![vc m_contact]) return;
     DDJokerHit(@"入口·addSection");
@@ -620,55 +599,9 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     DDInjectAvatarSwitchIntoTable(vc, NO);
 }
 
-- (void)insertSection:(id)a0 At:(unsigned int)a1 {
-    %orig;
-    if (s_injectingSection || !a0) return;
-    AddContactToChatRoomViewController *vc = DDCurrentProfileVCForTable(self);
-    if (!vc || ![vc m_contact]) return;
-    DDJokerHit(@"入口·insertSection");
-    DDLOG(@"[头像·重建] insertSection At:%u 回调  当前分组数=%lu",
-          a1, (unsigned long)[[self getAllSections] count]);
-    DDInjectAvatarSwitchIntoTable(vc, NO);
-}
-
-// 硬兜底：表格渲染前最后一次确认。
-// 若微信绕过 addSection/insertSection 直接改 sections 数组，此处在渲染前补回，
-// 因为发生在同一次 numberOfSections 查询内，不会产生额外一帧，故不闪烁。
-- (long long)numberOfSectionsInTableView:(id)a0 {
-    if (s_rebuildPending && !s_injectingSection) {
-        AddContactToChatRoomViewController *vc = DDCurrentProfileVCForTable(self);
-        if (!vc) {
-            s_rebuildPending = NO;                 // VC 已释放，放弃本轮
-        } else if ([vc m_contact]) {
-            if (s_rebuildRetry >= 8) {
-                s_rebuildPending = NO;             // 连续多帧未成功，放弃，避免刷屏
-                DDLOG(@"[头像·重建] 兜底重试已达上限，放弃  当前分组数=%lu",
-                      (unsigned long)[[self getAllSections] count]);
-            } else {
-                s_rebuildRetry++;
-                DDJokerHit(@"入口·numberOfSections兜底");
-                DDLOG(@"[头像·重建] numberOfSections 兜底第%d次  当前分组数=%lu",
-                      s_rebuildRetry, (unsigned long)[[self getAllSections] count]);
-                DDInjectAvatarSwitchIntoTable(vc, NO); // 真正插入成功后才清 pending
-            }
-        }
-    }
-    return %orig;
-}
-
 %end
 
 %hook AddContactToChatRoomViewController
-
-- (void)reloadTableData {
-    %orig;
-    DDJokerHit(@"入口·reloadTableData");
-    id tvInfo = nil;
-    @try { tvInfo = [self valueForKey:@"m_tableViewInfo"]; } @catch (NSException *e) {}
-    DDLOG(@"[头像·入口] reloadTableData 重建后分组数=%lu",
-          (unsigned long)[[tvInfo getAllSections] count]);
-    [self dd_injectAvatarCell];
-}
 
 // s_currentProfileVC 必须在 %orig 之前赋值：
 // 微信在 super viewDidLoad 内部就完成表格装配（addSection ×7），
@@ -686,7 +619,8 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     [self dd_injectAvatarCell];   // 表格已装配完、页面尚未显示，首帧即带开关
 }
 
-// 转场动画开始前再确认一次（比 viewDidAppear 早约一个转场时长）
+// 转场动画开始前再确认一次：若微信在 %orig 里又重建了一次表格，此处补回；
+// 正常情况下已被 addSection 插好，这里被去重挡住。
 - (void)viewWillAppear:(BOOL)animated {
     s_currentProfileVC = self;
     %orig;
@@ -699,13 +633,6 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     if (s_currentProfileVC == self) s_currentProfileVC = nil;
     [[NSNotificationCenter defaultCenter] removeObserver:self name:kDDAvatarChangedNotification object:nil];
     %orig;
-}
-
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
-    s_currentProfileVC = self;
-    DDJokerHit(@"入口·viewDidAppear");
-    [self dd_injectAvatarCell];
 }
 
 %new
