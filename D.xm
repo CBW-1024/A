@@ -670,13 +670,29 @@ static void DDInjectAvatarSwitchIntoTable(AddContactToChatRoomViewController *vc
     [self dd_injectAvatarCell];
 }
 
+// s_currentProfileVC 必须在 %orig 之前赋值：
+// 微信在 super viewDidLoad 内部就完成表格装配（addSection ×7），
+// 若等到 %orig 之后再赋值，装配期的 addSection 钩子会被判为"不是我的表"而全部跳过，
+// 只能退到 viewDidAppear 才补插——这就是开关"过一下才出现"的原因。
 - (void)viewDidLoad {
+    s_currentProfileVC = self;
     %orig;
     s_currentProfileVC = self;
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(reloadTableData)
                                                  name:kDDAvatarChangedNotification
                                                object:nil];
+    DDJokerHit(@"入口·viewDidLoad");
+    [self dd_injectAvatarCell];   // 表格已装配完、页面尚未显示，首帧即带开关
+}
+
+// 转场动画开始前再确认一次（比 viewDidAppear 早约一个转场时长）
+- (void)viewWillAppear:(BOOL)animated {
+    s_currentProfileVC = self;
+    %orig;
+    s_currentProfileVC = self;
+    DDJokerHit(@"入口·viewWillAppear");
+    [self dd_injectAvatarCell];
 }
 
 - (void)dealloc {
