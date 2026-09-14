@@ -107,9 +107,12 @@ static void DDShowErrorToast(NSString *text) {
 @interface WCTableViewSectionManager : NSObject
 + (id)sectionWithHeader:(NSString *)header;
 @property (nonatomic, copy) NSString *footerTitle;
+@property (retain, nonatomic) NSMutableArray *cells;
 - (void)addCell:(id)arg1;
 - (void)insertCell:(id)a0 At:(unsigned int)a1;
 - (id)getAllCells;
+- (unsigned long long)getCellCount;
+- (id)getCellAt:(unsigned long long)a0;
 @end
 
 // 与主插件声明保持一致（style 用 NSInteger、tableView 只读），另保留注入所需的分组访问方法，
@@ -136,15 +139,6 @@ static void DDShowErrorToast(NSString *text) {
 // 接住；%orig 之后往 section 0 真实 addCell: 一行（不虚拟化数据源，避免幽灵行越界闪退）。
 // 保留 MMTableViewInfo 声明，既作类型参考，也作为 %hook 的目标类。
 @interface MMTableViewInfo : WCTableViewManager
-@end
-
-// 分组模型。真插行时往 section 0 末尾 addCell: 我们的开关 cell
-// （WCTableViewSectionManager.h:43 addCell:、h:49 getCellCount、h:51 getCellAt:）。
-@interface WCTableViewSectionManager : NSObject
-@property (retain, nonatomic) NSMutableArray *cells;
-- (void)addCell:(id)arg1;
-- (unsigned long long)getCellCount;
-- (id)getCellAt:(unsigned long long)a0;
 @end
 
 // 联系人数据模型。CContact 继承 CBaseContact(CContact.h:3)，字段都在基类。
@@ -195,6 +189,7 @@ static void DDShowErrorToast(NSString *text) {
 @interface AddContactToChatRoomViewController : UIViewController
 @property (retain, nonatomic) CContact *m_contact;
 - (void)ddAvatarSwitchChanged:(UISwitch *)sender;
+- (void)dd_injectAvatarCell;
 @end
 
 
