@@ -859,9 +859,9 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
 // 菜单项：直接用微信内置 svg 图标 icons_filled_sticker（MMMenuItem.h:29 原生支持 svg 资源名）。
 static MMMenuItem *DDJokerMenuItem(NSString *title, id target, SEL action) {
     return [(MMMenuItem *)[%c(MMMenuItem) alloc] initWithTitle:title
-                                                      svgName:@"icons_filled_sticker"
-                                                       target:target
-                                                       action:action];
+                                                       svgName:@"icons_filled_sticker"
+                                                        target:target
+                                                        action:action];
 }
 
 static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *original) {
