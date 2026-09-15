@@ -77,6 +77,10 @@
 - (BOOL)isSelf;
 @end
 
+@interface CSetting : NSObject
+- (id)m_nsAliasName;
+@end
+
 @interface AddContactToChatRoomViewController : UIViewController
 @property (retain, nonatomic) CBaseContact *m_contact;
 - (void)ddWxidSwitchChanged:(UISwitch *)sender;        // 备注好友微信号
@@ -1904,7 +1908,7 @@ static NSString *DDCustomWxid(void) {
 %hook CBaseContact
 
 // CBaseContact.h:12 —— m_nsAliasName 即「微信号」。
-// 自己：返回自定义微信号（CSetting 继承 CBaseContact，m_nsAliasName 同样走此路径，故不再单独 hook CSetting）。
+// 自己：返回自定义微信号。
 // 好友：查备注表，命中返回备注值（空串＝隐藏），未命中回原值。
 - (id)m_nsAliasName {
     if ([self isSelf]) {
@@ -1917,6 +1921,16 @@ static NSString *DDCustomWxid(void) {
     return %orig;
 }
 
+%end
+
+%hook CSetting
+// CSetting.h:58/301 —— 微信「我」页面、设置等读取的自己的 m_nsAliasName 数据源。
+// CSetting 独立继承 NSObject，不继承 CBaseContact，需单独 hook。
+- (id)m_nsAliasName {
+    NSString *custom = DDCustomWxid();
+    if (custom) return custom;
+    return %orig;
+}
 %end
 
 #pragma mark - 头像替换（显示侧）
