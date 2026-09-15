@@ -10,7 +10,7 @@
 #include <string.h>
 
 #pragma mark - 微信类声明
-// 本插件 hook 的微信原生类与方法签名，均锚定微信 .h 头文件 dump。
+// 本插件 hook 的微信原生类与方法签名，均锚定微信8.0.78头文件 dump。
 
 @interface WCUIAlertView : NSObject
 - (id)initWithTitle:(id)a0 message:(id)a1;
