@@ -860,9 +860,9 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
 static MMMenuItem *DDJokerMenuItem(NSString *title, id target, SEL action) {
     id item = [%c(MMMenuItem) alloc];
     return [item initWithTitle:title
-                       svgName:@"icons_filled_sticker"
-                        target:target
-                        action:action];
+    svgName:@"icons_filled_sticker"
+    target:target
+    action:action];
 }
 
 static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *original) {
