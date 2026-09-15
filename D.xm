@@ -205,6 +205,17 @@
 - (void)updateDescLabel;
 @end
 
+@interface WCPayControlData : NSObject
+@property (retain, nonatomic) CMessageWrap *m_oSelectedMessageWrap;
+@end
+
+@interface WCPayBaseViewController : UIViewController
+- (id)data;
+@end
+
+@interface WCPayTransferMoneyStatusViewController : WCPayBaseViewController
+@end
+
 @interface ImageMessageCellView : CommonMessageCellView
 - (void)showImage;
 - (void)OnDownloadImageOk:(id)a0;
@@ -931,14 +942,19 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
                                   withTemplate:newAmount];
 }
 
-%hook WCPayBaseMessageCellView
-- (void)onTouchUpInside {
-    if ([self isKindOfClass:%c(WCPayTransferMessageCellView)]) {
-        id vm = [(WCPayTransferMessageCellView *)self viewModel];
-        CMessageWrap *msg = [vm messageWrap];
-        DDSetLastTransferOverride(DDJokerCachedAmount(msg));
-    }
+// 转账详情页金额改写：detail VC 的 data.m_oSelectedMessageWrap 就是该条转账消息，
+// 与聊天列表同一消息，故 DDJokerMessageKey 命中同一缓存。在 viewDidLoad 渲染前设 override，
+// 详情页 MMUILabel 渲染时即被替换（DDLabelOnTransferDetailVC 判定 label 归属本 VC）。
+%hook WCPayTransferMoneyStatusViewController
+- (void)viewDidLoad {
+    WCPayControlData *data = [self data];
+    CMessageWrap *msg = data.m_oSelectedMessageWrap;
+    DDSetLastTransferOverride(DDJokerCachedAmount(msg));
     %orig;
+}
+- (void)dealloc {
+    %orig;
+    DDSetLastTransferOverride(nil);
 }
 %end
 
