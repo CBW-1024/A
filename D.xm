@@ -10,9 +10,7 @@
 //  功能：聊天文字、图片、时间、转账改写；运动步数、好友数量；余额 / 零钱通自定义
 //  入口：微信 → 插件入口 → "DD小丑助手"设置页
 //
-//  诊断日志（DDLOG / DDJokerHit / 设置页"导出"）默认关闭：仅在设置页"记录运行日志"打开后，
-//    才在 %ctor 加载处与代码中临时加的 DDJokerHit(@"标签") / DDLOG(@"...") 处记录，并进入命中
-//    统计与导出文件；其余功能模块静默运行，不写日志。
+//  各功能模块静默运行，不写任何日志。
 // ============================================================
 
 
@@ -109,6 +107,7 @@
 @property (retain, nonatomic) CBaseContact *m_contact;
 - (void)updateHead;
 - (void)updateHDHead;
+- (void)dd_applyCustomHDHead;
 @end
 
 // BaseMsgContentLogicController.h:329/332/348
@@ -280,7 +279,6 @@ static NSString * const kDDFeatureWxidEnabled = @"DDFeatureWxidEnabled";
 static NSString * const kDDFeatureWxidValue = @"DDFeatureWxidValue";
 static NSString * const kDDFeatureAvatarEnabled = @"DDFeatureAvatarEnabled";
 static NSString * const kDDFeatureHideChatName = @"DDFeatureHideChatName";
-static NSString * const kDDFeatureDiagEnabled = @"DDFeatureDiagEnabled";
 
 static NSString * const kDDStepsValueStringKey = @"DDStepsValueString";
 static NSString * const kDDContactsCountValueKey = @"DDContactsCountValue";
@@ -302,7 +300,6 @@ static NSString * const kDDLingtongValueKey = @"DDLingtongValue";
 @property (nonatomic) BOOL avatarEnabled;
 @property (nonatomic) BOOL hideChatName;
 
-@property (nonatomic) BOOL diagEnabled;
 @property (nonatomic, copy) NSString *stepsValueString;
 @property (nonatomic, copy) NSString *contactsValue;
 @property (nonatomic, copy) NSString *balanceValue;
@@ -316,8 +313,7 @@ static NSString * const kDDLingtongValueKey = @"DDLingtongValue";
 - (void)saveContacts;
 @end
 
-#pragma mark - 通用诊断日志 · 采集
-// DDLOG 写内存缓冲（导出用）；DDJokerHit 做 hook 命中计数与节流；清空 / 统计供设置页与导出模块调用。
+#pragma mark - 通用辅助
 
 
 static BOOL DDStringHas(const char *haystack, const char *needle) {
@@ -327,80 +323,11 @@ static BOOL DDStringHas(const char *haystack, const char *needle) {
     return (h && n) ? ([h rangeOfString:n].location != NSNotFound) : NO;
 }
 
-static NSDateFormatter *DDLogTimeFormatter(void) {
-    static NSDateFormatter *fmt = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        fmt = [[NSDateFormatter alloc] init];
-        fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-        fmt.dateFormat = @"HH:mm:ss.SSS";
-    });
-    return fmt;
-}
 
-static NSMutableString *DDLogBuffer(void) {
-    static NSMutableString *buf = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ buf = [NSMutableString string]; });
-    return buf;
-}
 
-static NSMutableDictionary *DDLogHits(void) {
-    static NSMutableDictionary *hits = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ hits = [NSMutableDictionary dictionary]; });
-    return hits;
-}
 
-static void DDJokerLog(NSString *fmt, ...) {
-    if (![DDGlobalConfig shared].diagEnabled) return;
-    va_list ap;
-    va_start(ap, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    NSString *line = [NSString stringWithFormat:@"%@  %@",
-                      [DDLogTimeFormatter() stringFromDate:[NSDate date]], msg];
-    NSLog(@"[DD小丑] %@", line);
-    NSMutableString *buf = DDLogBuffer();
-    @synchronized (buf) {
-        [buf appendFormat:@"%@\n", line];
-        if (buf.length > 300000) {
-            [buf deleteCharactersInRange:NSMakeRange(0, buf.length - 200000)];
-        }
-    }
-}
 
-#define DDLOG(...) DDJokerLog(__VA_ARGS__)
 
-// hook 命中计数，节流输出（前 3 次 + 每 50 次），避免刷屏。
-// 插件加载时已记一次（见 %ctor），新功能里调 DDJokerHit(@"标签") 即追加命中统计。
-static void DDJokerHit(NSString *tag) {
-    NSMutableDictionary *hits = DDLogHits();
-    NSInteger n = 0;
-    @synchronized (hits) {
-        n = [hits[tag] integerValue] + 1;
-        hits[tag] = @(n);
-    }
-    if (n <= 3 || n % 50 == 0) DDLOG(@"HIT %@ 第 %ld 次", tag, (long)n);
-}
-
-static void DDJokerClearDiagLog(void) {
-    NSMutableString *buf = DDLogBuffer();
-    @synchronized (buf) { [buf setString:@""]; }
-    NSMutableDictionary *hits = DDLogHits();
-    @synchronized (hits) { [hits removeAllObjects]; }
-}
-
-static NSString *DDJokerDescribeHitStats(void) {
-    NSMutableDictionary *hits = DDLogHits();
-    if (!hits.count) return @"  (还没有任何 hook 被触发)\n";
-    NSMutableString *s = [NSMutableString string];
-    for (NSString *k in [[hits allKeys] sortedArrayUsingSelector:@selector(compare:)]) {
-
-        [s appendFormat:@"  %@ : %@ 次\n", k, hits[k]];
-    }
-    return s;
-}
 
 #pragma mark - 聊天消息改写（文字 / 图片 / 转账）
 // 长按消息弹出"小丑"菜单：文字改内容与引用标题、图片替换为相册所选图、转账改金额。
@@ -668,7 +595,6 @@ static void DDJokerClearAllMessageCache(void) {
     [fm removeItemAtPath:DDJokerImagesDir() error:nil];
 }
 
-static __weak id gDDLastTimeVM = nil;
 
 static NSString *DDTimeDesc(double ts) {
     if (ts <= 0) return @"0 (无效)";
@@ -1219,7 +1145,6 @@ static double DDTimeStampFromString(NSString *s) {
 
 %hook ChatTimeViewModel
 - (NSString *)timeText {
-    gDDLastTimeVM = self;
 
     double raw = DDRawShowingTimeOf(self);
     NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(self) : nil;
@@ -1742,123 +1667,6 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
 %end
 
 
-#pragma mark - 通用诊断日志 · 快照与导出
-// 拼装导出文本（命中统计 / 缓存盘点 / 时间条结构 / 日志正文），写微信 Documents/DDJokerDiag.log。
-
-
-static NSString *DDJokerDescribeClassIvars(Class cls) {
-    NSMutableString *s = [NSMutableString string];
-    if (!cls) return @"  (类不存在：dump 里的类名在当前微信版本变了)\n";
-    [s appendFormat:@"  类名    : %s\n", class_getName(cls)];
-
-    NSMutableArray *chain = [NSMutableArray array];
-    Class sup = class_getSuperclass(cls);
-    while (sup) { [chain addObject:[NSString stringWithUTF8String:class_getName(sup)]]; sup = class_getSuperclass(sup); }
-    [s appendFormat:@"  父类链  : %@\n", chain.count ? [chain componentsJoinedByString:@" → "] : @"(无)"];
-
-    unsigned int n = 0;
-    Ivar *list = class_copyIvarList(cls, &n);
-    [s appendFormat:@"  ivar 数 : %u\n", n];
-    for (unsigned int i = 0; i < n; i++) {
-        Ivar iv = list[i];
-        const char *nm = ivar_getName(iv) ?: "";
-        [s appendFormat:@"    [%02u] %-32s type=%-8s offset=%td%s\n",
-         i, nm, ivar_getTypeEncoding(iv) ?: "", ivar_getOffset(iv),
-         (DDStringHas(nm, "time") || DDStringHas(nm, "date")) ? "  <<<" : ""];
-    }
-    free(list);
-
-    unsigned int m = 0;
-    Method *ms = class_copyMethodList(cls, &m);
-    [s appendFormat:@"  方法数  : %u（只列名字含 time/date 的）\n", m];
-    for (unsigned int i = 0; i < m; i++) {
-        SEL sel = method_getName(ms[i]);
-        const char *nm = sel_getName(sel) ?: "";
-        if (DDStringHas(nm, "time") || DDStringHas(nm, "date")) {
-            [s appendFormat:@"    - %-34s %s\n", nm, method_getTypeEncoding(ms[i]) ?: ""];
-        }
-    }
-    free(ms);
-    return s;
-}
-
-static NSString *DDJokerDescribeTimeVM(id vm) {
-    if (!vm) return @"  (还没触发过 ChatTimeViewModel.timeText：先打开一个聊天页滚动几下再导出)\n";
-    NSMutableString *s = [NSMutableString string];
-    [s appendFormat:@"  vm=%p  类=%s\n", vm, class_getName([vm class])];
-    [s appendFormat:@"  showingTime 当前值 : %@\n", DDTimeDesc(DDShowingTimeOf(vm))];
-    [s appendFormat:@"  原始 showingTime   : %@\n", DDTimeDesc(DDRawShowingTimeOf(vm))];
-    [s appendFormat:@"  时间 key           : %@\n", DDJokerTimeKey(vm)];
-    NSNumber *cached = DDJokerCachedTime(vm);
-    [s appendFormat:@"  缓存命中           : %@\n", cached ? DDTimeDesc([cached doubleValue]) : @"无"];
-    return s;
-}
-
-static NSString *DDJokerDescribeCaches(void) {
-    NSMutableString *s = [NSMutableString string];
-    NSDictionary *time = DDJokerLoadCache(kDDJokerTimeCacheKey);
-    NSDictionary *text = DDJokerLoadCache(kDDJokerTextCacheKey);
-    NSDictionary *amount = DDJokerLoadCache(kDDJokerAmountCacheKey);
-    NSDictionary *origin = DDJokerLoadCache(kDDJokerTextOriginalKey);
-    [s appendFormat:@"  时间缓存 %lu 条 : %@\n", (unsigned long)time.count, time ?: @{}];
-    [s appendFormat:@"  文字缓存 %lu 条\n", (unsigned long)text.count];
-    [s appendFormat:@"  金额缓存 %lu 条\n", (unsigned long)amount.count];
-    [s appendFormat:@"  原文备份 %lu 条（清理缓存时刻意保留，用于文字还原）\n", (unsigned long)origin.count];
-    NSString *folder = DDJokerImagesDir();
-    NSArray *imgs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:folder error:nil];
-    [s appendFormat:@"  替换图片目录 %@ : %lu 个文件\n", folder, (unsigned long)imgs.count];
-    return s;
-}
-
-static NSString *DDJokerExportLogText(void) {
-    NSMutableString *out = [NSMutableString string];
-    [out appendString:@"===== DD小丑助手 诊断日志 =====\n"];
-
-    NSDateFormatter *f = [[NSDateFormatter alloc] init];
-    f.locale = [NSLocale localeWithLocaleIdentifier:@"zh_CN"];
-    f.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-    [out appendFormat:@"导出时间 : %@\n", [f stringFromDate:[NSDate date]]];
-    [out appendFormat:@"系统版本 : %@ %@\n", [UIDevice currentDevice].systemName, [UIDevice currentDevice].systemVersion];
-    NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
-    [out appendFormat:@"微信版本 : %@ (%@)\n", info[@"CFBundleShortVersionString"], info[@"CFBundleVersion"]];
-
-    DDGlobalConfig *c = [DDGlobalConfig shared];
-    [out appendFormat:@"开关状态 : 文字=%d 图片=%d 时间=%d 转账=%d 诊断=%d 余额=%d 余额值=%@ 零钱通值=%@\n",
-     c.textEnabled, c.imageEnabled, c.timeEnabled, c.transferEnabled, c.diagEnabled,
-     c.balanceEnabled, ([c hasBalanceValue] ? c.balanceValue : @"-"), ([c hasLingtongValue] ? c.lingtongValue : @"-")];
-    [out appendString:@"复现步骤 : 清空日志 → 复现问题（改时间/文字/金额/图片/步数…）→ 回本页导出，把日志发出去即可定位\n"];
-
-    [out appendString:@"\n----- hook 命中统计 -----\n"];
-    [out appendString:DDJokerDescribeHitStats()];
-
-    [out appendString:@"\n----- 缓存盘点 -----\n"];
-    [out appendString:DDJokerDescribeCaches()];
-
-    [out appendString:@"\n----- 最近一条时间条 -----\n"];
-    [out appendString:DDJokerDescribeTimeVM(gDDLastTimeVM)];
-
-    [out appendString:@"\n----- 该类运行时结构 -----\n"];
-    [out appendString:DDJokerDescribeClassIvars([gDDLastTimeVM class] ?: NSClassFromString(@"ChatTimeViewModel"))];
-
-    [out appendString:@"\n----- 日志正文 -----\n"];
-    NSMutableString *buf = DDLogBuffer();
-    NSString *body = @"";
-    @synchronized (buf) { body = [buf copy]; }
-    [out appendString:body.length ? body : @"(空：诊断开关没开，或还没触发过相关 hook)\n"];
-    return out;
-}
-
-static NSString *DDJokerWriteDiagLog(void) {
-    NSString *text = DDJokerExportLogText();
-    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    if (!dir.length) return nil;
-    NSString *path = [dir stringByAppendingPathComponent:@"DDJokerDiag.log"];
-    NSError *err = nil;
-    [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&err];
-    if (err) { NSLog(@"[DD小丑] 写诊断日志失败: %@", err); return nil; }
-    [[UIPasteboard generalPasteboard] setString:path];
-    return path;
-}
 
 #pragma mark - 好友微信号备注（按用户名，聊天详情页逐人设置）
 
@@ -2467,7 +2275,7 @@ static BOOL DDHideChatName(void) {
 %end
 
 #pragma mark - 设置界面
-// 各功能开关、自定义值输入、诊断日志清空 / 导出；表视图委托转发给微信原生 manager。
+// 各功能开关、自定义值输入；表视图委托转发给微信原生 manager。
 
 
 @interface DDJokerSettingsViewController : UIViewController <UITableViewDelegate>
@@ -2642,25 +2450,15 @@ static BOOL DDHideChatName(void) {
     }
 
     [profileSection addCell:[cellCls switchCellForSel:@selector(avatarSwitchChanged:) target:self title:@"备注用户头像" on:cfg.avatarEnabled]];
-    UIButton *clearBtn = [self dd_actionButton:@"清理" action:@selector(clearAllAvatarTapped:) x:0];
-    UIView *clearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
-    [clearRight addSubview:clearBtn];
-    [profileSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清理全部头像" rightView:clearRight]];
+    UIButton *avatarClearBtn = [self dd_actionButton:@"清理" action:@selector(clearAllAvatarTapped:) x:0];
+    UIView *avatarClearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
+    [avatarClearRight addSubview:avatarClearBtn];
+    [profileSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清理全部头像" rightView:avatarClearRight]];
 
     [profileSection addCell:[cellCls switchCellForSel:@selector(hideChatNameSwitch:) target:self title:@"隐藏聊天顶栏名字" on:cfg.hideChatName]];
 
     [_tableViewManager addSection:profileSection];
 
-    WCTableViewSectionManager *diagSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"诊断日志"];
-    diagSection.footerTitle = @"默认仅在插件启动时记录一条。排查问题时打开「记录运行日志」，复现后点下方「导出日志」即可";
-    [diagSection addCell:[cellCls switchCellForSel:@selector(diagSwitchChanged:) target:self title:@"记录运行日志" on:cfg.diagEnabled]];
-    UIButton *exportBtn = [self dd_actionButton:@"导出" action:@selector(exportDiagLogTapped:) x:0];
-    UIButton *logClearBtn = [self dd_actionButton:@"清空" action:@selector(clearDiagLogTapped:) x:60];
-    UIView *logRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 112, 34)];
-    [logRight addSubview:exportBtn];
-    [logRight addSubview:logClearBtn];
-    [diagSection addCell:[cellCls normalCellForSel:nil target:nil title:@"导出日志" rightView:logRight]];
-    [_tableViewManager addSection:diagSection];
 
     [_tableViewManager reloadTableView];
 }
@@ -2721,32 +2519,6 @@ static BOOL DDHideChatName(void) {
     [self dd_showDoneToast:@"已清理"];
 }
 
-- (void)diagSwitchChanged:(UISwitch *)sender {
-    [DDGlobalConfig shared].diagEnabled = sender.isOn;
-    [self buildTable];
-}
-
-- (void)clearDiagLogTapped:(id)sender {
-    DDJokerClearDiagLog();
-    [self dd_showDoneToast:@"日志已清空"];
-}
-
-- (void)exportDiagLogTapped:(id)sender {
-    NSString *path = DDJokerWriteDiagLog();
-    if (!path.length) { [self dd_showDoneToast:@"导出失败"]; return; }
-    NSURL *url = [NSURL fileURLWithPath:path];
-    UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
-    if (av.popoverPresentationController) {
-        UIView *anchor = [sender isKindOfClass:[UIView class]] ? (UIView *)sender : self.view;
-        av.popoverPresentationController.sourceView = anchor;
-        av.popoverPresentationController.sourceRect = anchor.bounds;
-    }
-    __weak DDJokerSettingsViewController *weakSelf = self;
-    av.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *error) {
-        [weakSelf dd_showDoneToast:completed ? @"日志已导出" : @"已取消"];
-    };
-    [self presentViewController:av animated:YES completion:nil];
-}
 
 - (void)dd_showDoneToast:(NSString *)text {
     if (!text.length) return;
@@ -2943,7 +2715,6 @@ static BOOL DDHideChatName(void) {
         _avatarEnabled = [def boolForKey:kDDFeatureAvatarEnabled];
         _hideChatName = [def boolForKey:kDDFeatureHideChatName];
 
-        _diagEnabled = [def objectForKey:kDDFeatureDiagEnabled] ? [def boolForKey:kDDFeatureDiagEnabled] : NO;
         _stepsValueString = [def stringForKey:kDDStepsValueStringKey];
         _contactsValue = [def stringForKey:kDDContactsCountValueKey];
         _balanceValue = [def stringForKey:kDDBalanceValueKey];
@@ -3023,11 +2794,6 @@ static BOOL DDHideChatName(void) {
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
-- (void)setDiagEnabled:(BOOL)enabled {
-    _diagEnabled = enabled;
-    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureDiagEnabled];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-}
 
 - (void)setStepsValueString:(NSString *)stepsValueString {
     _stepsValueString = [stepsValueString copy];
@@ -3110,8 +2876,6 @@ static BOOL DDHideChatName(void) {
 
 %ctor {
     @autoreleasepool {
-        DDLOG(@"=== 插件加载 ===");
-        DDJokerHit(@"插件加载");
         WCPluginsMgr *mgr = [%c(WCPluginsMgr) sharedInstance];
         [mgr registerControllerWithTitle:@"DD小丑助手"
                                  version:@"1.0.0"
