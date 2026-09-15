@@ -434,8 +434,13 @@ static NSString * const kDDJokerTimeCacheKey = @"DDJokerTimeCache";
 
 static NSString * const kDDJokerTextOriginalKey = @"DDJokerTextOriginal";
 
+// 关键：localID 只在单个会话内唯一（CMessageMgr.h:136 强制 usrName+localID 二元组定位），
+// 不同会话 localID 各自从 1 递增必然碰撞。必须用 (fromUsr|toUsr|localID) 三元组做全局唯一 key，
+// 否则会串聊——A 会话的改写命中 B 会话同 localID 的消息。
 static NSString *DDJokerMessageKey(CMessageWrap *msg) {
-    return [NSString stringWithFormat:@"%u", msg.m_uiMesLocalID];
+    NSString *from = [msg m_nsFromUsr] ?: @"";
+    NSString *to   = [msg m_nsToUsr]   ?: @"";
+    return [NSString stringWithFormat:@"%@|%@|%u", from, to, [msg m_uiMesLocalID]];
 }
 
 static NSString *DDJokerCacheDir(void) {
@@ -995,18 +1000,19 @@ static BOOL DDLabelOnTransferDetailVC(id v) {
 
 
 @interface DDWeChatImagePickerDelegate : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
-@property (nonatomic, assign) unsigned int mesLocalID;
+@property (nonatomic, copy) NSString *sessionKey;   // 会话唯一键（from|to|localID），避免跨会话串图
 @property (nonatomic, weak) id cellView;
 @end
 
-static NSString *DDImageReplacementPath(unsigned int mesLocalID) {
+static NSString *DDImageReplacementPath(NSString *sessionKey) {
     NSString *folder = DDJokerImagesDir();
-    return [folder stringByAppendingPathComponent:[NSString stringWithFormat:@"%u.png", mesLocalID]];
+    NSString *safe = [sessionKey stringByReplacingOccurrencesOfString:@"|" withString:@"_"];
+    return [folder stringByAppendingPathComponent:[safe stringByAppendingString:@".png"]];
 }
 
 static UIImage *DDImageReplacementForMessage(CMessageWrap *msg) {
     if (!msg || ![msg IsImgMsg]) return nil;
-    NSString *path = DDImageReplacementPath(msg.m_uiMesLocalID);
+    NSString *path = DDImageReplacementPath(DDJokerMessageKey(msg));
     if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return nil;
     return [UIImage imageWithContentsOfFile:path];
 }
@@ -1070,7 +1076,7 @@ static void DDImageApplyReplacementToCell(id cell) {
     picker.allowsEditing = NO;
     picker.title = @"图片修改";
     DDWeChatImagePickerDelegate *delegate = [[DDWeChatImagePickerDelegate alloc] init];
-    delegate.mesLocalID = msg.m_uiMesLocalID;
+    delegate.sessionKey = DDJokerMessageKey(msg);
     delegate.cellView = self;
     picker.delegate = delegate;
 
@@ -1095,7 +1101,7 @@ static void DDImageApplyReplacementToCell(id cell) {
 @implementation DDWeChatImagePickerDelegate
 
 #pragma mark - 系统相册选图回调
-// DDWeChatImagePickerDelegate：选图后落盘到按 mesLocalID 命名的 png，并刷新对应 cell。
+// DDWeChatImagePickerDelegate：选图后落盘到按 sessionKey（from|to|localID）命名的 png，并刷新对应 cell。
 
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<NSString *,id> *)info {
     UIImage *image = info[UIImagePickerControllerOriginalImage];
@@ -1107,7 +1113,7 @@ static void DDImageApplyReplacementToCell(id cell) {
 }
 
 - (void)dd_saveImage:(UIImage *)image dismissPicker:(UIImagePickerController *)picker {
-    NSString *path = DDImageReplacementPath(self.mesLocalID);
+    NSString *path = DDImageReplacementPath(self.sessionKey);
     NSData *data = UIImagePNGRepresentation(image);
     if (!data) { [picker dismissViewControllerAnimated:YES completion:nil]; return; }
     [data writeToFile:path atomically:YES];
