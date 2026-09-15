@@ -1576,8 +1576,8 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalanceResolveKind(self);
             unsigned long long want = 0; BOOL rewrite = NO;
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue])          { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
-            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue])   { want = DDClampFen(DDBalanceFenValue());   rewrite = YES; }
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
+            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { want = DDClampFen(DDBalanceFenValue());   rewrite = YES; }
             if (rewrite) { %orig(want); return; }
         }
     } @catch (NSException *e) {}
@@ -1589,8 +1589,8 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalanceResolveKind(self);
             unsigned long long want = 0; BOOL rewrite = NO;
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue])          { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
-            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue])   { want = DDClampFen(DDBalanceFenValue());   rewrite = YES; }
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
+            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { want = DDClampFen(DDBalanceFenValue());   rewrite = YES; }
             if (rewrite) { %orig(want); return; }
         }
     } @catch (NSException *e) {}
