@@ -2428,29 +2428,29 @@ static BOOL DDHideChatName(void) {
         [profileSection addCell:contactsSubCell];
     }
 
-    [profileSection addCell:[cellCls switchCellForSel:@selector(friendWxidSwitch:) target:self title:@"备注好友微信号" on:cfg.friendWxidEnabled]];
-
-    [profileSection addCell:[cellCls switchCellForSel:@selector(wxidSwitchChanged:) target:self title:@"自定义微信号" on:cfg.wxidEnabled]];
+    [profileSection addCell:[cellCls switchCellForSel:@selector(wxidSwitchChanged:) target:self title:@"备注自己微信号" on:cfg.wxidEnabled]];
     if (cfg.wxidEnabled) {
         self.wxidField = [[UITextField alloc] init];
         NSString *currentWxid = cfg.wxidValue.length ? cfg.wxidValue : @"";
         UIView *rightView = [self inputRowWithField:self.wxidField
                                          action:@selector(wxidConfirm:)
-                                    placeholder:@"自定义微信号"
+                                    placeholder:@"设置微信号"
                                            text:currentWxid];
         self.wxidField.keyboardType = UIKeyboardTypeASCIICapable;
-        WCTableViewCellManager *wxidSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳目标微信号" rightView:rightView];
+        WCTableViewCellManager *wxidSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳设置微信号" rightView:rightView];
         wxidSubCell.userInfo = @"SubCell";
         [profileSection addCell:wxidSubCell];
     }
+
+    [profileSection addCell:[cellCls switchCellForSel:@selector(friendWxidSwitch:) target:self title:@"备注好友微信号" on:cfg.friendWxidEnabled]];
+
+    [profileSection addCell:[cellCls switchCellForSel:@selector(hideChatNameSwitch:) target:self title:@"隐藏顶栏名字" on:cfg.hideChatName]];
 
     [profileSection addCell:[cellCls switchCellForSel:@selector(avatarSwitchChanged:) target:self title:@"备注用户头像" on:cfg.avatarEnabled]];
     UIButton *avatarClearBtn = [self dd_actionButton:@"清理" action:@selector(clearAllAvatarTapped:) x:0];
     UIView *avatarClearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
     [avatarClearRight addSubview:avatarClearBtn];
     [profileSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清理全部头像" rightView:avatarClearRight]];
-
-    [profileSection addCell:[cellCls switchCellForSel:@selector(hideChatNameSwitch:) target:self title:@"隐藏聊天顶栏名字" on:cfg.hideChatName]];
 
     [_tableViewManager addSection:profileSection];
 
