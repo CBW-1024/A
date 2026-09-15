@@ -2431,7 +2431,7 @@ static BOOL DDHideChatName(void) {
     Class cellCls = %c(WCTableViewCellManager);
 
     WCTableViewSectionManager *chatSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"聊天小丑"];
-    chatSection.footerTitle = @"开启后长按需要修改的聊天消息，在弹窗菜单点「小丑」即可修改：文字内容与引用、替换为相册图片、显示时间、转账金额";
+    chatSection.footerTitle = @"开启后长按需要修改的聊天消息，在弹窗菜单点「小丑」即可修改";
     [chatSection addCell:[cellCls switchCellForSel:@selector(textSwitchChanged:) target:self title:@"聊天文字修改" on:cfg.textEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(timeSwitchChanged:) target:self title:@"聊天时间修改" on:cfg.timeEnabled]];
@@ -2439,11 +2439,11 @@ static BOOL DDHideChatName(void) {
     UIButton *clearBtn = [self dd_actionButton:@"清理" action:@selector(clearChatCacheTapped:) x:0];
     UIView *clearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
     [clearRight addSubview:clearBtn];
-    [chatSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清除修改缓存" rightView:clearRight]];
+    [chatSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清空修改内容" rightView:clearRight]];
     [_tableViewManager addSection:chatSection];
 
     WCTableViewSectionManager *profileSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"资料小丑"];
-    profileSection.footerTitle = @"好友数量 / 账号修改后立即生效；运动步数不要超过100000；头像与好友账号开启后，在单聊「聊天信息」页逐人设置";
+    profileSection.footerTitle = @"头像与好友账号开启后在「聊天详情」页逐人设置";
     [profileSection addCell:[cellCls switchCellForSel:@selector(balanceSwitchChanged:) target:self title:@"零钱余额修改" on:cfg.balanceEnabled]];
     if (cfg.balanceEnabled) {
         self.balanceField = [[UITextField alloc] init];
@@ -2521,7 +2521,7 @@ static BOOL DDHideChatName(void) {
     UIButton *avatarClearBtn = [self dd_actionButton:@"清理" action:@selector(clearAllAvatarTapped:) x:0];
     UIView *avatarClearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
     [avatarClearRight addSubview:avatarClearBtn];
-    [profileSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清理全部头像" rightView:avatarClearRight]];
+    [profileSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清空全部头像" rightView:avatarClearRight]];
 
     [_tableViewManager addSection:profileSection];
 
