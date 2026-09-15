@@ -22,6 +22,25 @@
  *  云控开关                      0x148236c  WCRSideloadShareFixCloudAllowed
  *  总开关 ShouldInstall          0x14823ec
  *
+ *  ── 「需注入 ProtobufLite3（没有则 ProtobufLite）」的真实判定 ──────────────
+ *  0x14804f8  PreferredHostLinked      memo: bss 0x253a6f0/0x253a6f1
+ *  0x148056c  找宿主二进制  <bundle>/{Frameworks,Contents/Frameworks}/
+ *                          {ProtobufLite3(@0x205b4b6),ProtobufLite(@0x205b4c4)}.framework
+ *                          可执行文件取 Info.plist["CFBundleExecutable"]
+ *  0x147f6a4  fopen(path,"rb") 解析 Mach-O，只看
+ *             LC_LOAD_DYLIB(0x0c) / LC_LOAD_WEAK_DYLIB(0x80000018) /
+ *             LC_REEXPORT_DYLIB(0x8000001f) / LC_LOAD_UPWARD_DYLIB(0x80000023)
+ *             的 dylib 名字，strnstr(name, "WCRefine")  ← 标记串 @0x202a8b8
+ *  0x147ccf4  fat 中定位 arm64 slice（CPU_TYPE_ARM64），thin 返回 0，失败 -1
+ *  0x147cff4  BOOL ReadAt(FILE *, uint64_t off, void *buf, size_t len)
+ *  0x147d0b4  be32（fat_header/fat_arch 全是大端）
+ *
+ *  结论：判的不是"ProtobufLite 被没被加载"，而是
+ *        **磁盘上那份 ProtobufLite 二进制有没有被 Icsign 注入 WCRefine**
+ *        （注入后 Mach-O 会多一条指向 WCRefine.dylib 的 LC_LOAD_DYLIB）。
+ *  实测微信 8.0.78 的 Frameworks/ 只有 ProtobufLite.framework（无 ProtobufLite3），
+ *  且其依赖表里没有 WCRefine → 原始包下返回 NO，故设置页提示"需注入"。
+ *
  *  ── 私有函数（本文件按原样重建）─────────────────────────────────────────
  *  0x8f5490  WCRCurrentGroupID        扩展:0x8f3f40(nil)  主App:0x1481ec0
  *  0x8f4b9c  WCRFixActive             扩展:当前组非空    主App:config.sideloadShareFixEnabled
@@ -50,6 +69,9 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
+#import <stdio.h>
+#import <string.h>
+#import <stdlib.h>
 
 #pragma mark - 常量（全部来自 __cstring / __cfstring）
 
@@ -91,6 +113,14 @@ static NSString * const kWCRAuthDidFinish         = @"onCheckAuthenticateDidFini
 
 static NSString * const kWCRProtobufLite3 = @"ProtobufLite3";  // @0x205b4b6
 static NSString * const kWCRProtobufLite  = @"ProtobufLite";   // @0x205b4c4
+/* 0x147f6a4 在宿主 Mach-O 的 LC_LOAD_DYLIB* 名字里搜的标记 */
+static NSString * const kWCRInjectToken   = @"WCRefine";       // @0x202a8b8
+/* 0x14806a8 / 0x14806b4：宿主 framework 的候选目录（后者为 macOS 布局兼容） */
+static NSString * const kWCRFrameworksDir        = @"Frameworks";           // @0x22b3620
+static NSString * const kWCRContentsFrameworksDir= @"Contents/Frameworks";  // @0x22bf840
+static NSString * const kWCRFrameworkExt         = @"framework";            // @0x22bf860
+static NSString * const kWCRInfoPlistName        = @"Info.plist";           // @0x22b3740
+static NSString * const kWCRBundleExecutableKey  = @"CFBundleExecutable";   // @0x22bf7a0
 
 /* 配置键（WCRefineConfig，classref @0x238f810） */
 static NSString * const kWCRCfgEnabled  = @"sideloadShareFixEnabled";
@@ -98,6 +128,7 @@ static NSString * const kWCRCfgGroupID  = @"sideloadShareFixAppGroupId";
 
 #pragma mark - 前向声明
 
+static NSString *WCRPreferredHostBinaryPath(void);
 static NSArray<NSString *> *WCRApplicationGroupIDs(void);
 static NSString *WCRMarkerGroupID(void);
 static BOOL WCRWriteGroupMarker(NSString *groupID);
@@ -214,20 +245,44 @@ static NSArray<NSString *> *WCRGroupsFromEntitlements(NSDictionary *ent) {
     return out.count ? out : nil;
 }
 
+/* SecTask 系列在 iOS SDK 的公开头文件里没有声明，但 Security.framework 里确实有符号。
+ * 这里用 dlsym 在运行期解析，符号不存在就跳过该级回退 —— 既不依赖私有头，也不会链接失败。 */
+typedef struct __WCRSecTask *WCRSecTaskRef;
+typedef WCRSecTaskRef (*WCRSecTaskCreateFromSelfFunc)(CFAllocatorRef);
+typedef CFTypeRef     (*WCRSecTaskCopyValueFunc)(WCRSecTaskRef, CFStringRef, CFErrorRef *);
+
+static CFTypeRef WCRCopyEntitlementViaSecTask(NSString *key) {
+    static void *sSecTaskCreate = NULL, *sSecTaskCopy = NULL;
+    static BOOL sResolved = NO;
+    if (!sResolved) {
+        sResolved = YES;
+        sSecTaskCreate = dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
+        sSecTaskCopy   = dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+    }
+    if (!sSecTaskCreate || !sSecTaskCopy) return NULL;
+
+    WCRSecTaskRef task = ((WCRSecTaskCreateFromSelfFunc)sSecTaskCreate)(NULL);
+    if (!task) return NULL;
+    CFErrorRef err = NULL;
+    CFTypeRef v = ((WCRSecTaskCopyValueFunc)sSecTaskCopy)(
+                      task, (__bridge CFStringRef)key, &err);
+    CFRelease(task);
+    if (err) CFRelease(err);
+    return v;
+}
+
 /* 1) 0x147d944 内部缓存  2) 0x147bd34+0x147c2d0 embedded.mobileprovision
- * 3) 0x147c448 可执行文件  4) 0x147d254 CodeSignature
- * 每一级都用 @selector(count) 判空后再 objectForKeyedSubscript: */
+ *    3) 0x147c448 可执行文件  4) 0x147d254 CodeSignature
+ * 每一级都用 @selector(count) 判空后再 objectForKeyedSubscript:。
+ * iOS SDK 不导出 SecStaticCode / kSecCSDefaultFlags，级别 3/4 改用
+ * 直接读 Mach-O __TEXT,__entitlements 段的方式兜底。 */
 static NSArray<NSString *> *WCRDeclaredAppGroupIDs(void) {
     /* 级别 1：SecTaskCopyValueForEntitlement（进程真实生效的 entitlement） */
-    SecTaskRef task = SecTaskCreateFromSelf(NULL);
-    if (task) {
-        CFErrorRef err = NULL;
-        CFTypeRef v = SecTaskCopyValueForEntitlement(task,
-                        (__bridge CFStringRef)kWCREntitlementAppGroups, &err);
-        NSArray *a = CFBridgingRelease(v);
-        CFRelease(task);
-        if (err) { CFRelease(err); }
-        if (a.count) return a;
+    CFTypeRef ent = WCRCopyEntitlementViaSecTask(kWCREntitlementAppGroups);
+    if (ent) {
+        NSArray *a = CFBridgingRelease(ent);
+        NSArray *g = WCRGroupsFromEntitlements(@{ kWCREntitlementAppGroups : (a ?: @[]) });
+        if (g.count) return g;
     }
 
     /* 级别 2：embedded.mobileprovision（自签场景真正的来源） */
@@ -262,20 +317,31 @@ static NSArray<NSString *> *WCRDeclaredAppGroupIDs(void) {
         }
     }
 
-    /* 级别 3/4：可执行文件的 code signature（这里用 SecStaticCode 兜底） */
+    /* 级别 3/4：可执行文件自身的 entitlement。
+     * 现代签名把 entitlements 放在 __TEXT,__entitlements（<plist>...</plist>），
+     * 老签名放在 __TEXT,__info_plist / CodeResources，这里只扫 __TEXT,__entitlements。 */
     NSURL *exeURL = [[NSBundle mainBundle] executableURL];
     if (exeURL) {
-        SecStaticCodeRef code = NULL;
-        if (SecStaticCodeCreateWithPath((__bridge CFURLRef)exeURL,
-                                        kSecCSDefaultFlags, &code) == errSecSuccess) {
-            CFDictionaryRef info = NULL;
-            if (SecCodeCopySigningInformation(code, kSecCSDefaultFlags, &info)
-                == errSecSuccess) {
-                NSDictionary *d = CFBridgingRelease(info);
-                NSArray *a = WCRGroupsFromEntitlements(d[@"entitlements"]);
-                if (a.count) { CFRelease(code); return a; }
+        NSData *bin = [NSData dataWithContentsOfURL:exeURL];
+        if (bin.length) {
+            NSData *head = [NSData dataWithBytes:"<?xml" length:5];
+            NSData *tail = [NSData dataWithBytes:"</plist>" length:8];
+            NSRange s = [bin rangeOfData:head options:0 range:NSMakeRange(0, bin.length)];
+            if (s.location != NSNotFound) {
+                NSRange search = NSMakeRange(NSMaxRange(s), bin.length - NSMaxRange(s));
+                NSRange e = [bin rangeOfData:tail options:0 range:search];
+                if (e.location != NSNotFound) {
+                    NSData *xml = [bin subdataWithRange:
+                                   NSMakeRange(s.location, NSMaxRange(e) - s.location)];
+                    NSDictionary *plist =
+                        [NSPropertyListSerialization propertyListWithData:xml
+                                                                  options:0
+                                                                   format:NULL
+                                                                    error:NULL];
+                    NSArray *a = WCRGroupsFromEntitlements(plist);
+                    if (a.count) return a;
+                }
             }
-            CFRelease(code);
         }
     }
     return @[];
@@ -402,37 +468,219 @@ static void WCRSetPickedGroupID(NSString *gid) {
     }
 }
 
-#pragma mark - ProtobufLite 链接检查（0x14804f8）
+#pragma mark - ProtobufLite 链接检查（0x14804f8 / 0x148056c / 0x147f6a4 / 0x147ccf4 / 0x147cff4）
 
-/* 「需注入 ProtobufLite3（没有则 ProtobufLite）」 */
-static BOOL WCRObjectIsImageLinked(NSString *imageName) {
-    if (imageName.length == 0) return NO;
-    const char *name = imageName.UTF8String;
-    BOOL found = (dlsym(RTLD_DEFAULT, name) != NULL);
-    if (found) return YES;
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *p = _dyld_get_image_name(i);
-        if (!p) continue;
-        NSString *path = @(p);
-        if ([path.lastPathComponent hasPrefix:imageName] ||
-            [path rangeOfString:[NSString stringWithFormat:@"/%@.", imageName]].location != NSNotFound ||
-            [path rangeOfString:[NSString stringWithFormat:@"/%@/", imageName]].location != NSNotFound) {
-            return YES;
-        }
-    }
-    /* 兜底：拿该类/函数符号探测 */
-    void *h = dlopen(NULL, RTLD_NOLOAD);
-    if (h) {
-        NSString *sym = [@"OBJC_CLASS_$_" stringByAppendingString:imageName];
-        if (dlsym(h, sym.UTF8String)) return YES;
-    }
-    return NO;
+/*
+ * 「需注入 ProtobufLite3（没有则 ProtobufLite）」这句 UI 文案的真正含义，
+ * 由下面四个函数闭环给出，全部来自反汇编，不是推测：
+ *
+ *   0x148056c  在 <bundlePath>/{Frameworks,Contents/Frameworks}/ 下依次找
+ *              ProtobufLite3.framework (@0x205b4b6) → ProtobufLite.framework (@0x205b4c4)
+ *              读其 Info.plist 的 CFBundleExecutable 得到可执行文件名，
+ *              拼出 <fw>/<exe> 并 isReadableFileAtPath:
+ *   0x147f6a4  fopen(path,"rb") → 解析 Mach-O → 遍历 load commands，
+ *              只认 LC_LOAD_DYLIB(0x0c) / LC_LOAD_WEAK_DYLIB(0x80000018) /
+ *              LC_REEXPORT_DYLIB(0x8000001f) / LC_LOAD_UPWARD_DYLIB(0x80000023)
+ *              取其中的 dylib 名字，strnstr(name, "WCRefine")  ← @0x202a8b8
+ *   0x147ccf4  定位 fat 里的 arm64 slice（CPU_TYPE_ARM64），thin 直接返回 0
+ *   0x147cff4  BOOL ReadAt(FILE *, uint64_t off, void *buf, size_t len)
+ *
+ * 换句话说：这不是"检查 ProtobufLite 有没有被加载"，而是
+ * **检查磁盘上那份 ProtobufLite 二进制有没有被 Icsign 注入 WCRefine**
+ * （注入后其 Mach-O 会多出一条指向 WCRefine.dylib 的 LC_LOAD_DYLIB）。
+ *
+ * 实测微信 8.0.78（Frameworks.zip）：只有 ProtobufLite.framework，没有
+ * ProtobufLite3.framework；ProtobufLite 的 LC_LOAD_DYLIB 列表里没有 WCRefine，
+ * 所以原始包下本函数返回 NO —— 正是设置页提示"需注入"的原因。
+ */
+
+/* 0x147d0b4 —— 大端读 32 位 */
+static uint32_t WCRBigEndian32(const void *p) {
+    const uint8_t *b = (const uint8_t *)p;
+    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+           ((uint32_t)b[2] << 8)  |  (uint32_t)b[3];
 }
 
-static BOOL WCRPreferredHostLinked(void) {              /* 0x14804f8 */
-    if (WCRObjectIsImageLinked(kWCRProtobufLite3)) return YES;
-    return WCRObjectIsImageLinked(kWCRProtobufLite);
+/* 0x147cff4 */
+static BOOL WCRReadAt(FILE *f, uint64_t off, void *buf, size_t len) {
+    if (!f || !buf) return NO;
+    if (len == 0) return YES;
+    if (fseeko(f, (off_t)off, SEEK_SET) != 0) return NO;
+    return fread(buf, 1, len, f) == len;
+}
+
+/* WCR 用的是 strnstr（桩 0x1f15a44）；这里自带一份，避免 SDK 声明差异 */
+static char *WCRStrNStr(const char *haystack, const char *needle, size_t len) {
+    if (!haystack || !needle) return NULL;
+    size_t n = strlen(needle);
+    if (n == 0) return (char *)haystack;
+    if (n > len) return NULL;
+    for (size_t i = 0; i + n <= len; i++) {
+        if (haystack[i] == needle[0] && strncmp(haystack + i, needle, n) == 0) {
+            return (char *)(haystack + i);
+        }
+    }
+    return NULL;
+}
+
+/* 0x147ccf4 —— 返回 arm64 slice 的文件偏移；thin 返回 0；失败返回 -1 */
+static int64_t WCRFindARM64Slice(FILE *f, uint32_t *magicOut) {
+    uint8_t head[8];
+    if (!WCRReadAt(f, 0, head, 8)) return -1;                  /* 0x147cd28 */
+    uint32_t m = 0;
+    memcpy(&m, head, 4);
+    if (m == 0xfeedfacf /* MH_MAGIC_64 */) {                    /* 0x147cd58 */
+        if (magicOut) *magicOut = m;                            /* 0x147cd78 */
+        return 0;                                               /* 0x147cd80 */
+    }
+
+    uint32_t nfat = WCRBigEndian32(head + 4);                   /* 0x147cdd8 */
+    if (nfat == 0 || nfat > 0x10) return -1;                    /* 0x147cde4 / 0x147cdf0 */
+    BOOL isFat64 = (m == 0xcafebabf);                           /* 0x147ce14 */
+    size_t archSize = isFat64 ? 0x20 : 0x14;                    /* 0x147ce24~0x147ce38 */
+    uint64_t off = 8;                                           /* 0x147ce40 */
+
+    for (uint32_t i = 0; i < nfat; i++) {                       /* 0x147ce4c */
+        if (archSize > 0x20) return -1;                         /* 0x147ce64 */
+        uint8_t arch[0x20];
+        if (!WCRReadAt(f, off, arch, archSize)) return -1;       /* 0x147ce80 */
+
+        uint32_t cputype = WCRBigEndian32(arch);                /* 0x147ce9c */
+        uint64_t sliceOff;
+        if (isFat64) {                                          /* 0x147cea4 */
+            uint64_t lo = WCRBigEndian32(arch + 0x8);
+            uint64_t hi = WCRBigEndian32(arch + 0xc);
+            sliceOff = (hi << 32) | lo;                         /* 0x147cedc */
+        } else {                                                /* 0x147ceec */
+            sliceOff = WCRBigEndian32(arch + 0x8);
+        }
+
+        if ((cputype & 0x01000000) != 0 &&                      /* CPU_ARCH_ABI64  0x147cf0c */
+            (cputype & 0xfeffffff) == 0xc) {                    /* CPU_TYPE_ARM64  0x147cf1c */
+            uint32_t sliceMagic = 0;
+            if (!WCRReadAt(f, sliceOff, &sliceMagic, 4)) return -1;   /* 0x147cf3c */
+            if (sliceMagic == 0xfeedfacf) {                     /* 0x147cf54 */
+                if (magicOut) *magicOut = sliceMagic;           /* 0x147cf74 */
+                return (int64_t)sliceOff;                       /* 0x147cf7c */
+            }
+        }
+        off += archSize;                                        /* 0x147cf8c~0x147cf98 */
+    }
+    return -1;                                                  /* 0x147cfb0 */
+}
+
+/* 0x147f6a4 —— 该二进制的 dylib 依赖里是否含 "WCRefine"（@0x202a8b8） */
+static BOOL WCRMachOLinksWCRefine(NSString *path) {
+    if (![path isKindOfClass:[NSString class]]) return NO;
+    if (path.length == 0) return NO;                            /* 0x147f6ec */
+    FILE *f = fopen(path.fileSystemRepresentation, "rb");       /* 0x147f724 / 0x147f73c */
+    if (!f) return NO;                                          /* 0x147f748 */
+
+    BOOL found = NO;
+    uint32_t magic = 0;
+    int64_t base = WCRFindARM64Slice(f, &magic);                /* 0x147f778 */
+    if (base == -1) { fclose(f); return NO; }                   /* 0x147f784 */
+    if (magic != 0xfeedfacf) { fclose(f); return NO; }          /* 0x147f79c */
+
+    uint8_t hdr[0x20];
+    if (!WCRReadAt(f, (uint64_t)base, hdr, 0x20)) { fclose(f); return NO; }  /* 0x147f7dc */
+
+    uint32_t ncmds = 0, sizeofcmds = 0;
+    memcpy(&ncmds,      hdr + 0x10, 4);                         /* sp+0x60 */
+    memcpy(&sizeofcmds, hdr + 0x14, 4);                         /* sp+0x64 */
+    if (ncmds == 0 || ncmds > 0x200) { fclose(f); return NO; }              /* 0x147f81c */
+    if (sizeofcmds == 0 || sizeofcmds > 0x1000000) { fclose(f); return NO; } /* 0x147f838 */
+
+    uint64_t off = (uint64_t)base + 0x20;                       /* 0x147f868~0x147f86c */
+    for (uint32_t i = 0; i < ncmds && !found; i++) {            /* 0x147f880 */
+        uint32_t pair[2] = {0, 0};
+        if (!WCRReadAt(f, off, pair, 8)) break;                 /* 0x147f8cc */
+        uint32_t cmd = pair[0], cmdsize = pair[1];
+        if (cmdsize < 8 || cmdsize > sizeofcmds) break;         /* 0x147f8f4 / 0x147f904 */
+
+        if (cmd == 0x0c        ||    /* LC_LOAD_DYLIB         0x147f918 */
+            cmd == 0x80000018  ||    /* LC_LOAD_WEAK_DYLIB    0x147f92c */
+            cmd == 0x8000001f  ||    /* LC_REEXPORT_DYLIB     0x147f944 */
+            cmd == 0x80000023) {     /* LC_LOAD_UPWARD_DYLIB  0x147f95c */
+            uint32_t nameoff = 0;
+            if (cmdsize >= 0xc &&                               /* 0x147f970 */
+                WCRReadAt(f, off + 8, &nameoff, 4) &&           /* 0x147f990 */
+                nameoff >= 8 && nameoff < cmdsize) {            /* 0x147f9a0 / 0x147f9b4 */
+                size_t len = cmdsize - nameoff;                 /* 0x147f9c8 */
+                if (len > 0x200) len = 0x200;                   /* 0x147f9d4 */
+                char name[0x201];
+                memset(name, 0, sizeof(name));                  /* 0x147f9f8 (bzero) */
+                if (WCRReadAt(f, off + nameoff, name, len) &&   /* 0x147fa14 */
+                    WCRStrNStr(name, kWCRInjectToken.UTF8String, len)) {  /* 0x147fa30 */
+                    found = YES;                                /* 0x147fa40 */
+                }
+            }
+        }
+        off += cmdsize;                                         /* 0x147fa54~0x147fa64 */
+    }
+    fclose(f);                                                  /* 0x147fa80 */
+    return found;
+}
+
+/* 0x148056c —— 找"首选宿主"二进制：
+ *   名字 ProtobufLite3 → ProtobufLite，目录 Frameworks → Contents/Frameworks，
+ *   可执行名取 Info.plist["CFBundleExecutable"]，取不到就用 name 本身。 */
+static NSString *WCRPreferredHostBinaryPath(void) {
+    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];   /* 0x1480598 / 0x14805b8 */
+    if (bundlePath.length == 0) return nil;                     /* 0x1480600 */
+    NSFileManager *fm = [NSFileManager defaultManager];          /* 0x1480624 */
+
+    NSString *fallback = nil;                                    /* sp+0x220 */
+    NSArray *names = @[ kWCRProtobufLite3, kWCRProtobufLite ];   /* 0x1480648 / 0x1480654 */
+    NSArray *dirs  = @[ kWCRFrameworksDir, kWCRContentsFrameworksDir ]; /* 0x14806a8 / 0x14806b4 */
+
+    for (NSString *name in names) {
+        for (NSString *dir in dirs) {
+            NSString *fw =
+                [[bundlePath stringByAppendingPathComponent:dir] /* 0x1480868 */
+                    stringByAppendingPathComponent:
+                        [name stringByAppendingPathExtension:kWCRFrameworkExt]]; /* 0x148088c */
+
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                [fw stringByAppendingPathComponent:kWCRInfoPlistName]];     /* 0x1480924 / 0x1480944 */
+            NSString *exe = nil;
+            if ([info isKindOfClass:[NSDictionary class]]) {                 /* 0x14809e0 */
+                id v = info[kWCRBundleExecutableKey];                        /* 0x1480a00 */
+                if ([v isKindOfClass:[NSString class]] &&                    /* 0x1480a60 */
+                    [(NSString *)v length] > 0) {                            /* 0x1480abc */
+                    exe = (NSString *)v;
+                }
+            }
+
+            NSString *bin = [fw stringByAppendingPathComponent:(exe ?: name)]; /* 0x1480ba4 */
+            if ([fm isReadableFileAtPath:bin]) {                             /* 0x1480bcc */
+                if (WCRMachOLinksWCRefine(bin)) return bin;                  /* 0x1480be8 */
+                if (!fallback) fallback = bin;                               /* 0x1480c28 */
+            }
+
+            /* 变体二：<bundlePath>/<dir>/<name>（不带 .framework） */
+            NSString *bin2 = [[bundlePath stringByAppendingPathComponent:dir] /* 0x1480c4c */
+                                stringByAppendingPathComponent:name];        /* 0x1480c70 */
+            if ([fm isReadableFileAtPath:bin2]) {                            /* 0x1480cac */
+                if (WCRMachOLinksWCRefine(bin2)) return bin2;
+                if (!fallback) fallback = bin2;
+            }
+        }
+    }
+    return fallback;
+}
+
+/* 0x14804f8 —— memo：bss 0x253a6f0（已算过） / 0x253a6f1（结果） */
+static BOOL WCRPreferredHostLinked(void) {
+    static BOOL sComputed = NO;                                  /* bss 0x253a6f0 */
+    static BOOL sLinked   = NO;                                  /* bss 0x253a6f1 */
+    if (!sComputed) {                                            /* 0x148050c */
+        sComputed = YES;                                         /* 0x148051c */
+        NSString *p = WCRPreferredHostBinaryPath();              /* 0x1480520 */
+        BOOL r = WCRMachOLinksWCRefine(p);                       /* 0x1480530 */
+        sLinked = r;                                             /* 0x1480540 */
+    }
+    return sLinked & 1;                                          /* 0x1480558~0x148055c */
 }
 
 #pragma mark - 云控（0x148236c）
@@ -670,74 +918,69 @@ static NSURL *WCRHook_ContainerURL(id self, SEL _cmd, NSString *groupIdentifier)
 
 /* ── 0x8f55cc : -[CKEntitlements initWithEntitlementsDict:] ── */
 static id WCRHook_CKEntitlementsInit(id self, SEL _cmd, NSDictionary *dict) {
-    if (!WCRFixActive()) goto passthrough;                        /* 0x8f5610 */
-    if (![dict isKindOfClass:[NSDictionary class]]) goto passthrough;
-
-    NSMutableDictionary *m = [dict mutableCopy];                  /* 0x8f56d8 */
-    /* 自签包没有这些 iCloud entitlement，留着会让 CloudKit 走错误分支 */
-    [m removeObjectForKey:@"com.apple.developer.icloud-container-environment"]; /* 0x8f5710 */
-    [m removeObjectForKey:@"com.apple.developer.icloud-services"];              /* 0x8f5734 */
-    dict = [m copy];                                              /* 0x8f5748 */
-
-passthrough:
-    if (gOrigCKEntitlementsInit) return gOrigCKEntitlementsInit(self, _cmd, dict);
+    /* 注意：这里原来写成 goto passthrough;，ARC 下 goto 不能跨过 __strong 变量的
+     * 初始化（clang: "jump bypasses initialization of __strong variable"），
+     * 全部改成早返回语义，二进制里的控制流完全等价。 */
+    NSDictionary *patched = dict;
+    if (WCRFixActive() &&                                         /* 0x8f5610 */
+        [dict isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *m = [dict mutableCopy];              /* 0x8f56d8 */
+        /* 自签包没有这些 iCloud entitlement，留着会让 CloudKit 走错误分支 */
+        [m removeObjectForKey:@"com.apple.developer.icloud-container-environment"]; /* 0x8f5710 */
+        [m removeObjectForKey:@"com.apple.developer.icloud-services"];              /* 0x8f5734 */
+        patched = [m copy];                                       /* 0x8f5748 */
+    }
+    if (gOrigCKEntitlementsInit) return gOrigCKEntitlementsInit(self, _cmd, patched);
     return nil;
 }
 
 /* ── 0x8f5834 : -[CKContainer _initWithContainerIdentifier:] ── */
 static id WCRHook_CKInitWithID(id self, SEL _cmd, NSString *containerID) {
-    if (!WCRFixActive()) goto passthrough;                        /* 0x8f5878 */
-    if (![containerID isKindOfClass:[NSString class]]) goto passthrough;
-    /* WCR 走 0x8f6760：把 CloudKit 容器目录也挂到重映射后的 App Group 容器下 */
-    {
+    if (WCRFixActive() &&                                         /* 0x8f5878 */
+        [containerID isKindOfClass:[NSString class]]) {
+        /* WCR 走 0x8f6760：把 CloudKit 容器目录也挂到重映射后的 App Group 容器下 */
         NSURL *u = WCRRemappedContainerURL();
         if (u) {
             NSString *dir = [u URLByAppendingPathComponent:containerID].path;
             WCREnsureDirectory(dir);
         }
     }
-passthrough:
     if (gOrigCKInitWithID) return gOrigCKInitWithID(self, _cmd, containerID);
     return nil;
 }
 
 /* ── 0x8f5af8 : -[CKContainer _setupWithContainerID:options:] ── */
 static id WCRHook_CKSetupWithID(id self, SEL _cmd, NSString *containerID, id options) {
-    if (!WCRFixActive()) goto passthrough;                        /* 0x8f5b… */
-    if (![containerID isKindOfClass:[NSString class]]) goto passthrough;
-    {
+    if (WCRFixActive() &&                                         /* 0x8f5b48 */
+        [containerID isKindOfClass:[NSString class]]) {
         NSURL *u = WCRRemappedContainerURL();
         if (u) {
             NSString *dir = [u URLByAppendingPathComponent:containerID].path;
             WCREnsureDirectory(dir);
         }
     }
-passthrough:
     if (gOrigCKSetupWithID) return gOrigCKSetupWithID(self, _cmd, containerID, options);
     return nil;
 }
 
 /* ── 0x8f5df4 : -[NSUserDefaults _initWithSuiteName:container:] ── */
 static id WCRHook_UserDefaultsSuiteInit(id self, SEL _cmd, NSString *suiteName, id container) {
-    if (!WCRFixActive()) goto passthrough;                                   /* 0x8f5e50 */
-    if (![suiteName isKindOfClass:[NSString class]]) goto passthrough;        /* 0x8f5f08 */
-    if (![suiteName hasPrefix:kWCRGroupPrefix]) goto passthrough;             /* 0x8f5f3c */
-    if (!WCRShouldRemapGroup(suiteName)) goto passthrough;                    /* 0x8f5f98 */
-    {
-        NSURL *u = WCRRemappedContainerURL();                                 /* 0x8f5fe4 */
-        if (!u) goto passthrough;                                              /* 0x8f6004 */
-
-        NSString *gid = WCRCurrentGroupID();                                   /* 0x8f60d0 */
-        if (gid.length == 0) goto passthrough;
-
-        NSURL *suiteURL = [u URLByAppendingPathComponent:gid];                 /* 0x8f618c */
-        WCREnsureDirectory(suiteURL.path);                                     /* 0x8f61f0 (0x8f6af4) */
-        WCRProbe(@"suite", suiteName, gid, suiteURL.path);                     /* 0x8f625c */
-        if (gOrigUserDefaultsSuiteInit) {
-            return gOrigUserDefaultsSuiteInit(self, _cmd, gid, suiteURL);      /* 0x8f6280 */
+    BOOL remap = WCRFixActive() &&                                            /* 0x8f5e50 */
+                 [suiteName isKindOfClass:[NSString class]] &&                 /* 0x8f5f08 */
+                 [suiteName hasPrefix:kWCRGroupPrefix] &&                      /* 0x8f5f3c */
+                 WCRShouldRemapGroup(suiteName);                               /* 0x8f5f98 */
+    if (remap) {
+        NSURL *u = WCRRemappedContainerURL();                                  /* 0x8f5fe4 */
+        NSString *gid = u ? WCRCurrentGroupID() : nil;                          /* 0x8f60d0 */
+        if (u && gid.length > 0) {                                              /* 0x8f6004 */
+            NSURL *suiteURL = [u URLByAppendingPathComponent:gid];              /* 0x8f618c */
+            WCREnsureDirectory(suiteURL.path);                                  /* 0x8f61f0 (0x8f6af4) */
+            WCRProbe(@"suite", suiteName, gid, suiteURL.path);                  /* 0x8f625c */
+            if (gOrigUserDefaultsSuiteInit) {
+                return gOrigUserDefaultsSuiteInit(self, _cmd, gid, suiteURL);   /* 0x8f6280 */
+            }
         }
     }
-passthrough:
     if (gOrigUserDefaultsSuiteInit) {
         return gOrigUserDefaultsSuiteInit(self, _cmd, suiteName, container);
     }
@@ -898,7 +1141,15 @@ static NSString *WCRStatusText(void) {
     [parts addObject:[NSString stringWithFormat:@"当前应用组：%@",
                       cur.length ? cur : @"无应用组"]];
     if (!WCRPreferredHostLinked()) {
-        [parts addObject:@"未检测到 ProtobufLite3 / ProtobufLite，请注入后再试。"];
+        /* 与 0x14804f8 的判定口径一致：没把 WCRefine 注进宿主二进制 */
+        NSString *host = WCRPreferredHostBinaryPath();
+        if (host.length) {
+            [parts addObject:[NSString stringWithFormat:
+                @"宿主 %@ 未注入 WCRefine，请用 Icsign 注入后再试。",
+                host.lastPathComponent]];
+        } else {
+            [parts addObject:@"未找到 ProtobufLite3 / ProtobufLite，请用 Icsign 注入后再试。"];
+        }
     }
     [parts addObject:@"多开请选不同应用组，防止串号。"];
     return [parts componentsJoinedByString:@"\n"];
@@ -944,10 +1195,14 @@ static void WCRPresentGroupPickerOn(UIViewController *presenter) {
 
 - (void)reloadTableData {
     %orig;
+    /* Logos 只会生成 @class NewSettingViewController;（前向声明），
+     * 直接 [self respondsToSelector:] 会报
+     * "receiver type ... for instance message is a forward declaration"。
+     * 先经 (id) 中转再 cast，绕开静态类型检查，运行期完全等价。 */
+    UIViewController *vc = (UIViewController *)(id)self;
     if (![(id)self isKindOfClass:[UIViewController class]]) return;
-    if (![self respondsToSelector:@selector(navigationItem)]) return;
+    if (![(id)self respondsToSelector:@selector(navigationItem)]) return;
 
-    UIViewController *vc = (UIViewController *)self;
     if (objc_getAssociatedObject(vc, @selector(reloadTableData))) return;
     objc_setAssociatedObject(vc, @selector(reloadTableData), @YES,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -955,13 +1210,13 @@ static void WCRPresentGroupPickerOn(UIViewController *presenter) {
     vc.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithTitle:@"自签修复"
                                          style:UIBarButtonItemStylePlain
-                                        target:self
+                                        target:vc
                                         action:@selector(wcr_openSideloadFix)];
 }
 
 %new
 - (void)wcr_openSideloadFix {
-    UIViewController *vc = (UIViewController *)self;
+    UIViewController *vc = (UIViewController *)(id)self;
     __weak typeof(vc) weakVC = vc;
 
     UIAlertController *ac = [UIAlertController
