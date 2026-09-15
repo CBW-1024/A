@@ -2256,7 +2256,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
         return;
     }
 
-    WCUIAlertView *alert = [[%c(WCUIAlertView) alloc] initWithTitle:@"自定义账号" message:@"请输入账号如：520\n输入空格隐藏账号\n留空还原"];
+    WCUIAlertView *alert = [[%c(WCUIAlertView) alloc] initWithTitle:@"账号修改" message:@"请输入账号如：520\n输入空格隐藏账号\n留空还原"];
     if (!alert) {
         [sender setOn:NO animated:YES];
         return;
@@ -2439,7 +2439,7 @@ static BOOL DDHideChatName(void) {
     UIButton *clearBtn = [self dd_actionButton:@"清理" action:@selector(clearChatCacheTapped:) x:0];
     UIView *clearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
     [clearRight addSubview:clearBtn];
-    [chatSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清空修改内容" rightView:clearRight]];
+    [chatSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清空修改记录" rightView:clearRight]];
     [_tableViewManager addSection:chatSection];
 
     WCTableViewSectionManager *profileSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"资料小丑"];
@@ -2581,7 +2581,7 @@ static BOOL DDHideChatName(void) {
     DDJokerClearAllMessageCache();
     JokerInvalidateAllLayout();
     [self buildTable];
-    [self dd_showDoneToast:@"已清理"];
+    [self dd_showDoneToast:@"记录已清理"];
 }
 
 - (void)dd_showDoneToast:(NSString *)text {
