@@ -83,7 +83,7 @@
 
 @interface AddContactToChatRoomViewController : UIViewController
 @property (retain, nonatomic) CBaseContact *m_contact;
-- (void)ddWxidSwitchChanged:(UISwitch *)sender;        // 备注好友微信号
+- (void)ddWxidSwitchChanged:(UISwitch *)sender;        // 备注用户微信号
 - (void)ddAvatarSwitchChanged:(UISwitch *)sender;      // 备注用户头像
 - (void)dd_injectProfileSection;                       // 聊天详情页插入头像 + 微信号开关
 @end
@@ -1908,14 +1908,8 @@ static NSString *DDCustomWxid(void) {
 %hook CBaseContact
 
 // CBaseContact.h:12 —— m_nsAliasName 即「微信号」。
-// 自己：返回自定义微信号。
 // 好友：查备注表，命中返回备注值（空串＝隐藏），未命中回原值。
 - (id)m_nsAliasName {
-    if ([self isSelf]) {
-        NSString *custom = DDCustomWxid();
-        if (custom) return custom;
-        return %orig;
-    }
     NSString *alias = DDFriendWxidForUser([self m_nsUsrName]);
     if (alias) return alias;
     return %orig;
@@ -2042,7 +2036,7 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 
 %end
 
-#pragma mark - 聊天详情页「自定义头像 / 自定义微信号」入口
+#pragma mark - 聊天详情页「自定义头像 / 备注用户微信号」入口
 
 static NSString * const kDDProfileChangedNotification = @"DDProfileContentChanged";
 
@@ -2099,7 +2093,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
         BOOL hasCustom = DDFriendWxidForUser(usrName) != nil;
         id cell = [%c(WCTableViewCellManager) switchCellForSel:@selector(ddWxidSwitchChanged:)
                                                        target:vc
-                                                        title:@"自定义微信号"
+                                                        title:@"备注用户微信号"
                                                            on:hasCustom];
         if (cell) { [section addCell:cell]; if (!firstCell) firstCell = cell; }
     }
@@ -2205,7 +2199,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
         return;
     }
 
-    WCUIAlertView *alert = [[%c(WCUIAlertView) alloc] initWithTitle:@"自定义微信号" message:nil];
+    WCUIAlertView *alert = [[%c(WCUIAlertView) alloc] initWithTitle:@"备注用户微信号" message:nil];
     if (!alert) {
         [sender setOn:NO animated:YES];
         return;
@@ -2456,7 +2450,7 @@ static BOOL DDHideChatName(void) {
         [profileSection addCell:wxidSubCell];
     }
 
-    [profileSection addCell:[cellCls switchCellForSel:@selector(friendWxidSwitch:) target:self title:@"备注好友微信号" on:cfg.friendWxidEnabled]];
+    [profileSection addCell:[cellCls switchCellForSel:@selector(friendWxidSwitch:) target:self title:@"备注用户微信号" on:cfg.friendWxidEnabled]];
 
     [profileSection addCell:[cellCls switchCellForSel:@selector(hideChatNameSwitch:) target:self title:@"隐藏顶栏名字" on:cfg.hideChatName]];
 
