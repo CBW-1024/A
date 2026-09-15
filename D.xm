@@ -2443,7 +2443,7 @@ static BOOL DDHideChatName(void) {
     [_tableViewManager addSection:chatSection];
 
     WCTableViewSectionManager *profileSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"资料小丑"];
-    profileSection.footerTitle = @"头像与好友账号开启后在「聊天详情」页逐人设置";
+    profileSection.footerTitle = @"开启设置头像与好友账号后在「聊天详情」页逐人自定义";
     [profileSection addCell:[cellCls switchCellForSel:@selector(balanceSwitchChanged:) target:self title:@"零钱余额修改" on:cfg.balanceEnabled]];
     if (cfg.balanceEnabled) {
         self.balanceField = [[UITextField alloc] init];
