@@ -2218,8 +2218,14 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
     }];
     [alert addBtnTitle:@"确定" handler:^{
         NSString *text = [blockAlert getTextFieldText] ?: @"";
-        text = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        DDFriendWxidSetForUser(text, usrName);
+        if (text.length == 0) {
+            // 没有输入：关闭该好友备注并回弹开关
+            DDFriendWxidRemoveForUser(usrName);
+            [weakSw setOn:NO animated:YES];
+        } else {
+            // 空格 / 文字：原样保存（空格＝空白微信号即隐藏）
+            DDFriendWxidSetForUser(text, usrName);
+        }
         [[NSNotificationCenter defaultCenter] postNotificationName:kDDFriendWxidChangedNotification object:nil];
         blockAlert = nil;
     }];
@@ -2556,8 +2562,8 @@ static BOOL DDHideChatName(void) {
 }
 
 - (void)wxidConfirm:(id)sender {
-    NSString *text = [self.wxidField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    [DDGlobalConfig shared].wxidValue = text;
+    // 原样保存：空＝不覆盖，空格＝空白微信号（隐藏），其他＝自定义值
+    [DDGlobalConfig shared].wxidValue = self.wxidField.text ?: @"";
     [self.wxidField resignFirstResponder];
     [self buildTable];
 }
