@@ -952,6 +952,19 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
     DDSetLastTransferOverride(DDJokerCachedAmount(msg));
     %orig;
 }
+// data 可能在 viewDidLoad 之后才赋值（setupWithData:/refreshViewWithData:），
+// 这里兜底刷新一次 override，保证 MMUILabel 渲染时已是目标金额。
+- (void)viewWillAppear:(BOOL)animated {
+    WCPayControlData *data = [self data];
+    DDSetLastTransferOverride(DDJokerCachedAmount(data.m_oSelectedMessageWrap));
+    %orig;
+}
+// 状态轮询 / 刷新会重新走 refreshViewWithData:，也同步刷新 override。
+- (void)refreshViewWithData:(id)a0 {
+    WCPayControlData *data = [self data];
+    DDSetLastTransferOverride(DDJokerCachedAmount(data.m_oSelectedMessageWrap));
+    %orig;
+}
 - (void)dealloc {
     %orig;
     DDSetLastTransferOverride(nil);
