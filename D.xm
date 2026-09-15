@@ -229,6 +229,8 @@
 
 @interface MMMenuItem : UIMenuItem
 - (instancetype)initWithTitle:(NSString *)title icon:(UIImage *)icon target:(id)target action:(SEL)action;
+// MMMenuItem.h:29 —— 直接吃 svg 资源名，由微信内部渲染，无需自行转 UIImage
+- (instancetype)initWithTitle:(NSString *)title svgName:(NSString *)svgName target:(id)target action:(SEL)action;
 @end
 
 @interface WCDeviceStepObject : NSObject
@@ -854,13 +856,20 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
     }
 }
 
+// 菜单项：直接用微信内置 svg 图标 icons_filled_sticker（MMMenuItem.h:29 原生支持 svg 资源名）。
+static MMMenuItem *DDJokerMenuItem(NSString *title, id target, SEL action) {
+    return [(MMMenuItem *)[%c(MMMenuItem) alloc] initWithTitle:title
+                                                      svgName:@"icons_filled_sticker"
+                                                       target:target
+                                                       action:action];
+}
+
 static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *original) {
 
     if (!JokerEnabledForCell(cell)) return original;
     if (!JokerIsSupportedCell(cell)) return original;
 
-    UIImage *icon = [[UIImage systemImageNamed:@"face.smiling.fill"] imageWithTintColor:[UIColor whiteColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
-    MMMenuItem *newItem = [(MMMenuItem *)[%c(MMMenuItem) alloc] initWithTitle:@"小丑" icon:icon target:cell action:@selector(joker_handleMenuItem:)];
+    MMMenuItem *newItem = DDJokerMenuItem(@"小丑", cell, @selector(joker_handleMenuItem:));
     NSMutableArray *newItems = [NSMutableArray arrayWithArray:original];
     [newItems insertObject:newItem atIndex:0];
     return newItems;
@@ -1091,8 +1100,7 @@ static void DDImageApplyReplacementToCell(id cell) {
     if (!cfg.imageEnabled) return original;
     CMessageWrap *msg = self.viewModel.messageWrap;
     if (![msg IsImgMsg]) return original;
-    UIImage *icon = [[UIImage systemImageNamed:@"face.smiling.fill"] imageWithTintColor:[UIColor whiteColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
-    MMMenuItem *newItem = [(MMMenuItem *)[%c(MMMenuItem) alloc] initWithTitle:@"小丑" icon:icon target:self action:@selector(dk_changeChatImage)];
+    MMMenuItem *newItem = DDJokerMenuItem(@"小丑", self, @selector(dk_changeChatImage));
     NSMutableArray *newItems = [NSMutableArray arrayWithArray:original];
     [newItems insertObject:newItem atIndex:0];
     return newItems;
