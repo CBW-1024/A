@@ -2940,4 +2940,3 @@ static BOOL DDHideChatName(void) {
     }
 }
 
-hc
