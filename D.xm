@@ -515,7 +515,6 @@ static void DDJokerSetCachedAmount(CMessageWrap *msg, NSString *amount) {
 
 static NSString *gDDLastTransferOverride = nil;
 static void DDSetLastTransferOverride(NSString *value) {
-    [gDDLastTransferOverride release];
     gDDLastTransferOverride = value.length ? [value copy] : nil;
 }
 
@@ -935,7 +934,7 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 %hook WCPayBaseMessageCellView
 - (void)onTouchUpInside {
     if ([self isKindOfClass:%c(WCPayTransferMessageCellView)]) {
-        WCPayTransferMessageViewModel *vm = [(WCPayTransferMessageCellView *)self viewModel];
+        id vm = [(WCPayTransferMessageCellView *)self viewModel];
         CMessageWrap *msg = [vm messageWrap];
         DDSetLastTransferOverride(DDJokerCachedAmount(msg));
     }
