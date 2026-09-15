@@ -80,8 +80,6 @@
 static NSString * const kWCRMarkerFileName = @"com.qimiao.WCRefine.sideload-share-fix-group";
 /* @0x205b1b9 —— 探针日志（WCR 内 0 调用，保留） */
 static NSString * const kWCRProbeLogName   = @"com.qimiao.WCRefine.sideload-share-fix.log";
-/* @0x205b3cd —— 云控 feature id */
-static NSString * const kWCRCloudFeatureID = @"sideload_share_fix";
 
 static NSString * const kWCREntitlementAppGroups = @"com.apple.security.application-groups"; // @0x22bf480
 static NSString * const kWCRExtShareService       = @"com.apple.share-services";              // @0x1482130
@@ -142,7 +140,6 @@ static NSString *WCRRemapGroupID(NSString *groupID);
 static NSArray<NSString *> *WCRCachedAvailableGroups(void);
 static void WCREnsureDirectory(NSString *path);
 static BOOL WCRPreferredHostLinked(void);
-static BOOL WCRCloudAllowed(void);
 static BOOL WCRShouldInstall(void);
 static NSString *WCRStatusText(void);
 static void WCRApplySelectedGroupID(NSString *groupID);
@@ -683,15 +680,6 @@ static BOOL WCRPreferredHostLinked(void) {
     return sLinked & 1;                                          /* 0x1480558~0x148055c */
 }
 
-#pragma mark - 云控（0x148236c）
-
-static BOOL WCRCloudAllowed(void) {                      /* 0x148236c */
-    /* WCR 内部走自己的云控；独立插件版本默认放行，
-     * 如需接自己的开关，在这里按 feature id `sideload_share_fix` 判定即可。 */
-    (void)kWCRCloudFeatureID;
-    return YES;
-}
-
 #pragma mark - 组解析
 
 /* 0x1481ec0 —— 只在**主 App** 进程里被调用 */
@@ -1091,7 +1079,7 @@ static BOOL WCRShouldInstall(void) {
     if (WCRIsNotificationServiceProcess()) return YES;        /* 0x148230c 分支 */
     if (!WCRFixEnabledFromConfig()) return NO;
     if (!WCRPreferredHostLinked()) return NO;                 /* 0x14804f8 */
-    return WCRCloudAllowed();                                 /* 0x148236c */
+    return YES;   /* 纯本地运行，不接 WCR 私有云控（原函数 0x148236c） */
 }
 
 /* 0x8f3508 —— 完整安装流程 */
