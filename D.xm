@@ -2492,7 +2492,7 @@ static BOOL DDHideChatName(void) {
         NSString *currentContacts = [cfg hasContactsValue] ? cfg.contactsValue : @"";
         UIView *rightView = [self inputRowWithField:self.contactsField
                                              action:@selector(contactsConfirm:)
-                                        placeholder:@"例如：5200"
+                                        placeholder:@"例如：520"
                                                text:currentContacts];
         WCTableViewCellManager *contactsSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳数量自定义" rightView:rightView];
         contactsSubCell.userInfo = @"SubCell";
@@ -2505,7 +2505,7 @@ static BOOL DDHideChatName(void) {
         NSString *currentWxid = cfg.wxidValue.length ? cfg.wxidValue : @"";
         UIView *rightView = [self inputRowWithField:self.wxidField
                                          action:@selector(wxidConfirm:)
-                                    placeholder:@"设置微信号"
+                                    placeholder:@"例如：520"
                                            text:currentWxid];
         self.wxidField.keyboardType = UIKeyboardTypeASCIICapable;
         WCTableViewCellManager *wxidSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳设置微信号" rightView:rightView];
