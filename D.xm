@@ -1432,8 +1432,8 @@ typedef NS_ENUM(NSInteger, DDBalancePageKind) {
 };
 
 // 页面判定：沿响应链上溯，命中的第一条规则即返回。
-//   钱包页单元格：祖先 accessibilityIdentifier 为 balance_cell -> 余额，lqt_cell -> 零钱通
-//   详情/服务页（VC description）：balanceEntryUIPage / WCPayMainViewControllerV2 -> 余额，lqtDetailUIPage -> 零钱通
+//   钱包页单元格：祖先 accessibilityIdentifier 为 balance_cell → 余额，lqt_cell → 零钱通
+//   详情/服务页（VC description）：balanceEntryUIPage / WCPayMainViewControllerV2 → 余额，lqtDetailUIPage → 零钱通
 static DDBalancePageKind DDBalancePageKindOf(id sn) {
     @try {
         if (![sn isKindOfClass:[UIView class]]) return DDBalancePageNone;
@@ -1531,7 +1531,7 @@ static BOOL DDBalanceWantFenFor(id v, DDBalancePageKind kind, unsigned long long
 // 钱包页金额行右侧箭头 + 间距占用的宽度，沿用 28pt 右缘边距常量（不压箭头）。
 static const CGFloat kDDWalletArrowGap = 28.0;
 
-// frame 是否已够接近（避免重复赋值触发 Kinda 反复重排 → 闪烁）
+// frame 是否已足够接近（避免重复赋值触发反复重排 → 闪烁）
 static BOOL DDBalanceFrameNear(CGRect a, CGRect b) {
     return (fabs(a.origin.x - b.origin.x) < 0.5 && fabs(a.origin.y - b.origin.y) < 0.5 &&
             fabs(a.size.width - b.size.width) < 0.5 && fabs(a.size.height - b.size.height) < 0.5);
@@ -1637,12 +1637,12 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
     } @catch (NSException *e) {}
     %orig(original);
 }
-// 顶格修复三步，缺一不可：
+// 顶格三步，缺一不可：
 //   1) [sn setFrame:] 原点不变、尺寸换成 scrollNumberSize —— 滚轮按新值的正确尺寸重设
-//   2) [self updateScrollNumber]                         —— 容器按新滚轮尺寸重排内部
-//   3) [self setFrame:] x = superview 宽度 - 28 - 宽度    —— 右缘钉在箭头左侧，数字往左长
-// 前提：scrollNumberSize 按改后的值算，所以下方 %hook ScrollNumber 必须连 currentNumber
-//   读路径一起改；只改写入口的话宽度仍按旧值算，光改 frame 救不回来。
+//   2) [self updateScrollNumber] —— 容器按新滚轮尺寸重排内部
+//   3) [self setFrame:] x = superview 宽度 - 28 - 宽度 —— 右缘钉在箭头左侧，数字往左长
+// 前提：scrollNumberSize 按改后的值算，故 currentNumber 读路径须一并改写，
+//   否则宽度仍按旧值算，仅改 frame 无法对齐。
 - (void)layoutSubviews {
     %orig;
     @try {
@@ -1657,7 +1657,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
             ![self respondsToSelector:@selector(scrollNumberSize)]) return;
         UIView *sn = [self scrollNumber];
         if (![sn isKindOfClass:[UIView class]]) return;
-        // 几何加固（必须放在改动任何 frame 之前，否则"拦了但宽度已经改过"，等于没拦）：
+        // 几何加固：须在任何 frame 改动之前判定，父容器接近全宽的一律跳过：
         //   钱包页金额行位于 cell 内，父容器宽度有限；父容器接近全宽的必然是
         //   零钱/零钱通详情页那种居中的大数字，一旦右对齐就会被推到屏幕边上。
         UIView *sp = self.superview;
@@ -1684,11 +1684,11 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
 }
 %end
 
-// 读路径必须一起改：scrollNumberSize / widthOfNumber: 都读 currentNumber 推算宽度，
-//   只改写入口的话内部宽度仍按旧值算，容器与内容对不上 → 数字右溢盖箭头（顶格）。
+// 读路径须一起改：scrollNumberSize / widthOfNumber: 都读 currentNumber 推算宽度，
+//   否则内部宽度仍按旧值算，容器与内容对不上 → 数字右溢盖箭头（顶格）。
 %hook ScrollNumber
 // 写入口③：property setter 直赋。服务页（WCPayMainViewControllerV2）的金额由
-//   WCPayWalletGetAllFunctionCgi 回调异步写入，闪出真实金额的就是这条未拦截的路径。
+//   WCPayWalletGetAllFunctionCgi 回调异步写入，须一并拦截，否则会闪出真实金额。
 //   与 currentNumber getter 的改写自洽：写入假值 → 重排按假值算宽 → getter 返回同值。
 - (void)setCurrentNumber:(unsigned long long)original {
     unsigned long long v = original;
@@ -1788,7 +1788,7 @@ static NSString *DDFriendWxidForUser(NSString *usrName) {
     if (![DDGlobalConfig shared].friendWxidEnabled) return nil;
     if (usrName.length == 0) return nil;
     NSString *value = DDFriendWxidMap()[usrName];
-    return [value isKindOfClass:[NSString class]] ? value : nil;   // 存了空串也算，效果＝隐藏
+    return [value isKindOfClass:[NSString class]] ? value : nil;   // 存了空串也算，效果=隐藏
 }
 
 static void DDFriendWxidSetForUser(NSString *value, NSString *usrName) {
@@ -1999,12 +1999,12 @@ static NSString *DDCustomWxid(void) {
     return value;
 }
 
-#pragma mark - 数据源（微信「账号」统一拦截）
+#pragma mark - 数据源（微信"账号"统一拦截）
 
 %hook CBaseContact
 
-// CBaseContact.h:12 —— m_nsAliasName 即「账号」。
-// 用户：查自定义表，命中返回自定义值（空串＝隐藏），未命中回原值。
+// CBaseContact.h:12 —— m_nsAliasName 即"账号"。
+// 用户：查自定义表，命中返回自定义值（空串=隐藏），未命中回原值。
 - (id)m_nsAliasName {
     NSString *alias = DDFriendWxidForUser([self m_nsUsrName]);
     if (alias) return alias;
@@ -2014,7 +2014,7 @@ static NSString *DDCustomWxid(void) {
 %end
 
 %hook CSetting
-// CSetting.h:58/301 —— 微信「我」页面、设置等读取的自己的 m_nsAliasName 数据源。
+// CSetting.h:58/301 —— 微信"我"页面、设置等读取的自己的 m_nsAliasName 数据源。
 // CSetting 独立继承 NSObject，不继承 CBaseContact，需单独 hook。
 - (id)m_nsAliasName {
     NSString *custom = DDCustomWxid();
@@ -2132,7 +2132,7 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 
 %end
 
-#pragma mark - 聊天详情页「自定义头像 / 自定义账号」入口
+#pragma mark - 聊天详情页"自定义头像 / 自定义账号"入口
 
 static NSString * const kDDProfileChangedNotification = @"DDProfileContentChanged";
 
@@ -2279,7 +2279,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
     }
 }
 
-// 与「自定义头像」对称：开 → 微信原生输入弹窗；关 → 清掉该用户的自定义。
+// 与"自定义头像"对称：开 → 微信原生输入弹窗；关 → 清掉该用户的自定义。
 // 弹窗里留空直接确定 = 存空串，效果等同隐藏。
 %new
 - (void)ddWxidSwitchChanged:(UISwitch *)sender {
@@ -2319,7 +2319,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
             DDFriendWxidRemoveForUser(usrName);
             [weakSw setOn:NO animated:YES];
         } else {
-            // 空格 / 文字：原样保存（空格＝空白账号即隐藏）
+            // 空格 / 文字：原样保存（空格=空白账号即隐藏）
             DDFriendWxidSetForUser(text, usrName);
         }
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
@@ -2675,7 +2675,7 @@ static BOOL DDHideChatName(void) {
 }
 
 - (void)wxidConfirm:(id)sender {
-    // 原样保存：空＝不覆盖，空格＝空白账号（隐藏），其他＝自定义值
+    // 原样保存：空=不覆盖，空格=空白账号（隐藏），其他=自定义值
     [DDGlobalConfig shared].wxidValue = self.wxidField.text ?: @"";
     [self.wxidField resignFirstResponder];
     [self buildTable];
