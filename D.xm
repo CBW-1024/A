@@ -1728,7 +1728,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
 
 
 
-#pragma mark - 好友账号自定义（按用户名，聊天详情页逐人设置）
+#pragma mark - 用户账号自定义（按用户名，聊天详情页逐人设置）
 
 static NSString * const kDDFriendWxidChangedNotification = @"DDFriendWxidChanged";
 
@@ -1969,7 +1969,7 @@ static NSString *DDCustomWxid(void) {
 %hook CBaseContact
 
 // CBaseContact.h:12 —— m_nsAliasName 即「账号」。
-// 好友：查自定义表，命中返回自定义值（空串＝隐藏），未命中回原值。
+// 用户：查自定义表，命中返回自定义值（空串＝隐藏），未命中回原值。
 - (id)m_nsAliasName {
     NSString *alias = DDFriendWxidForUser([self m_nsUsrName]);
     if (alias) return alias;
@@ -2242,7 +2242,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
     }
 }
 
-// 与「自定义头像」对称：开 → 微信原生输入弹窗；关 → 清掉该好友的自定义。
+// 与「自定义头像」对称：开 → 微信原生输入弹窗；关 → 清掉该用户的自定义。
 // 弹窗里留空直接确定 = 存空串，效果等同隐藏。
 %new
 - (void)ddWxidSwitchChanged:(UISwitch *)sender {
@@ -2276,7 +2276,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
     [alert addBtnTitle:@"确定" handler:^{
         NSString *text = [blockAlert getTextFieldText] ?: @"";
         if (text.length == 0) {
-            // 没有输入：关闭该好友自定义并回弹开关
+            // 没有输入：关闭该用户自定义并回弹开关
             DDFriendWxidRemoveForUser(usrName);
             [weakSw setOn:NO animated:YES];
         } else {
@@ -2443,7 +2443,7 @@ static BOOL DDHideChatName(void) {
     [_tableViewManager addSection:chatSection];
 
     WCTableViewSectionManager *profileSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"资料小丑"];
-    profileSection.footerTitle = @"开启设置头像与好友账号后在「聊天详情」页逐人自定义";
+    profileSection.footerTitle = @"开启设置用户账号/头像后在「聊天详情」页逐人自定义";
     [profileSection addCell:[cellCls switchCellForSel:@selector(balanceSwitchChanged:) target:self title:@"零钱余额修改" on:cfg.balanceEnabled]];
     if (cfg.balanceEnabled) {
         self.balanceField = [[UITextField alloc] init];
@@ -2517,7 +2517,7 @@ static BOOL DDHideChatName(void) {
 
     [profileSection addCell:[cellCls switchCellForSel:@selector(hideChatNameSwitch:) target:self title:@"隐藏顶栏名字" on:cfg.hideChatName]];
 
-    [profileSection addCell:[cellCls switchCellForSel:@selector(avatarSwitchChanged:) target:self title:@"备注用户头像" on:cfg.avatarEnabled]];
+    [profileSection addCell:[cellCls switchCellForSel:@selector(avatarSwitchChanged:) target:self title:@"设置用户头像" on:cfg.avatarEnabled]];
     UIButton *avatarClearBtn = [self dd_actionButton:@"清理" action:@selector(clearAllAvatarTapped:) x:0];
     UIView *avatarClearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
     [avatarClearRight addSubview:avatarClearBtn];
