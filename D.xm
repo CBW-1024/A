@@ -411,7 +411,8 @@ static BOOL JokerEnabledForCell(CommonMessageCellView *cell) {
 }
 
 static NSString *JokerNormalizeAmount(NSString *amount) {
-    NSString *trimmed = [amount stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    NSString *trimmed = [amount stringByTrimmingCharactersInSet:ws];
     if (!trimmed.length) return nil;
     NSMutableString *filtered = [NSMutableString string];
     for (NSUInteger i = 0; i < trimmed.length; i++) {
@@ -464,7 +465,10 @@ static NSString *DDJokerAmountKey(CMessageWrap *msg) {
 
 static NSString *DDJokerCacheDir(void) {
     NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/DDJoker"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+            withIntermediateDirectories:YES
+            attributes:nil
+            error:nil];
     return dir;
 }
 static NSString *DDJokerCacheFile(NSString *name) {
@@ -479,7 +483,10 @@ static void DDJokerSaveCache(NSString *name, NSDictionary *d) {
 }
 static NSString *DDJokerImagesDir(void) {
     NSString *dir = [DDJokerCacheDir() stringByAppendingPathComponent:@"DDJokerImages"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+            withIntermediateDirectories:YES
+            attributes:nil
+            error:nil];
     return dir;
 }
 
@@ -657,10 +664,14 @@ static void JokerCollectViewControllers(UIViewController *root, NSMutableArray *
     if (root.presentedViewController) JokerCollectViewControllers(root.presentedViewController, out);
     for (UIViewController *c in root.childViewControllers) JokerCollectViewControllers(c, out);
     if ([root isKindOfClass:[UINavigationController class]]) {
-        for (UIViewController *c in ((UINavigationController *)root).viewControllers) JokerCollectViewControllers(c, out);
+        for (UIViewController *c in ((UINavigationController *)root).viewControllers) {
+            JokerCollectViewControllers(c, out);
+        }
     }
     if ([root isKindOfClass:[UITabBarController class]]) {
-        for (UIViewController *c in ((UITabBarController *)root).viewControllers) JokerCollectViewControllers(c, out);
+        for (UIViewController *c in ((UITabBarController *)root).viewControllers) {
+            JokerCollectViewControllers(c, out);
+        }
     }
 }
 
@@ -797,7 +808,8 @@ static void JokerReloadCellAfterReplace(id vc, CMessageWrap *msg, CommonMessageC
         return;
     }
 
-    CGPoint center = [cell convertPoint:CGPointMake(CGRectGetMidX(cell.bounds), CGRectGetMidY(cell.bounds)) toView:tv];
+    CGPoint mid = CGPointMake(CGRectGetMidX(cell.bounds), CGRectGetMidY(cell.bounds));
+    CGPoint center = [cell convertPoint:mid toView:tv];
     NSIndexPath *ip = [tv indexPathForRowAtPoint:center];
     if (ip) {
         [UIView performWithoutAnimation:^{
@@ -819,7 +831,9 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
 
     NSString *editorTitle = isTransfer ? @"转账修改" : @"文字修改";
     NSString *editorMessage = isTransfer ? @"请输入需要修改的金额\n留空还原" : @"请输入需要修改的文字\n留空还原";
-    WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:editorTitle message:editorMessage];
+    id alertObj = [%c(WCUIAlertView) alloc];
+    WCUIAlertView *alert = [(WCUIAlertView *)alertObj initWithTitle:editorTitle
+            message:editorMessage];
     if (!alert) return;
     [alert showTextFieldWithMaxLen:1000];
     [alert setTextFieldDefaultText:current];
@@ -830,7 +844,8 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
     [alert addBtnTitle:@"确定" handler:^{
         NSString *raw = blockAlert ? [blockAlert getTextFieldText] : nil;
         if (!raw.length) raw = inputField.text;
-        NSString *newText = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+        NSString *newText = [raw stringByTrimmingCharactersInSet:ws];
         if (newText.length) {
             if ([newText isEqualToString:current]) { blockAlert = nil; return; }
             if (isTransfer) {
@@ -910,7 +925,8 @@ static void JokerInvalidateAllLayout(void) {
     gJokerNeedsResetLayout = YES;
     JokerReloadAllMsgContent();
     JokerRefreshVisibleImageCells();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_time_t delay = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC));
+    dispatch_after(delay, dispatch_get_main_queue(), ^{
         gJokerNeedsResetLayout = NO;
     });
 }
@@ -1030,17 +1046,20 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 
 %hook MMUILabel
 - (void)setText:(NSString *)text {
-    if (gDDInTransferDetail && [DDGlobalConfig shared].transferEnabled && gDDTransferDetailAmount.length && [text hasPrefix:@"¥"]) {
+    if (gDDInTransferDetail && [DDGlobalConfig shared].transferEnabled
+            && gDDTransferDetailAmount.length && [text hasPrefix:@"¥"]) {
         %orig([@"¥" stringByAppendingString:gDDTransferDetailAmount]);
     } else {
         %orig;
     }
 }
 - (void)setAttributedText:(NSAttributedString *)attr {
-    if (gDDInTransferDetail && [DDGlobalConfig shared].transferEnabled && gDDTransferDetailAmount.length
-        && attr.string.length && [attr.string hasPrefix:@"¥"]) {
+    if (gDDInTransferDetail && [DDGlobalConfig shared].transferEnabled
+            && gDDTransferDetailAmount.length && attr.string.length
+            && [attr.string hasPrefix:@"¥"]) {
         NSDictionary *attrs = [attr attributesAtIndex:0 effectiveRange:NULL];
-        %orig([[NSAttributedString alloc] initWithString:[@"¥" stringByAppendingString:gDDTransferDetailAmount] attributes:attrs]);
+        NSString *replaced = [@"¥" stringByAppendingString:gDDTransferDetailAmount];
+        %orig([[NSAttributedString alloc] initWithString:replaced attributes:attrs]);
     } else {
         %orig;
     }
@@ -1269,7 +1288,8 @@ static double DDTimeStampFromString(NSString *s) {
         if ([g isKindOfClass:[UILongPressGestureRecognizer class]]) return;
     }
     label.userInteractionEnabled = YES;
-    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(dk_handleTimeLongPress:)];
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
+            initWithTarget:self action:@selector(dk_handleTimeLongPress:)];
     lp.minimumPressDuration = 0.5;
     lp.allowableMovement = 24;
     lp.cancelsTouchesInView = NO;
@@ -1289,7 +1309,11 @@ static double DDTimeStampFromString(NSString *s) {
     NSNumber *cached = DDJokerCachedTime(vm);
     double base = cached ? [cached doubleValue]
             : DDShowingTimeOf(vm);
-    NSString *defaultText = base > 0 ? [DDTimeInputFormatter() stringFromDate:[NSDate dateWithTimeIntervalSince1970:base]] : @"";
+    NSString *defaultText = @"";
+    if (base > 0) {
+        NSDate *date = [NSDate dateWithTimeIntervalSince1970:base];
+        defaultText = [DDTimeInputFormatter() stringFromDate:date];
+    }
 
     WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:@"时间修改"
             message:@"输入格式如下\n2024-08-01 22:30\n留空还原"];
@@ -1302,7 +1326,8 @@ static double DDTimeStampFromString(NSString *s) {
     [alert addBtnTitle:@"确定" handler:^{
         NSString *raw = blockAlert ? [blockAlert getTextFieldText] : nil;
         if (!raw.length) raw = inputField.text;
-        NSString *t = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+        NSString *t = [raw stringByTrimmingCharactersInSet:ws];
         double ts = DDTimeStampFromString(t);
         if (ts > 0) {
 
@@ -1492,8 +1517,14 @@ static unsigned long long DDClampFen(unsigned long long fen);
 // 取该 view 应改成的目标值（分）；不需要改写返回 NO。
 static BOOL DDBalanceWantFenFor(id v, DDBalancePageKind kind, unsigned long long *out) {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { *out = DDClampFen(DDLingtongFenValue()); return YES; }
-    if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { *out = DDClampFen(DDBalanceFenValue()); return YES; }
+    if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) {
+        *out = DDClampFen(DDLingtongFenValue());
+        return YES;
+    }
+    if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) {
+        *out = DDClampFen(DDBalanceFenValue());
+        return YES;
+    }
     return NO;
 }
 
@@ -1576,8 +1607,13 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalanceResolveKind(self);
             unsigned long long want = 0; BOOL rewrite = NO;
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
-            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { want = DDClampFen(DDBalanceFenValue()); rewrite = YES; }
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) {
+                want = DDClampFen(DDLingtongFenValue());
+                rewrite = YES;
+            } else if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) {
+                want = DDClampFen(DDBalanceFenValue());
+                rewrite = YES;
+            }
             if (rewrite) { %orig(want); return; }
         }
     } @catch (NSException *e) {}
@@ -1589,8 +1625,13 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
         if (cfg.balanceEnabled) {
             DDBalancePageKind kind = DDBalanceResolveKind(self);
             unsigned long long want = 0; BOOL rewrite = NO;
-            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
-            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { want = DDClampFen(DDBalanceFenValue()); rewrite = YES; }
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) {
+                want = DDClampFen(DDLingtongFenValue());
+                rewrite = YES;
+            } else if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) {
+                want = DDClampFen(DDBalanceFenValue());
+                rewrite = YES;
+            }
             if (rewrite) { %orig(want); return; }
         }
     } @catch (NSException *e) {}
@@ -1867,7 +1908,8 @@ static NSInteger DDAvatarRemoveAll(void) {
     NSInteger n = 0;
     for (NSString *f in files) {
         if (![f.pathExtension isEqualToString:@"png"]) continue;
-        if ([[NSFileManager defaultManager] removeItemAtPath:[dir stringByAppendingPathComponent:f] error:nil]) n++;
+        NSString *path = [dir stringByAppendingPathComponent:f];
+        if ([[NSFileManager defaultManager] removeItemAtPath:path error:nil]) n++;
     }
     if (n > 0) {
         DDAvatarCacheInvalidate(nil);
@@ -2215,7 +2257,8 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 
     if (DDAvatarImageForUser(usrName)) {
         (void)DDAvatarRemoveForUser(usrName);
-        [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        [nc postNotificationName:kDDProfileChangedNotification object:nil];
     } else {
         __weak typeof(self) weakSelf = self;
         __weak UISwitch *weakSw = sender;
@@ -2229,7 +2272,8 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
             if (!DDAvatarSaveImage(image, usrName)) {
                 [weakSw setOn:NO animated:YES];
             } else {
-                [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
+                NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+                [nc postNotificationName:kDDProfileChangedNotification object:nil];
             }
         }];
     }
@@ -2245,11 +2289,13 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 
     if (DDFriendWxidForUser(usrName)) {
         DDFriendWxidRemoveForUser(usrName);
-        [[NSNotificationCenter defaultCenter] postNotificationName:kDDFriendWxidChangedNotification object:nil];
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        [nc postNotificationName:kDDFriendWxidChangedNotification object:nil];
         return;
     }
 
-    WCUIAlertView *alert = [[%c(WCUIAlertView) alloc] initWithTitle:@"账号修改" message:@"请输入账号如：520\n输入空格隐藏账号\n留空还原"];
+    WCUIAlertView *alert = [[%c(WCUIAlertView) alloc] initWithTitle:@"账号修改"
+            message:@"请输入账号如：520\n输入空格隐藏账号\n留空还原"];
     if (!alert) {
         [sender setOn:NO animated:YES];
         return;
@@ -2276,7 +2322,8 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
             // 空格 / 文字：原样保存（空格＝空白账号即隐藏）
             DDFriendWxidSetForUser(text, usrName);
         }
-        [[NSNotificationCenter defaultCenter] postNotificationName:kDDFriendWxidChangedNotification object:nil];
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        [nc postNotificationName:kDDFriendWxidChangedNotification object:nil];
         blockAlert = nil;
     }];
     [alert show];
@@ -2362,8 +2409,11 @@ static BOOL DDHideChatName(void) {
     self.navigationItem.scrollEdgeAppearance = appearance;
     self.navigationItem.compactAppearance = appearance;
 
-    _tableViewManager = [(WCTableViewManager *)[%c(WCTableViewManager) alloc] initWithFrame:[[UIScreen mainScreen] bounds] style:UITableViewStyleInsetGrouped];
-    _tableViewManager.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    id tvMgr = [%c(WCTableViewManager) alloc];
+    _tableViewManager = [(WCTableViewManager *)tvMgr initWithFrame:[[UIScreen mainScreen] bounds]
+            style:UITableViewStyleInsetGrouped];
+    _tableViewManager.tableView.autoresizingMask =
+            UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     _tableViewManager.tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
     [self.view addSubview:_tableViewManager.tableView];
 
@@ -2423,76 +2473,88 @@ static BOOL DDHideChatName(void) {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     Class cellCls = %c(WCTableViewCellManager);
 
+    // 本方法内 cellCls 与 target 恒定，收成两个构造器，避免每行重复一长串参数
+    void (^addSwitch)(id, SEL, NSString *, BOOL) = ^void(id sec, SEL sel, NSString *title, BOOL on) {
+        [sec addCell:[cellCls switchCellForSel:sel target:self title:title on:on]];
+    };
+    id (^subCell)(NSString *, UIView *) = ^id(NSString *title, UIView *rightView) {
+        return [cellCls normalCellForSel:nil target:nil title:title rightView:rightView];
+    };
+
     WCTableViewSectionManager *chatSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"聊天小丑"];
     chatSection.footerTitle = @"开启后长按聊天消息，弹窗/菜单点击「小丑」修改";
-    [chatSection addCell:[cellCls switchCellForSel:@selector(textSwitchChanged:) target:self title:@"聊天文字修改" on:cfg.textEnabled]];
-    [chatSection addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
-    [chatSection addCell:[cellCls switchCellForSel:@selector(timeSwitchChanged:) target:self title:@"聊天时间修改" on:cfg.timeEnabled]];
-    [chatSection addCell:[cellCls switchCellForSel:@selector(transferSwitchChanged:) target:self title:@"聊天转账修改" on:cfg.transferEnabled]];
+    addSwitch(chatSection, @selector(textSwitchChanged:), @"聊天文字修改", cfg.textEnabled);
+    addSwitch(chatSection, @selector(imageSwitchChanged:), @"聊天图片修改", cfg.imageEnabled);
+    addSwitch(chatSection, @selector(timeSwitchChanged:), @"聊天时间修改", cfg.timeEnabled);
+    addSwitch(chatSection, @selector(transferSwitchChanged:), @"聊天转账修改", cfg.transferEnabled);
     UIButton *clearBtn = [self dd_actionButton:@"清理" action:@selector(clearChatCacheTapped:) x:0];
     UIView *clearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
     [clearRight addSubview:clearBtn];
-    [chatSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清空修改记录" rightView:clearRight]];
+    [chatSection addCell:subCell(@"清空修改记录", clearRight)];
     [_tableViewManager addSection:chatSection];
 
     WCTableViewSectionManager *profileSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"资料小丑"];
     profileSection.footerTitle = @"开启设置用户账号/头像后在「聊天详情」页逐人自定义";
-    [profileSection addCell:[cellCls switchCellForSel:@selector(balanceSwitchChanged:) target:self title:@"零钱余额修改" on:cfg.balanceEnabled]];
+    addSwitch(profileSection, @selector(balanceSwitchChanged:), @"零钱余额修改", cfg.balanceEnabled);
     if (cfg.balanceEnabled) {
         self.balanceField = [[UITextField alloc] init];
-        [self.balanceField addTarget:self action:@selector(balanceChanged:) forControlEvents:UIControlEventEditingChanged];
+        [self.balanceField addTarget:self action:@selector(balanceChanged:)
+                forControlEvents:UIControlEventEditingChanged];
         NSString *currentBalance = [cfg hasBalanceValue] ? cfg.balanceValue : @"";
         UIView *balanceRight = [self inputRowWithField:self.balanceField
                 action:@selector(balanceConfirm:)
                 placeholder:@"例如：888.88"
                 text:currentBalance];
         self.balanceField.keyboardType = UIKeyboardTypeDecimalPad;
-        WCTableViewCellManager *balanceSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳余额自定义" rightView:balanceRight];
+        WCTableViewCellManager *balanceSubCell = subCell(@"↳余额自定义", balanceRight);
         balanceSubCell.userInfo = @"SubCell";
         [profileSection addCell:balanceSubCell];
 
         self.lingtongField = [[UITextField alloc] init];
-        [self.lingtongField addTarget:self action:@selector(lingtongChanged:) forControlEvents:UIControlEventEditingChanged];
+        [self.lingtongField addTarget:self action:@selector(lingtongChanged:)
+                forControlEvents:UIControlEventEditingChanged];
         NSString *currentLingtong = [cfg hasLingtongValue] ? cfg.lingtongValue : @"";
         UIView *lingtongRight = [self inputRowWithField:self.lingtongField
                 action:@selector(lingtongConfirm:)
                 placeholder:@"例如：888.88"
                 text:currentLingtong];
         self.lingtongField.keyboardType = UIKeyboardTypeDecimalPad;
-        WCTableViewCellManager *lingtongSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳零钱通自定义" rightView:lingtongRight];
+        WCTableViewCellManager *lingtongSubCell = subCell(@"↳零钱通自定义", lingtongRight);
         lingtongSubCell.userInfo = @"SubCell";
         [profileSection addCell:lingtongSubCell];
     }
 
-    [profileSection addCell:[cellCls switchCellForSel:@selector(stepsSwitchChanged:) target:self title:@"运动步数修改" on:cfg.stepsEnabled]];
+    addSwitch(profileSection, @selector(stepsSwitchChanged:), @"运动步数修改", cfg.stepsEnabled);
     if (cfg.stepsEnabled) {
         self.stepsField = [[UITextField alloc] init];
-        [self.stepsField addTarget:self action:@selector(stepsChanged:) forControlEvents:UIControlEventEditingChanged];
+        [self.stepsField addTarget:self action:@selector(stepsChanged:)
+                forControlEvents:UIControlEventEditingChanged];
         NSString *currentSteps = [cfg hasStepsValue] ? cfg.stepsValueString : @"";
         UIView *rightView = [self inputRowWithField:self.stepsField
                 action:@selector(stepsConfirm:)
                 placeholder:@"例如：88888"
                 text:currentSteps];
-        WCTableViewCellManager *stepsSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳步数自定义" rightView:rightView];
+        WCTableViewCellManager *stepsSubCell = subCell(@"↳步数自定义", rightView);
         stepsSubCell.userInfo = @"SubCell";
         [profileSection addCell:stepsSubCell];
     }
 
-    [profileSection addCell:[cellCls switchCellForSel:@selector(contactsSwitchChanged:) target:self title:@"好友数量修改" on:cfg.contactsEnabled]];
+    addSwitch(profileSection, @selector(contactsSwitchChanged:), @"好友数量修改", cfg.contactsEnabled);
     if (cfg.contactsEnabled) {
         self.contactsField = [[UITextField alloc] init];
-        [self.contactsField addTarget:self action:@selector(contactsChanged:) forControlEvents:UIControlEventEditingChanged];
+        [self.contactsField addTarget:self action:@selector(contactsChanged:)
+                forControlEvents:UIControlEventEditingChanged];
         NSString *currentContacts = [cfg hasContactsValue] ? cfg.contactsValue : @"";
         UIView *rightView = [self inputRowWithField:self.contactsField
                 action:@selector(contactsConfirm:)
                 placeholder:@"例如：520"
                 text:currentContacts];
-        WCTableViewCellManager *contactsSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳数量自定义" rightView:rightView];
+        WCTableViewCellManager *contactsSubCell = subCell(@"↳数量自定义", rightView);
         contactsSubCell.userInfo = @"SubCell";
         [profileSection addCell:contactsSubCell];
     }
 
-    [profileSection addCell:[cellCls switchCellForSel:@selector(wxidSwitchChanged:) target:self title:@"设置自己账号" on:cfg.wxidEnabled]];
+    addSwitch(profileSection, @selector(wxidSwitchChanged:), @"设置自己账号", cfg.wxidEnabled);
     if (cfg.wxidEnabled) {
         self.wxidField = [[UITextField alloc] init];
         NSString *currentWxid = cfg.wxidValue.length ? cfg.wxidValue : @"";
@@ -2501,20 +2563,20 @@ static BOOL DDHideChatName(void) {
                 placeholder:@"例如：520"
                 text:currentWxid];
         self.wxidField.keyboardType = UIKeyboardTypeASCIICapable;
-        WCTableViewCellManager *wxidSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳账号自定义" rightView:rightView];
+        WCTableViewCellManager *wxidSubCell = subCell(@"↳账号自定义", rightView);
         wxidSubCell.userInfo = @"SubCell";
         [profileSection addCell:wxidSubCell];
     }
 
-    [profileSection addCell:[cellCls switchCellForSel:@selector(friendWxidSwitch:) target:self title:@"设置用户账号" on:cfg.friendWxidEnabled]];
+    addSwitch(profileSection, @selector(friendWxidSwitch:), @"设置用户账号", cfg.friendWxidEnabled);
 
-    [profileSection addCell:[cellCls switchCellForSel:@selector(hideChatNameSwitch:) target:self title:@"隐藏顶栏名字" on:cfg.hideChatName]];
+    addSwitch(profileSection, @selector(hideChatNameSwitch:), @"隐藏顶栏名字", cfg.hideChatName);
 
-    [profileSection addCell:[cellCls switchCellForSel:@selector(avatarSwitchChanged:) target:self title:@"设置用户头像" on:cfg.avatarEnabled]];
+    addSwitch(profileSection, @selector(avatarSwitchChanged:), @"设置用户头像", cfg.avatarEnabled);
     UIButton *avatarClearBtn = [self dd_actionButton:@"清理" action:@selector(clearAllAvatarTapped:) x:0];
     UIView *avatarClearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
     [avatarClearRight addSubview:avatarClearBtn];
-    [profileSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清空全部头像" rightView:avatarClearRight]];
+    [profileSection addCell:subCell(@"清空全部头像", avatarClearRight)];
 
     [_tableViewManager addSection:profileSection];
 
@@ -2522,7 +2584,8 @@ static BOOL DDHideChatName(void) {
 }
 
 - (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:willDisplayCell:forRowAtIndexPath:)]) {
+    SEL fwdSel = @selector(tableView:willDisplayCell:forRowAtIndexPath:);
+    if (_originalDelegate && [_originalDelegate respondsToSelector:fwdSel]) {
         [_originalDelegate tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
     }
     WCTableViewCellManager *cellInfo = [self.tableViewManager cellInfoAtIndexPath:indexPath];
@@ -2533,13 +2596,15 @@ static BOOL DDHideChatName(void) {
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)]) {
+    SEL fwdSel = @selector(tableView:didSelectRowAtIndexPath:);
+    if (_originalDelegate && [_originalDelegate respondsToSelector:fwdSel]) {
         [_originalDelegate tableView:tableView didSelectRowAtIndexPath:indexPath];
     }
 }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:heightForRowAtIndexPath:)]) {
+    SEL fwdSel = @selector(tableView:heightForRowAtIndexPath:);
+    if (_originalDelegate && [_originalDelegate respondsToSelector:fwdSel]) {
         return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
     }
     return UITableViewAutomaticDimension;
@@ -2675,7 +2740,8 @@ static BOOL DDHideChatName(void) {
 
 - (void)saveStepsInput:(NSString *)input {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    NSString *trimmed = [input stringByTrimmingCharactersInSet:ws];
     if (trimmed.length == 0) {
         cfg.stepsValueString = nil;
     } else {
@@ -2688,7 +2754,8 @@ static BOOL DDHideChatName(void) {
 
 - (void)saveContactsInput:(NSString *)input {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    NSString *trimmed = [input stringByTrimmingCharactersInSet:ws];
     if (trimmed.length == 0) {
         cfg.contactsValue = nil;
     } else {
@@ -2701,7 +2768,8 @@ static BOOL DDHideChatName(void) {
 
 - (void)saveBalanceInput:(NSString *)input {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    NSString *trimmed = [input stringByTrimmingCharactersInSet:ws];
     if (trimmed.length == 0) {
         cfg.balanceValue = nil;
         return;
@@ -2722,7 +2790,8 @@ static BOOL DDHideChatName(void) {
 
 - (void)saveLingtongInput:(NSString *)input {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    NSString *trimmed = [input stringByTrimmingCharactersInSet:ws];
     if (trimmed.length == 0) {
         cfg.lingtongValue = nil;
         return;
