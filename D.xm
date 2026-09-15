@@ -458,6 +458,26 @@ static NSString *DDJokerMessageKey(CMessageWrap *msg) {
     return [NSString stringWithFormat:@"%@|%@|%u", from, to, [msg m_uiMesLocalID]];
 }
 
+// 转账金额缓存改用 transferid 做全局唯一 key：聊天列表的 CMessageWrap 与详情页
+// m_oSelectedMessageWrap 的 localID/from/to 可能不一致，但同一条转账的 transferid 必然相同
+// （来自 m_nsContent 里的 <transferid>）。用 transferid 才能稳定命中同一笔改写。
+static NSString *DDTransferIDFromContent(NSString *xml) {
+    if (!xml.length) return nil;
+    NSRange ro = [xml rangeOfString:@"<transferid>" options:NSCaseInsensitiveSearch];
+    if (ro.location == NSNotFound) return nil;
+    NSUInteger start = ro.location + ro.length;
+    NSRange rc = [xml rangeOfString:@"</transferid>" options:NSCaseInsensitiveSearch
+                               range:NSMakeRange(start, xml.length - start)];
+    if (rc.location == NSNotFound) return nil;
+    NSString *tid = [xml substringWithRange:NSMakeRange(start, rc.location - start)];
+    return tid.length ? tid : nil;
+}
+static NSString *DDJokerAmountKey(CMessageWrap *msg) {
+    NSString *tid = DDTransferIDFromContent([msg m_nsContent]);
+    if (tid.length) return [@"TRF:" stringByAppendingString:tid];
+    return DDJokerMessageKey(msg);
+}
+
 static NSString *DDJokerCacheDir(void) {
     NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/DDJoker"];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -512,21 +532,44 @@ static void DDJokerSetOriginalText(CMessageWrap *msg, NSString *text) {
 static NSString *DDJokerCachedAmount(CMessageWrap *msg) {
     if (!msg) return nil;
     NSDictionary *d = DDJokerLoadCache(kDDJokerAmountCacheKey);
-    NSString *v = d[DDJokerMessageKey(msg)];
+    NSString *v = d[DDJokerAmountKey(msg)];
+    if (v.length) return v;
+    v = d[DDJokerMessageKey(msg)];   // 兼容旧缓存（from|to|localID 键）
     return v.length ? v : nil;
 }
 
 static void DDJokerSetCachedAmount(CMessageWrap *msg, NSString *amount) {
     if (!msg) return;
     NSMutableDictionary *d = DDJokerLoadCache(kDDJokerAmountCacheKey);
-    if (amount.length) d[DDJokerMessageKey(msg)] = amount;
-    else [d removeObjectForKey:DDJokerMessageKey(msg)];
+    NSString *key = DDJokerAmountKey(msg);
+    if (amount.length) d[key] = amount;
+    else [d removeObjectForKey:key];
     DDJokerSaveCache(kDDJokerAmountCacheKey, d);
 }
 
-static NSString *gDDLastTransferOverride = nil;
-static void DDSetLastTransferOverride(NSString *value) {
-    gDDLastTransferOverride = value.length ? [value copy] : nil;
+// 转账详情页作用域：仅当某个 WCPayTransferMoneyStatusViewController 存活时为 YES，
+// 彻底取代 MMUILabel 里的 responder 链判定（label 在 setText: 时往往尚未挂入层级，
+// responder 链走不到 VC，导致替换永不触发）。Enter/Leave 与 VC 生命周期 1:1 配对（计数器兼容嵌套），
+// viewWillAppear/refreshViewWithData 只更新金额、不碰计数，避免计数失衡。
+static NSInteger gDDTransferDetailCount = 0;
+static BOOL gDDInTransferDetail = NO;
+static NSString *gDDTransferDetailAmount = nil;
+
+static void DDTransferDetailEnter(NSString *amount) {
+    gDDTransferDetailCount++;
+    gDDInTransferDetail = YES;
+    gDDTransferDetailAmount = amount.length ? [amount copy] : nil;
+}
+static void DDTransferDetailUpdateAmount(NSString *amount) {
+    if (gDDInTransferDetail) gDDTransferDetailAmount = amount.length ? [amount copy] : nil;
+}
+static void DDTransferDetailLeave(void) {
+    gDDTransferDetailCount--;
+    if (gDDTransferDetailCount <= 0) {
+        gDDTransferDetailCount = 0;
+        gDDInTransferDetail = NO;
+        gDDTransferDetailAmount = nil;
+    }
 }
 
 #pragma mark - 聊天时间 · 缓存与 ivar 读写
@@ -620,7 +663,7 @@ static void DDJokerClearAllMessageCache(void) {
     [fm removeItemAtPath:DDJokerCacheFile(kDDJokerTimeCacheKey) error:nil];
 
     [fm removeItemAtPath:DDJokerImagesDir() error:nil];
-    DDSetLastTransferOverride(nil);
+    DDTransferDetailLeave();
 }
 
 
@@ -808,7 +851,7 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
             if ([newText isEqualToString:current]) { blockAlert = nil; return; }
             if (isTransfer) {
                 NSString *normalized = JokerNormalizeAmount(newText);
-                if (normalized) { DDJokerSetCachedAmount(msg, normalized); DDSetLastTransferOverride(normalized); }
+                if (normalized) { DDJokerSetCachedAmount(msg, normalized); }
             } else {
                 DDJokerSetCachedText(msg, newText);
             }
@@ -942,32 +985,30 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
                                   withTemplate:newAmount];
 }
 
-// 转账详情页金额改写：detail VC 的 data.m_oSelectedMessageWrap 就是该条转账消息，
-// 与聊天列表同一消息，故 DDJokerMessageKey 命中同一缓存。在 viewDidLoad 渲染前设 override，
-// 详情页 MMUILabel 渲染时即被替换（DDLabelOnTransferDetailVC 判定 label 归属本 VC）。
+// 转账详情页金额改写：缓存按 transferid 命中（聊天列表与详情页同一条转账 transferid 相同，
+// 见 DDJokerAmountKey）。用 gDDInTransferDetail 开关做作用域、gDDTransferDetailAmount 存目标金额，
+// 每次 MMUILabel 的 setText:/setAttributedText: 实时查——彻底摆脱 responder 链与刷新时序。
 %hook WCPayTransferMoneyStatusViewController
 - (void)viewDidLoad {
     WCPayControlData *data = [self data];
-    CMessageWrap *msg = data.m_oSelectedMessageWrap;
-    DDSetLastTransferOverride(DDJokerCachedAmount(msg));
+    DDTransferDetailEnter(DDJokerCachedAmount(data.m_oSelectedMessageWrap));
     %orig;
 }
-// data 可能在 viewDidLoad 之后才赋值（setupWithData:/refreshViewWithData:），
-// 这里兜底刷新一次 override，保证 MMUILabel 渲染时已是目标金额。
+// data 可能在 viewDidLoad 之后才赋值（setupWithData:/refreshViewWithData:），兜底刷新金额。
 - (void)viewWillAppear:(BOOL)animated {
     WCPayControlData *data = [self data];
-    DDSetLastTransferOverride(DDJokerCachedAmount(data.m_oSelectedMessageWrap));
+    DDTransferDetailUpdateAmount(DDJokerCachedAmount(data.m_oSelectedMessageWrap));
     %orig;
 }
-// 状态轮询 / 刷新会重新走 refreshViewWithData:，也同步刷新 override。
+// 状态轮询 / 刷新会重新走 refreshViewWithData:，也同步刷新目标金额。
 - (void)refreshViewWithData:(id)a0 {
     WCPayControlData *data = [self data];
-    DDSetLastTransferOverride(DDJokerCachedAmount(data.m_oSelectedMessageWrap));
+    DDTransferDetailUpdateAmount(DDJokerCachedAmount(data.m_oSelectedMessageWrap));
     %orig;
 }
 - (void)dealloc {
     %orig;
-    DDSetLastTransferOverride(nil);
+    DDTransferDetailLeave();
 }
 %end
 
@@ -1006,37 +1047,25 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 %end
 
 // 转账详情页金额改写（精确方案，零 view 树遍历）：
-// 用 Flex 锁定真实金额 label 是 MMUILabel（baseClass=UILabel，frame=(0 128; 414 54)，text=¥0.01），
-// 直接 hook MMUILabel 的 setText:/setAttributedText:，仅当"label 归属转账详情页 VC +
-// 文本是 ¥ 金额 + 存在 override"时改写。微信每次重设金额（含状态轮询/刷新）都会被接住，不闪不还原。
-// 该 label enableLongPressCopy=0，长按复制未启用，textToCopy 不参与，故不写。
-
-// 沿 responder 链上溯判断 label 是否属于转账详情页（只走 responder 链，不遍历 view 树）。
-static BOOL DDLabelOnTransferDetailVC(id v) {
-    Class detailVC = %c(WCPayTransferMoneyStatusViewController);
-    if (!detailVC) return NO;
-    UIResponder *r = (UIResponder *)v;
-    while (r) {
-        if ([r isKindOfClass:detailVC]) return YES;
-        r = r.nextResponder;
-    }
-    return NO;
-}
+// 用 Flex 锁定真实金额 label 是 MMUILabel（baseClass=UILabel，frame=(0 128; 414 54)），
+// 直接 hook MMUILabel 的 setText:/setAttributedText:，仅当"处于转账详情页作用域(gDDInTransferDetail)
+// + transferEnabled + 文本是 ¥ 金额 + 存在目标金额"时改写。每次 setText: 实时查 gDDTransferDetailAmount，
+// 彻底摆脱 responder 链（setText: 时 label 尚未挂层级，链走不到 VC）与刷新时序。详情页每次重设金额
+// （含状态轮询/刷新/重新布局）都被接住，不闪不还原。该 label enableLongPressCopy=0，长按复制未启用。
 
 %hook MMUILabel
 - (void)setText:(NSString *)text {
-    NSString *ov = gDDLastTransferOverride;
-    if (ov.length && [DDGlobalConfig shared].transferEnabled && [text hasPrefix:@"¥"] && DDLabelOnTransferDetailVC(self)) {
-        %orig([@"¥" stringByAppendingString:ov]);
+    if (gDDInTransferDetail && [DDGlobalConfig shared].transferEnabled && gDDTransferDetailAmount.length && [text hasPrefix:@"¥"]) {
+        %orig([@"¥" stringByAppendingString:gDDTransferDetailAmount]);
     } else {
         %orig;
     }
 }
 - (void)setAttributedText:(NSAttributedString *)attr {
-    NSString *ov = gDDLastTransferOverride;
-    if (ov.length && [DDGlobalConfig shared].transferEnabled && attr.string.length && [attr.string hasPrefix:@"¥"] && DDLabelOnTransferDetailVC(self)) {
+    if (gDDInTransferDetail && [DDGlobalConfig shared].transferEnabled && gDDTransferDetailAmount.length
+        && attr.string.length && [attr.string hasPrefix:@"¥"]) {
         NSDictionary *attrs = [attr attributesAtIndex:0 effectiveRange:NULL];
-        %orig([[NSAttributedString alloc] initWithString:[@"¥" stringByAppendingString:ov] attributes:attrs]);
+        %orig([[NSAttributedString alloc] initWithString:[@"¥" stringByAppendingString:gDDTransferDetailAmount] attributes:attrs]);
     } else {
         %orig;
     }
