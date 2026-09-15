@@ -196,7 +196,11 @@
 - (NSString *)descText;
 @end
 
-@interface WCPayTransferMessageCellView : CommonMessageCellView
+@interface WCPayBaseMessageCellView : CommonMessageCellView
+- (void)onTouchUpInside;
+@end
+
+@interface WCPayTransferMessageCellView : WCPayBaseMessageCellView
 - (void)updateTitleLabel;
 - (void)updateDescLabel;
 @end
@@ -510,6 +514,10 @@ static void DDJokerSetCachedAmount(CMessageWrap *msg, NSString *amount) {
 }
 
 static NSString *gDDLastTransferOverride = nil;
+static void DDSetLastTransferOverride(NSString *value) {
+    [gDDLastTransferOverride release];
+    gDDLastTransferOverride = value.length ? [value copy] : nil;
+}
 
 #pragma mark - 聊天时间 · 缓存与 ivar 读写
 // 直接读写 ChatTimeViewModel 的 _showingTime ivar（double 时间戳）；缓存按消息或原始时间戳索引。
@@ -602,6 +610,7 @@ static void DDJokerClearAllMessageCache(void) {
     [fm removeItemAtPath:DDJokerCacheFile(kDDJokerTimeCacheKey) error:nil];
 
     [fm removeItemAtPath:DDJokerImagesDir() error:nil];
+    DDSetLastTransferOverride(nil);
 }
 
 
@@ -789,7 +798,7 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
             if ([newText isEqualToString:current]) { blockAlert = nil; return; }
             if (isTransfer) {
                 NSString *normalized = JokerNormalizeAmount(newText);
-                if (normalized) { DDJokerSetCachedAmount(msg, normalized); gDDLastTransferOverride = normalized; }
+                if (normalized) { DDJokerSetCachedAmount(msg, normalized); DDSetLastTransferOverride(normalized); }
             } else {
                 DDJokerSetCachedText(msg, newText);
             }
@@ -922,6 +931,17 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
                                          range:NSMakeRange(0, text.length)
                                   withTemplate:newAmount];
 }
+
+%hook WCPayBaseMessageCellView
+- (void)onTouchUpInside {
+    if ([self isKindOfClass:%c(WCPayTransferMessageCellView)]) {
+        WCPayTransferMessageViewModel *vm = [(WCPayTransferMessageCellView *)self viewModel];
+        CMessageWrap *msg = [vm messageWrap];
+        DDSetLastTransferOverride(DDJokerCachedAmount(msg));
+    }
+    %orig;
+}
+%end
 
 %hook WCPayTransferMessageCellView
 
