@@ -439,7 +439,7 @@ static NSString * const kDDJokerTextOriginalKey = @"DDJokerTextOriginal";
 // 确保不同会话的改写互不串扰。
 static NSString *DDJokerMessageKey(CMessageWrap *msg) {
     NSString *from = [msg m_nsFromUsr] ?: @"";
-    NSString *to   = [msg m_nsToUsr]   ?: @"";
+    NSString *to = [msg m_nsToUsr] ?: @"";
     return [NSString stringWithFormat:@"%@|%@|%u", from, to, [msg m_uiMesLocalID]];
 }
 
@@ -1446,7 +1446,7 @@ static DDBalancePageKind DDBalanceCellKindOf(id sn) {
         for (int depth = 0; depth < 24 && r; depth++) {
             if ([r isKindOfClass:[UIView class]]) {
                 NSString *ai = ((UIView *)r).accessibilityIdentifier;
-                if ([ai isEqualToString:@"lqt_cell"])    return DDBalancePageLQT;
+                if ([ai isEqualToString:@"lqt_cell"]) return DDBalancePageLQT;
                 if ([ai isEqualToString:@"balance_cell"]) return DDBalancePageBalance;
             }
             r = r.nextResponder;
@@ -1577,7 +1577,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
             DDBalancePageKind kind = DDBalanceResolveKind(self);
             unsigned long long want = 0; BOOL rewrite = NO;
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
-            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { want = DDClampFen(DDBalanceFenValue());   rewrite = YES; }
+            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { want = DDClampFen(DDBalanceFenValue()); rewrite = YES; }
             if (rewrite) { %orig(want); return; }
         }
     } @catch (NSException *e) {}
@@ -1590,7 +1590,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
             DDBalancePageKind kind = DDBalanceResolveKind(self);
             unsigned long long want = 0; BOOL rewrite = NO;
             if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
-            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { want = DDClampFen(DDBalanceFenValue());   rewrite = YES; }
+            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { want = DDClampFen(DDBalanceFenValue()); rewrite = YES; }
             if (rewrite) { %orig(want); return; }
         }
     } @catch (NSException *e) {}
