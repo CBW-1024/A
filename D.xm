@@ -364,11 +364,11 @@ static BOOL JokerIsReferMessage(CMessageWrap *msg) {
 static NSString *JokerUnescapeXML(NSString *s) {
     if (![s isKindOfClass:[NSString class]] || !s.length) return s;
     NSDictionary *map = @{@"&lt;":@"<", @"&gt;":@">", @"&amp;":@"&",
-                          @"&quot;":@"\"", @"&apos;":@"'"};
+            @"&quot;":@"\"", @"&apos;":@"'"};
     NSMutableString *m = [s mutableCopy];
     for (NSString *key in map) {
         [m replaceOccurrencesOfString:key withString:map[key]
-                               options:NSLiteralSearch range:NSMakeRange(0, m.length)];
+                options:NSLiteralSearch range:NSMakeRange(0, m.length)];
     }
     return m;
 }
@@ -380,8 +380,8 @@ static NSString *JokerReferMessageTitle(CMessageWrap *msg) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         re = [NSRegularExpression regularExpressionWithPattern:@"<title\\s*>(.*?)</title\\s*>"
-                                                        options:NSRegularExpressionCaseInsensitive | NSRegularExpressionDotMatchesLineSeparators
-                                                          error:nil];
+                options:NSRegularExpressionCaseInsensitive | NSRegularExpressionDotMatchesLineSeparators
+                error:nil];
     });
     NSTextCheckingResult *r = [re firstMatchInString:xml options:0 range:NSMakeRange(0, xml.length)];
     if (!r || r.numberOfRanges < 2) return nil;
@@ -452,7 +452,7 @@ static NSString *DDTransferIDFromContent(NSString *xml) {
     if (ro.location == NSNotFound) return nil;
     NSUInteger start = ro.location + ro.length;
     NSRange rc = [xml rangeOfString:@"</transferid>" options:NSCaseInsensitiveSearch
-                               range:NSMakeRange(start, xml.length - start)];
+            range:NSMakeRange(start, xml.length - start)];
     if (rc.location == NSNotFound) return nil;
     NSString *tid = [xml substringWithRange:NSMakeRange(start, rc.location - start)];
     return tid.length ? tid : nil;
@@ -860,9 +860,9 @@ static void JokerPresentEditor(CommonMessageCellView *cell) {
 static MMMenuItem *DDJokerMenuItem(NSString *title, id target, SEL action) {
     id item = [%c(MMMenuItem) alloc];
     return [item initWithTitle:title
-    svgName:@"icons_filled_sticker"
-    target:target
-    action:action];
+            svgName:@"icons_filled_sticker"
+            target:target
+            action:action];
 }
 
 static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *original) {
@@ -967,14 +967,14 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
     if (!text.length || !override.length) return text;
     // 转账消息金额：必带 ¥、两位小数（允许千分位逗号）。
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"¥\\d[\\d,]*\\.\\d{2}"
-                                                                        options:0
-                                                                          error:nil];
+            options:0
+            error:nil];
     if (!re) return text;
     NSString *newAmount = [@"¥" stringByAppendingString:override];
     return [re stringByReplacingMatchesInString:text
-                                       options:0
-                                         range:NSMakeRange(0, text.length)
-                                  withTemplate:newAmount];
+            options:0
+            range:NSMakeRange(0, text.length)
+            withTemplate:newAmount];
 }
 
 // 转账详情页金额改写：进入详情页时按 transferid 命中缓存金额并进入作用域；
@@ -1288,11 +1288,11 @@ static double DDTimeStampFromString(NSString *s) {
 
     NSNumber *cached = DDJokerCachedTime(vm);
     double base = cached ? [cached doubleValue]
-                         : DDShowingTimeOf(vm);
+            : DDShowingTimeOf(vm);
     NSString *defaultText = base > 0 ? [DDTimeInputFormatter() stringFromDate:[NSDate dateWithTimeIntervalSince1970:base]] : @"";
 
     WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:@"时间修改"
-                                                                           message:@"输入格式如下\n2024-08-01 22:30\n留空还原"];
+            message:@"输入格式如下\n2024-08-01 22:30\n留空还原"];
     [alert showTextFieldWithMaxLen:100];
     [alert setTextFieldDefaultText:defaultText];
 
@@ -1774,9 +1774,9 @@ static NSString *DDAvatarDir(void) {
     BOOL isDir = NO;
     if (![[NSFileManager defaultManager] fileExistsAtPath:dir isDirectory:&isDir]) {
         [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                                 withIntermediateDirectories:YES
-                                                  attributes:nil
-                                                       error:nil];
+                withIntermediateDirectories:YES
+                attributes:nil
+                error:nil];
     }
     return dir;
 }
@@ -2138,17 +2138,17 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
     if (cfg.avatarEnabled) {
         BOOL hasCustom = DDAvatarImageForUser(usrName) != nil;
         id cell = [%c(WCTableViewCellManager) switchCellForSel:@selector(ddAvatarSwitchChanged:)
-                                                       target:vc
-                                                        title:@"自定义头像"
-                                                           on:hasCustom];
+                target:vc
+                title:@"自定义头像"
+                on:hasCustom];
         if (cell) { [section addCell:cell]; if (!firstCell) firstCell = cell; }
     }
     if (cfg.friendWxidEnabled) {
         BOOL hasCustom = DDFriendWxidForUser(usrName) != nil;
         id cell = [%c(WCTableViewCellManager) switchCellForSel:@selector(ddWxidSwitchChanged:)
-                                                       target:vc
-                                                        title:@"自定义账号"
-                                                           on:hasCustom];
+                target:vc
+                title:@"自定义账号"
+                on:hasCustom];
         if (cell) { [section addCell:cell]; if (!firstCell) firstCell = cell; }
     }
     if (!firstCell) return;
@@ -2182,9 +2182,9 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
     %orig;
     s_profileVC = self;
     [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(reloadTableData)
-                                                 name:kDDProfileChangedNotification
-                                               object:nil];
+            selector:@selector(reloadTableData)
+            name:kDDProfileChangedNotification
+            object:nil];
     [self dd_injectProfileSection];   // 表格已装配完、页面尚未显示，首帧即带开关
 }
 
@@ -2443,9 +2443,9 @@ static BOOL DDHideChatName(void) {
         [self.balanceField addTarget:self action:@selector(balanceChanged:) forControlEvents:UIControlEventEditingChanged];
         NSString *currentBalance = [cfg hasBalanceValue] ? cfg.balanceValue : @"";
         UIView *balanceRight = [self inputRowWithField:self.balanceField
-                                                action:@selector(balanceConfirm:)
-                                           placeholder:@"例如：888.88"
-                                                  text:currentBalance];
+                action:@selector(balanceConfirm:)
+                placeholder:@"例如：888.88"
+                text:currentBalance];
         self.balanceField.keyboardType = UIKeyboardTypeDecimalPad;
         WCTableViewCellManager *balanceSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳余额自定义" rightView:balanceRight];
         balanceSubCell.userInfo = @"SubCell";
@@ -2455,9 +2455,9 @@ static BOOL DDHideChatName(void) {
         [self.lingtongField addTarget:self action:@selector(lingtongChanged:) forControlEvents:UIControlEventEditingChanged];
         NSString *currentLingtong = [cfg hasLingtongValue] ? cfg.lingtongValue : @"";
         UIView *lingtongRight = [self inputRowWithField:self.lingtongField
-                                                 action:@selector(lingtongConfirm:)
-                                            placeholder:@"例如：888.88"
-                                                   text:currentLingtong];
+                action:@selector(lingtongConfirm:)
+                placeholder:@"例如：888.88"
+                text:currentLingtong];
         self.lingtongField.keyboardType = UIKeyboardTypeDecimalPad;
         WCTableViewCellManager *lingtongSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳零钱通自定义" rightView:lingtongRight];
         lingtongSubCell.userInfo = @"SubCell";
@@ -2470,9 +2470,9 @@ static BOOL DDHideChatName(void) {
         [self.stepsField addTarget:self action:@selector(stepsChanged:) forControlEvents:UIControlEventEditingChanged];
         NSString *currentSteps = [cfg hasStepsValue] ? cfg.stepsValueString : @"";
         UIView *rightView = [self inputRowWithField:self.stepsField
-                                             action:@selector(stepsConfirm:)
-                                        placeholder:@"例如：88888"
-                                               text:currentSteps];
+                action:@selector(stepsConfirm:)
+                placeholder:@"例如：88888"
+                text:currentSteps];
         WCTableViewCellManager *stepsSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳步数自定义" rightView:rightView];
         stepsSubCell.userInfo = @"SubCell";
         [profileSection addCell:stepsSubCell];
@@ -2484,9 +2484,9 @@ static BOOL DDHideChatName(void) {
         [self.contactsField addTarget:self action:@selector(contactsChanged:) forControlEvents:UIControlEventEditingChanged];
         NSString *currentContacts = [cfg hasContactsValue] ? cfg.contactsValue : @"";
         UIView *rightView = [self inputRowWithField:self.contactsField
-                                             action:@selector(contactsConfirm:)
-                                        placeholder:@"例如：520"
-                                               text:currentContacts];
+                action:@selector(contactsConfirm:)
+                placeholder:@"例如：520"
+                text:currentContacts];
         WCTableViewCellManager *contactsSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳数量自定义" rightView:rightView];
         contactsSubCell.userInfo = @"SubCell";
         [profileSection addCell:contactsSubCell];
@@ -2497,9 +2497,9 @@ static BOOL DDHideChatName(void) {
         self.wxidField = [[UITextField alloc] init];
         NSString *currentWxid = cfg.wxidValue.length ? cfg.wxidValue : @"";
         UIView *rightView = [self inputRowWithField:self.wxidField
-                                         action:@selector(wxidConfirm:)
-                                    placeholder:@"例如：520"
-                                           text:currentWxid];
+                action:@selector(wxidConfirm:)
+                placeholder:@"例如：520"
+                text:currentWxid];
         self.wxidField.keyboardType = UIKeyboardTypeASCIICapable;
         WCTableViewCellManager *wxidSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳账号自定义" rightView:rightView];
         wxidSubCell.userInfo = @"SubCell";
@@ -2935,8 +2935,9 @@ static BOOL DDHideChatName(void) {
     @autoreleasepool {
         WCPluginsMgr *mgr = [%c(WCPluginsMgr) sharedInstance];
         [mgr registerControllerWithTitle:@"DD小丑助手"
-                                 version:@"1.0.0"
-                              controller:@"DDJokerSettingsViewController"];
+                version:@"1.0.0"
+                controller:@"DDJokerSettingsViewController"];
     }
 }
 
+hc
