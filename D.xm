@@ -3,6 +3,7 @@
 #import <objc/runtime.h>
 #import <substrate.h>
 #include <string.h>
+#include <stdarg.h>
 
 // ============================================================
 //  DD小丑助手  (WeChat Jailbreak Tweak, Theos/Logos 单文件)
@@ -533,8 +534,6 @@ static NSString *DDJokerCachedAmount(CMessageWrap *msg) {
     if (!msg) return nil;
     NSDictionary *d = DDJokerLoadCache(kDDJokerAmountCacheKey);
     NSString *v = d[DDJokerAmountKey(msg)];
-    if (v.length) return v;
-    v = d[DDJokerMessageKey(msg)];   // 兼容旧缓存（from|to|localID 键）
     return v.length ? v : nil;
 }
 
@@ -548,28 +547,68 @@ static void DDJokerSetCachedAmount(CMessageWrap *msg, NSString *amount) {
 }
 
 // 转账详情页作用域：仅当某个 WCPayTransferMoneyStatusViewController 存活时为 YES，
-// 彻底取代 MMUILabel 里的 responder 链判定（label 在 setText: 时往往尚未挂入层级，
-// responder 链走不到 VC，导致替换永不触发）。Enter/Leave 与 VC 生命周期 1:1 配对（计数器兼容嵌套），
-// viewWillAppear/refreshViewWithData 只更新金额、不碰计数，避免计数失衡。
+// 取代 MMUILabel 里失效的 responder 链判定（label 在 setText: 时往往尚未挂入层级，
+// 链走不到 VC，导致替换永不触发）。Enter/Leave 与 VC 生命周期 1:1 配对（计数器兼容嵌套），
+// viewWillAppear/refreshViewWithData 仅刷新金额、不碰计数。金额统一经 DDTransferDetailSetAmount
+// 写入，避免赋值语句在多处重复。
 static NSInteger gDDTransferDetailCount = 0;
 static BOOL gDDInTransferDetail = NO;
 static NSString *gDDTransferDetailAmount = nil;
 
-static void DDTransferDetailEnter(NSString *amount) {
-    gDDTransferDetailCount++;
-    gDDInTransferDetail = YES;
+static void DDTransferDetailSetAmount(NSString *amount) {
     gDDTransferDetailAmount = amount.length ? [amount copy] : nil;
 }
-static void DDTransferDetailUpdateAmount(NSString *amount) {
-    if (gDDInTransferDetail) gDDTransferDetailAmount = amount.length ? [amount copy] : nil;
+static void DDTransferDetailEnter(CMessageWrap *msg) {
+    gDDTransferDetailCount++;
+    gDDInTransferDetail = YES;
+    NSString *amt = DDJokerCachedAmount(msg);
+    DDLog(@"[转账详情] Enter(viewDidLoad) msgLocalID=%u cachedAmount=%@", msg ? [msg m_uiMesLocalID] : 0, amt);
+    DDTransferDetailSetAmount(amt);
+}
+static void DDTransferDetailRefresh(CMessageWrap *msg) {
+    if (!gDDInTransferDetail) return;
+    NSString *amt = DDJokerCachedAmount(msg);
+    DDLog(@"[转账详情] Refresh(viewWillAppear/refreshView) msgLocalID=%u cachedAmount=%@", msg ? [msg m_uiMesLocalID] : 0, amt);
+    DDTransferDetailSetAmount(amt);
 }
 static void DDTransferDetailLeave(void) {
+    DDLog(@"[转账详情] Leave(dealloc)");
     gDDTransferDetailCount--;
     if (gDDTransferDetailCount <= 0) {
         gDDTransferDetailCount = 0;
         gDDInTransferDetail = NO;
         gDDTransferDetailAmount = nil;
     }
+}
+
+// 诊断日志：写入沙盒 DDJoker.log，供设置界面「导出调试日志」分享。仅记录转账详情页作用域
+// 进出与金额替换命中，用于定位双保险/兜底中哪些路径真正生效，便于据此删冗余。限长 1MB 自动截断尾部。
+static NSString *DDLogFilePath(void) {
+    return [DDJokerCacheDir() stringByAppendingPathComponent:@"DDJoker.log"];
+}
+static void DDLog(NSString *fmt, ...) {
+    if (!fmt) return;
+    va_list ap; va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    if (!msg.length) return;
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"MM-dd HH:mm:ss.SSS";
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [df stringFromDate:[NSDate date]], msg];
+    NSString *path = DDLogFilePath();
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDictionary *attr = [fm attributesOfItemAtPath:path error:nil];
+    if (attr && [attr[NSFileSize] unsignedLongLongValue] > 1024*1024) {
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        [fm removeItemAtPath:path error:nil];
+        if (data.length > 256*1024) {
+            data = [data subdataWithRange:NSMakeRange(data.length - 256*1024, 256*1024)];
+            [data writeToFile:path atomically:NO];
+        }
+    }
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+    else { [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
 }
 
 #pragma mark - 聊天时间 · 缓存与 ivar 读写
@@ -990,20 +1029,17 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 // 每次 MMUILabel 的 setText:/setAttributedText: 实时查——彻底摆脱 responder 链与刷新时序。
 %hook WCPayTransferMoneyStatusViewController
 - (void)viewDidLoad {
-    WCPayControlData *data = [self data];
-    DDTransferDetailEnter(DDJokerCachedAmount(data.m_oSelectedMessageWrap));
+    DDTransferDetailEnter([self data].m_oSelectedMessageWrap);
     %orig;
 }
 // data 可能在 viewDidLoad 之后才赋值（setupWithData:/refreshViewWithData:），兜底刷新金额。
 - (void)viewWillAppear:(BOOL)animated {
-    WCPayControlData *data = [self data];
-    DDTransferDetailUpdateAmount(DDJokerCachedAmount(data.m_oSelectedMessageWrap));
+    DDTransferDetailRefresh([self data].m_oSelectedMessageWrap);
     %orig;
 }
 // 状态轮询 / 刷新会重新走 refreshViewWithData:，也同步刷新目标金额。
 - (void)refreshViewWithData:(id)a0 {
-    WCPayControlData *data = [self data];
-    DDTransferDetailUpdateAmount(DDJokerCachedAmount(data.m_oSelectedMessageWrap));
+    DDTransferDetailRefresh([self data].m_oSelectedMessageWrap);
     %orig;
 }
 - (void)dealloc {
@@ -1056,6 +1092,7 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 %hook MMUILabel
 - (void)setText:(NSString *)text {
     if (gDDInTransferDetail && [DDGlobalConfig shared].transferEnabled && gDDTransferDetailAmount.length && [text hasPrefix:@"¥"]) {
+        DDLog(@"[转账详情] 金额替换命中 text=%@ -> ¥%@", text, gDDTransferDetailAmount);
         %orig([@"¥" stringByAppendingString:gDDTransferDetailAmount]);
     } else {
         %orig;
@@ -1064,6 +1101,7 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 - (void)setAttributedText:(NSAttributedString *)attr {
     if (gDDInTransferDetail && [DDGlobalConfig shared].transferEnabled && gDDTransferDetailAmount.length
         && attr.string.length && [attr.string hasPrefix:@"¥"]) {
+        DDLog(@"[转账详情] 金额替换命中(attributed) -> ¥%@", gDDTransferDetailAmount);
         NSDictionary *attrs = [attr attributesAtIndex:0 effectiveRange:NULL];
         %orig([[NSAttributedString alloc] initWithString:[@"¥" stringByAppendingString:gDDTransferDetailAmount] attributes:attrs]);
     } else {
@@ -2551,6 +2589,13 @@ static BOOL DDHideChatName(void) {
 
     [_tableViewManager addSection:profileSection];
 
+    WCTableViewSectionManager *debugSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"调试"];
+    debugSection.footerTitle = @"导出运行日志用于排查转账详情页改写命中情况。";
+    UIButton *exportLogBtn = [self dd_actionButton:@"导出" action:@selector(exportLogTapped:) x:0];
+    UIView *exportLogRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
+    [exportLogRight addSubview:exportLogBtn];
+    [debugSection addCell:[cellCls normalCellForSel:nil target:nil title:@"导出调试日志" rightView:exportLogRight]];
+    [_tableViewManager addSection:debugSection];
 
     [_tableViewManager reloadTableView];
 }
@@ -2609,6 +2654,18 @@ static BOOL DDHideChatName(void) {
     JokerInvalidateAllLayout();
     [self buildTable];
     [self dd_showDoneToast:@"已清理"];
+}
+
+- (void)exportLogTapped:(id)sender {
+    NSString *path = DDLogFilePath();
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path] || [[fm attributesOfItemAtPath:path error:nil][NSFileSize] unsignedLongLongValue] == 0) {
+        [self dd_showDoneToast:@"暂无日志"];
+        return;
+    }
+    NSURL *url = [NSURL fileURLWithPath:path];
+    UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    [self presentViewController:avc animated:YES completion:nil];
 }
 
 
