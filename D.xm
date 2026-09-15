@@ -12,6 +12,7 @@
 #pragma mark - 微信类声明
 // 本插件 hook 的微信原生类与方法签名，均锚定微信8.0.78头文件 dump。
 
+
 @interface WCUIAlertView : NSObject
 - (id)initWithTitle:(id)a0 message:(id)a1;
 - (void)showTextFieldWithMaxLen:(unsigned int)a0;
@@ -85,7 +86,6 @@
 @interface CContact : CBaseContact
 @end
 
-// MMHeadImageView.h：头像视图，:setHeadImageByName:/:updateHeadImage:/:didMoveToWindow 等
 @interface MMHeadImageView : UIView
 @property (readonly, nonatomic) NSString *nsUsrName;
 - (void)setHeadImageByName:(id)usrName;
@@ -100,7 +100,6 @@
 - (void)updateImage:(id)image;
 @end
 
-// MMHDHeadImageView.h：资料页点开后的高清大图视图，:updateHead/:updateHDHead
 @interface MMHDHeadImageView : UIView
 @property (retain, nonatomic) CBaseContact *m_contact;
 - (void)updateHead;
@@ -108,14 +107,12 @@
 - (void)dd_applyCustomHDHead;
 @end
 
-// BaseMsgContentLogicController.h:329/332/348
 @interface BaseMsgContentLogicController : NSObject
 - (id)GetUsrTitle;
 - (id)getSubTitle;
 - (id)GetTitleTailImageView;
 @end
 
-// RoomContentLogicController.h:3 继承 BaseMsgContentLogicController；:72/74/75/109
 @interface RoomContentLogicController : BaseMsgContentLogicController
 - (id)GetUsrTitle;
 - (id)getSubTitle;
@@ -273,8 +270,6 @@
 - (void)updateNumber:(unsigned long long)a0;
 - (id)container;      // dump 中存在：外层容器（TimeoutNumber）
 @end
-
-@class WCPayTableCellViewDataView;
 
 #pragma mark - 配置管理（接口）
 // 全局开关与各功能自定义值；以 NSUserDefaults 持久化（见文件末"配置管理（实现）"）。
@@ -1045,6 +1040,7 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 #pragma mark - 聊天图片改写
 // hook ImageMessageCellView 各渲染入口注入替换图；相册选图回调见下一段。
 
+
 @interface DDWeChatImagePickerDelegate : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 @property (nonatomic, copy) NSString *sessionKey;   // 会话唯一键（from|to|localID），区分不同会话的图片改写
 @property (nonatomic, weak) id cellView;
@@ -1147,6 +1143,7 @@ static void DDImageApplyReplacementToCell(id cell) {
 
 #pragma mark - 系统相册选图回调
 // 选图后落盘到以 sessionKey（from|to|localID）命名的 png，并刷新对应 cell。
+
 
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<NSString *,id> *)info {
     UIImage *image = info[UIImagePickerControllerOriginalImage];
@@ -1713,7 +1710,6 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
         DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()));
 }
 %end
-
 
 
 #pragma mark - 用户账号自定义（按用户名，聊天详情页逐人设置）
