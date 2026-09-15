@@ -2415,7 +2415,7 @@ static BOOL DDHideChatName(void) {
     Class cellCls = %c(WCTableViewCellManager);
 
     WCTableViewSectionManager *chatSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"聊天小丑"];
-    chatSection.footerTitle = @"开启后长按消息，弹窗菜单点击「小丑」修改";
+    chatSection.footerTitle = @"开启后长按聊天消息，弹窗/菜单点击「小丑」修改";
     [chatSection addCell:[cellCls switchCellForSel:@selector(textSwitchChanged:) target:self title:@"聊天文字修改" on:cfg.textEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(timeSwitchChanged:) target:self title:@"聊天时间修改" on:cfg.timeEnabled]];
