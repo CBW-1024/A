@@ -211,7 +211,7 @@
 @end
 
 @interface WCPayBaseViewController : UIViewController
-- (id)data;
+- (WCPayControlData *)data;
 @end
 
 @interface WCPayTransferMoneyStatusViewController : WCPayBaseViewController
@@ -554,6 +554,8 @@ static void DDJokerSetCachedAmount(CMessageWrap *msg, NSString *amount) {
 static NSInteger gDDTransferDetailCount = 0;
 static BOOL gDDInTransferDetail = NO;
 static NSString *gDDTransferDetailAmount = nil;
+
+static void DDLog(NSString *fmt, ...);
 
 static void DDTransferDetailSetAmount(NSString *amount) {
     gDDTransferDetailAmount = amount.length ? [amount copy] : nil;
