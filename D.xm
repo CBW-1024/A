@@ -2256,7 +2256,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
         return;
     }
 
-    WCUIAlertView *alert = [[%c(WCUIAlertView) alloc] initWithTitle:@"自定义账号" message:nil];
+    WCUIAlertView *alert = [[%c(WCUIAlertView) alloc] initWithTitle:@"自定义账号" message:@"请输入账号如：520\n输入空格隐藏账号\n留空还原"];
     if (!alert) {
         [sender setOn:NO animated:YES];
         return;
