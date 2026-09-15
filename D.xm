@@ -9,8 +9,6 @@
 //  在微信内自定义聊天 / 资料 / 余额等显示
 //  功能：聊天文字、图片、时间、转账改写；运动步数、好友数量；余额 / 零钱通自定义
 //  入口：微信 → 插件入口 → "DD小丑助手"设置页
-//
-//  各功能模块静默运行，不写任何日志。
 // ============================================================
 
 
@@ -350,7 +348,7 @@ static BOOL DDStringHas(const char *haystack, const char *needle) {
 
 #pragma mark - 聊天消息改写（文字 / 图片 / 转账）
 // 长按消息弹出"小丑"菜单：文字改内容与引用标题、图片替换为相册所选图、转账改金额。
-// 改写值按消息 m_uiMesLocalID 缓存到 plist，刷新走 cell/viewModel 重绘。
+// 改写值按消息会话唯一键缓存到 plist，刷新走 cell/viewModel 重绘。
 
 
 static CMessageWrap *JokerGetMessageWrapFromCell(CommonMessageCellView *cell) {
@@ -449,18 +447,18 @@ static NSString * const kDDJokerTimeCacheKey = @"DDJokerTimeCache";
 
 static NSString * const kDDJokerTextOriginalKey = @"DDJokerTextOriginal";
 
-// 关键：localID 只在单个会话内唯一（CMessageMgr.h:136 强制 usrName+localID 二元组定位），
-// 不同会话 localID 各自从 1 递增必然碰撞。必须用 (fromUsr|toUsr|localID) 三元组做全局唯一 key，
-// 否则会串聊——A 会话的改写命中 B 会话同 localID 的消息。
+// localID 仅在单个会话内唯一（CMessageMgr.h:136 强制 usrName+localID 二元组定位），
+// 不同会话的 localID 各自从 1 递增会碰撞。用 (fromUsr|toUsr|localID) 三元组作为全局唯一键，
+// 确保不同会话的改写互不串扰。
 static NSString *DDJokerMessageKey(CMessageWrap *msg) {
     NSString *from = [msg m_nsFromUsr] ?: @"";
     NSString *to   = [msg m_nsToUsr]   ?: @"";
     return [NSString stringWithFormat:@"%@|%@|%u", from, to, [msg m_uiMesLocalID]];
 }
 
-// 转账金额缓存改用 transferid 做全局唯一 key：聊天列表的 CMessageWrap 与详情页
-// m_oSelectedMessageWrap 的 localID/from/to 可能不一致，但同一条转账的 transferid 必然相同
-// （来自 m_nsContent 里的 <transferid>）。用 transferid 才能稳定命中同一笔改写。
+// 转账金额以 transferid 作为全局唯一缓存键：同一条转账在聊天列表与详情页的
+// localID/from/to 可能不一致，但 transferid 必然相同（取自 m_nsContent 的 <transferid>），
+// 用它才能稳定命中同一笔改写。
 static NSString *DDTransferIDFromContent(NSString *xml) {
     if (!xml.length) return nil;
     NSRange ro = [xml rangeOfString:@"<transferid>" options:NSCaseInsensitiveSearch];
@@ -547,11 +545,9 @@ static void DDJokerSetCachedAmount(CMessageWrap *msg, NSString *amount) {
     DDJokerSaveCache(kDDJokerAmountCacheKey, d);
 }
 
-// 转账详情页作用域：仅当某个 WCPayTransferMoneyStatusViewController 存活时为 YES，
-// 取代 MMUILabel 里失效的 responder 链判定（label 在 setText: 时往往尚未挂入层级，
-// 链走不到 VC，导致替换永不触发）。Enter/Leave 与 VC 生命周期 1:1 配对（计数器兼容嵌套），
-// Enter 在 viewDidLoad 一次性设好金额（真机日志证实此时缓存已命中），金额统一经 DDTransferDetailSetAmount
-// 写入，避免赋值语句在多处重复。
+// 转账详情页作用域：由 WCPayTransferMoneyStatusViewController 的存活状态控制，
+// viewDidLoad 时进入（同时取出缓存金额）、dealloc 时退出。金额统一经
+// DDTransferDetailSetAmount 写入，label 每次刷新时实时取用，不依赖刷新时序。
 static NSInteger gDDTransferDetailCount = 0;
 static BOOL gDDInTransferDetail = NO;
 static NSString *gDDTransferDetailAmount = nil;
@@ -986,9 +982,8 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
                                   withTemplate:newAmount];
 }
 
-// 转账详情页金额改写：缓存按 transferid 命中（聊天列表与详情页同一条转账 transferid 相同，
-// 见 DDJokerAmountKey）。用 gDDInTransferDetail 开关做作用域、gDDTransferDetailAmount 存目标金额，
-// 每次 MMUILabel 的 setText:/setAttributedText: 实时查——彻底摆脱 responder 链与刷新时序。
+// 转账详情页金额改写：进入详情页时按 transferid 命中缓存金额并进入作用域；
+// 金额 label 渲染时由 MMUILabel 的 hook 实时改写为目标值。
 %hook WCPayTransferMoneyStatusViewController
 - (void)viewDidLoad {
     DDTransferDetailEnter([self data].m_oSelectedMessageWrap);
@@ -1034,12 +1029,9 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 }
 %end
 
-// 转账详情页金额改写（精确方案，零 view 树遍历）：
-// 用 Flex 锁定真实金额 label 是 MMUILabel（baseClass=UILabel，frame=(0 128; 414 54)），
-// 直接 hook MMUILabel 的 setText:/setAttributedText:，仅当"处于转账详情页作用域(gDDInTransferDetail)
-// + transferEnabled + 文本是 ¥ 金额 + 存在目标金额"时改写。每次 setText: 实时查 gDDTransferDetailAmount，
-// 彻底摆脱 responder 链（setText: 时 label 尚未挂层级，链走不到 VC）与刷新时序。详情页每次重设金额
-// （含状态轮询/刷新/重新布局）都被接住，不闪不还原。该 label enableLongPressCopy=0，长按复制未启用。
+// 转账详情页金额 label 为 MMUILabel，直接 hook 其 setText:/setAttributedText:：
+// 当处于转账详情页作用域、功能开启且文本为 ¥ 金额时，改写为目标金额。
+// 每次 setText: 实时取用最新目标值，覆盖微信的状态刷新与重布局。
 
 %hook MMUILabel
 - (void)setText:(NSString *)text {
@@ -1065,7 +1057,7 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 
 
 @interface DDWeChatImagePickerDelegate : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
-@property (nonatomic, copy) NSString *sessionKey;   // 会话唯一键（from|to|localID），避免跨会话串图
+@property (nonatomic, copy) NSString *sessionKey;   // 会话唯一键（from|to|localID），区分不同会话的图片改写
 @property (nonatomic, weak) id cellView;
 @end
 
@@ -1084,8 +1076,7 @@ static UIImage *DDImageReplacementForMessage(CMessageWrap *msg) {
 
 static UIImageView *DDImageViewFromCell(UIView *cell) {
     if (!cell) return nil;
-    // Flex 实测：图片 view 是 ImageMessageCellView 的 m_imageView ivar（YYAsyncImageView，UIImageView 子类）。
-    // 直接取 ivar，零遍历。
+    // 图片视图为 ImageMessageCellView 的 m_imageView ivar，直接读取，无需遍历。
     Ivar ivar = class_getInstanceVariable([cell class], "m_imageView");
     if (ivar) {
         id value = object_getIvar(cell, ivar);
@@ -1166,7 +1157,7 @@ static void DDImageApplyReplacementToCell(id cell) {
 @implementation DDWeChatImagePickerDelegate
 
 #pragma mark - 系统相册选图回调
-// DDWeChatImagePickerDelegate：选图后落盘到按 sessionKey（from|to|localID）命名的 png，并刷新对应 cell。
+// 选图后落盘到以 sessionKey（from|to|localID）命名的 png，并刷新对应 cell。
 
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<NSString *,id> *)info {
     UIImage *image = info[UIImagePickerControllerOriginalImage];
@@ -1266,8 +1257,7 @@ static double DDTimeStampFromString(NSString *s) {
 }
 %new
 - (UILabel *)dk_timeLabel {
-    // Flex 实测：时间 label 即 ChatTimeCellView 的 m_timeLabel ivar（MMUILabel，文本如 "昨天 15:56"）。
-    // 直接取 ivar，零遍历。
+    // 时间 label 为 ChatTimeCellView 的 m_timeLabel ivar，直接读取，无需遍历。
     Ivar iv = class_getInstanceVariable([self class], "m_timeLabel");
     if (iv) {
         id v = object_getIvar(self, iv);
@@ -1422,7 +1412,7 @@ typedef NS_ENUM(NSInteger, DDBalancePageKind) {
 };
 
 // 页面判定：沿响应链上溯，命中的第一条规则即返回。
-//   钱包页单元格（Flex 实证）：祖先 accessibilityIdentifier balance_cell -> 余额，lqt_cell -> 零钱通
+//   钱包页单元格：祖先 accessibilityIdentifier 为 balance_cell -> 余额，lqt_cell -> 零钱通
 //   详情/服务页（VC description）：balanceEntryUIPage / WCPayMainViewControllerV2 -> 余额，lqtDetailUIPage -> 零钱通
 static DDBalancePageKind DDBalancePageKindOf(id sn) {
     @try {
@@ -1452,7 +1442,7 @@ static DDBalancePageKind DDBalancePageKindOf(id sn) {
 }
 
 
-// 帧修正专用判定：只认钱包页零钱/零钱通行特有的 cell 标识符（Flex 实证），
+// 帧修正专用判定：只认钱包页零钱/零钱通单元格的标识符，
 // 不认任何 VC，避免把微信支付总页（WCPayMainViewControllerV2 等）下其他页面的
 // TimeoutNumber 也卷进 frame 重设（那种布局不同，强行右对齐会把数字顶没）。
 static DDBalancePageKind DDBalanceCellKindOf(id sn) {
@@ -1495,7 +1485,7 @@ static DDBalancePageKind DDBalanceResolveKind(id v) {
     return DDBalancePageKindOf(DDBalanceAnchorOf(v));
 }
 
-// 修帧判定（窄）：只认 Flex 实证的两个钱包页单元格 balance_cell（零钱）/ lqt_cell（零钱通）。
+// 修帧判定（窄）：只认钱包页两个金额单元格 balance_cell（零钱）/ lqt_cell（零钱通）。
 //   这两个 cell 的金额行右侧有箭头，改值后数字变长会右溢盖住它，才需要重排；
 //   服务页钱包入口、零钱 / 零钱通详情页的金额本来就不顶格，动它们的 frame 反而会被推歪。
 static DDBalancePageKind DDBalanceFixKindFor(id v) {
@@ -1513,7 +1503,7 @@ static BOOL DDBalanceWantFenFor(id v, DDBalancePageKind kind, unsigned long long
     return NO;
 }
 
-// 钱包页金额行右侧箭头 + 间距占用的宽度（实测不压箭头，沿用 28pt 右缘边距常量）。
+// 钱包页金额行右侧箭头 + 间距占用的宽度，沿用 28pt 右缘边距常量（不压箭头）。
 static const CGFloat kDDWalletArrowGap = 28.0;
 
 // frame 是否已够接近（避免重复赋值触发 Kinda 反复重排 → 闪烁）
@@ -1633,7 +1623,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
         UIView *sn = [self scrollNumber];
         if (![sn isKindOfClass:[UIView class]]) return;
         // 几何加固（必须放在改动任何 frame 之前，否则"拦了但宽度已经改过"，等于没拦）：
-        //   钱包页金额行在 cell 内（实测父宽 180.67 / 127.67）。父容器接近全宽的必然是
+        //   钱包页金额行位于 cell 内，父容器宽度有限；父容器接近全宽的必然是
         //   零钱/零钱通详情页那种居中的大数字，一旦右对齐就会被推到屏幕边上。
         UIView *sp = self.superview;
         if (!sp) return;
@@ -1651,7 +1641,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
         // ③ 自身右对齐：右缘钉在 superview 宽度 - 箭头区(28)，数字往左长 → 永远压不到箭头
         CGRect selfF = self.frame;
         CGFloat newX = spW - kDDWalletArrowGap - sz.width;
-        // 兜底：算出的位置越过左边界（或 superview 宽度异常）就退化为"右缘原地不动"
+        // 越界处理：算出的位置越过左边界（或 superview 宽度异常）时退化为"右缘原地不动"
         if (spW <= 0 || newX < 0) newX = (selfF.origin.x + selfF.size.width) - sz.width;
         CGRect selfNew = CGRectMake(newX, selfF.origin.y, sz.width, selfF.size.height);
         if (!DDBalanceFrameNear(selfF, selfNew)) self.frame = selfNew;
@@ -2135,7 +2125,7 @@ static AddContactToChatRoomViewController *DDProfileVCForTable(id tableViewInfo)
     return vc;
 }
 
-// 与 DD小丑资料助手「自定义头像」同一套插入机制：在重建表格的同一次 runloop 内插到 At:1（资料卡正下方），不产生第二帧。
+// 在微信重建表格的同一次 runloop 内将入口插入到位置 At:1（资料卡正下方），不产生额外帧。
 static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *vc, BOOL reloadNow) {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     if (!cfg.avatarEnabled && !cfg.friendWxidEnabled) return;
@@ -2178,9 +2168,8 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 
 %hook WCTableViewManager
 
-// 主力路径：微信重建表格走 clearAllSection → addSection ×N。
-// 首个 addSection 回调时资料卡已加回，此刻同步插到 At:1，
-// 与重建在同一 runloop 内完成，微信随后的一次 reloadData 即带出该行，不产生第二帧。
+// 微信重建表格走 clearAllSection → addSection ×N；首个 addSection 回调时资料卡已加回，
+//   此刻同步插入到 At:1，与重建在同一 runloop 内完成，随后一次 reloadData 即带出该行。
 - (void)addSection:(id)a0 {
     %orig;
     if (!a0) return;
@@ -2193,10 +2182,8 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 
 %hook AddContactToChatRoomViewController
 
-// s_profileVC 必须在 %orig 之前赋值：
-// 微信在 super viewDidLoad 内部就完成表格装配（addSection ×7），
-// 若等到 %orig 之后再赋值，装配期的 addSection 钩子会被判为"不是我的表"而全部跳过，
-// 只能退到 viewDidAppear 才补插——这就是开关"过一下才出现"的原因。
+// s_profileVC 须在 %orig 之前赋值：微信在 super viewDidLoad 内部即完成表格装配，
+//   若晚于 %orig 赋值，装配期的 addSection 钩子会无法识别本表而跳过，需退到 viewWillAppear 才补插。
 - (void)viewDidLoad {
     s_profileVC = self;
     %orig;
@@ -2208,8 +2195,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
     [self dd_injectProfileSection];   // 表格已装配完、页面尚未显示，首帧即带开关
 }
 
-// 转场动画开始前再确认一次：若微信在 %orig 里又重建了一次表格，此处补回；
-// 正常情况下已被 addSection 插好，这里被去重挡住。
+// 转场前再确认一次：若微信在 %orig 内又重建表格，此处补插（已插入时由查重跳过）。
 - (void)viewWillAppear:(BOOL)animated {
     s_profileVC = self;
     %orig;
@@ -2278,8 +2264,8 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
     [alert showTextFieldWithMaxLen:32];
     [alert setTextFieldDefaultText:[contact m_nsAliasName] ?: @""];
 
-    // 写法对齐 DD小丑助手（已实测）：无参 block + __block 强持有，回调末尾置 nil 打破循环。
-    // getTextField 必须等 show 之后才有，这里直接 getTextFieldText 取文本，绕开时序。
+    // 无参 block 配合 __block 强持有，回调末尾置 nil 打破循环；
+    //   getTextField 需在 show 之后才有，故直接 getTextFieldText 取文本。
     __block WCUIAlertView *blockAlert = alert;
     __weak UISwitch *weakSw = sender;
 
