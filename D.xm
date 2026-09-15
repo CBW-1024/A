@@ -1728,7 +1728,7 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
 
 
 
-#pragma mark - 好友帐号自定义（按用户名，聊天详情页逐人设置）
+#pragma mark - 好友账号自定义（按用户名，聊天详情页逐人设置）
 
 static NSString * const kDDFriendWxidChangedNotification = @"DDFriendWxidChanged";
 
@@ -1954,7 +1954,7 @@ static UIViewController *DDTopPresentedViewController(UIViewController *vc) {
 
 @end
 
-#pragma mark - 自定义自己帐号（只改自己）
+#pragma mark - 自定义自己账号（只改自己）
 
 static NSString *DDCustomWxid(void) {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
@@ -1964,11 +1964,11 @@ static NSString *DDCustomWxid(void) {
     return value;
 }
 
-#pragma mark - 数据源（微信「帐号」统一拦截）
+#pragma mark - 数据源（微信「账号」统一拦截）
 
 %hook CBaseContact
 
-// CBaseContact.h:12 —— m_nsAliasName 即「帐号」。
+// CBaseContact.h:12 —— m_nsAliasName 即「账号」。
 // 好友：查自定义表，命中返回自定义值（空串＝隐藏），未命中回原值。
 - (id)m_nsAliasName {
     NSString *alias = DDFriendWxidForUser([self m_nsUsrName]);
@@ -2097,7 +2097,7 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 
 %end
 
-#pragma mark - 聊天详情页「自定义头像 / 自定义帐号」入口
+#pragma mark - 聊天详情页「自定义头像 / 自定义账号」入口
 
 static NSString * const kDDProfileChangedNotification = @"DDProfileContentChanged";
 
@@ -2257,7 +2257,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
     }
 
     WCUIAlertView *alert = [[%c(WCUIAlertView) alloc] initWithTitle:@"
-自定义账号" message:nil];
+设置用户账号" message:nil];
     if (!alert) {
         [sender setOn:NO animated:YES];
         return;
@@ -2431,7 +2431,7 @@ static BOOL DDHideChatName(void) {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     Class cellCls = %c(WCTableViewCellManager);
 
-    WCTableViewSectionManager *chatSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"聊天设置"];
+    WCTableViewSectionManager *chatSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"聊天小丑"];
     chatSection.footerTitle = @"开启后长按需要修改的聊天消息，在弹窗菜单点「小丑」即可修改：文字内容与引用、替换为相册图片、显示时间、转账金额";
     [chatSection addCell:[cellCls switchCellForSel:@selector(textSwitchChanged:) target:self title:@"聊天文字修改" on:cfg.textEnabled]];
     [chatSection addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
@@ -2500,7 +2500,7 @@ static BOOL DDHideChatName(void) {
         [profileSection addCell:contactsSubCell];
     }
 
-    [profileSection addCell:[cellCls switchCellForSel:@selector(wxidSwitchChanged:) target:self title:@"备注自己账号" on:cfg.wxidEnabled]];
+    [profileSection addCell:[cellCls switchCellForSel:@selector(wxidSwitchChanged:) target:self title:@"设置自己账号" on:cfg.wxidEnabled]];
     if (cfg.wxidEnabled) {
         self.wxidField = [[UITextField alloc] init];
         NSString *currentWxid = cfg.wxidValue.length ? cfg.wxidValue : @"";
@@ -2514,7 +2514,7 @@ static BOOL DDHideChatName(void) {
         [profileSection addCell:wxidSubCell];
     }
 
-    [profileSection addCell:[cellCls switchCellForSel:@selector(friendWxidSwitch:) target:self title:@"备注用户账号" on:cfg.friendWxidEnabled]];
+    [profileSection addCell:[cellCls switchCellForSel:@selector(friendWxidSwitch:) target:self title:@"设置用户账号" on:cfg.friendWxidEnabled]];
 
     [profileSection addCell:[cellCls switchCellForSel:@selector(hideChatNameSwitch:) target:self title:@"隐藏顶栏名字" on:cfg.hideChatName]];
 
@@ -2618,7 +2618,7 @@ static BOOL DDHideChatName(void) {
 }
 
 - (void)wxidConfirm:(id)sender {
-    // 原样保存：空＝不覆盖，空格＝空白帐号（隐藏），其他＝自定义值
+    // 原样保存：空＝不覆盖，空格＝空白账号（隐藏），其他＝自定义值
     [DDGlobalConfig shared].wxidValue = self.wxidField.text ?: @"";
     [self.wxidField resignFirstResponder];
     [self buildTable];
