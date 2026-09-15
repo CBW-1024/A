@@ -1,20 +1,16 @@
+//  DD小丑助手  (WeChat Jailbreak Tweak, Theos/Logos 单文件)
+//  在微信内自定义聊天 / 资料 / 余额等显示
+//  功能：聊天文字、图片、时间、转账改写；运动步数、好友数量；余额 / 零钱通自定义；微信账号 / 头像自定义
+//  入口：微信 → 插件入口 → "DD小丑助手"设置页
+
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <substrate.h>
 #include <string.h>
 
-// ============================================================
-//  DD小丑助手  (WeChat Jailbreak Tweak, Theos/Logos 单文件)
-//  在微信内自定义聊天 / 资料 / 余额等显示
-//  功能：聊天文字、图片、时间、转账改写；运动步数、好友数量；余额 / 零钱通自定义
-//  入口：微信 → 插件入口 → "DD小丑助手"设置页
-// ============================================================
-
-
 #pragma mark - 微信类声明
 // 本插件 hook 的微信原生类与方法签名，均锚定微信 .h 头文件 dump。
-
 
 @interface WCUIAlertView : NSObject
 - (id)initWithTitle:(id)a0 message:(id)a1;
@@ -339,12 +335,6 @@ static BOOL DDStringHas(const char *haystack, const char *needle) {
     NSString *n = [[NSString stringWithUTF8String:needle] lowercaseString];
     return (h && n) ? ([h rangeOfString:n].location != NSNotFound) : NO;
 }
-
-
-
-
-
-
 
 #pragma mark - 聊天消息改写（文字 / 图片 / 转账）
 // 长按消息弹出"小丑"菜单：文字改内容与引用标题、图片替换为相册所选图、转账改金额。
@@ -1055,7 +1045,6 @@ static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *overrid
 #pragma mark - 聊天图片改写
 // hook ImageMessageCellView 各渲染入口注入替换图；相册选图回调见下一段。
 
-
 @interface DDWeChatImagePickerDelegate : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
 @property (nonatomic, copy) NSString *sessionKey;   // 会话唯一键（from|to|localID），区分不同会话的图片改写
 @property (nonatomic, weak) id cellView;
@@ -1440,7 +1429,6 @@ static DDBalancePageKind DDBalancePageKindOf(id sn) {
     } @catch (NSException *e) {}
     return DDBalancePageNone;
 }
-
 
 // 帧修正专用判定：只认钱包页零钱/零钱通单元格的标识符，
 // 不认任何 VC，避免把微信支付总页（WCPayMainViewControllerV2 等）下其他页面的
