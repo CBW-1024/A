@@ -2256,8 +2256,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
         return;
     }
 
-    WCUIAlertView *alert = [[%c(WCUIAlertView) alloc] initWithTitle:@"
-设置用户账号" message:nil];
+    WCUIAlertView *alert = [[%c(WCUIAlertView) alloc] initWithTitle:@"自定义账号" message:nil];
     if (!alert) {
         [sender setOn:NO animated:YES];
         return;
