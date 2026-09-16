@@ -39,11 +39,16 @@
  *        **磁盘上那份 ProtobufLite 二进制有没有被 Icsign 注入 WCRefine**
  *        （注入后 Mach-O 会多一条指向 WCRefine.dylib 的 LC_LOAD_DYLIB）。
  *  实测微信 8.0.78 的 Frameworks/ 只有 ProtobufLite.framework（无 ProtobufLite3），
- *  且其依赖表里没有 WCRefine → 原始包下返回 NO，故设置页提示"需注入"。
+ *  且其依赖表里没有 WCRefine → 原始包下返回 NO，故未注入时功能不挂载。
+ *
+ *  ── 纯本地运行形态 ───────────────────────────────────────────────────────
+ *  · 无云控（0x148236c 已删除）；无本地开关；无设置页 UI。
+ *  · 功能默认生效：主 App 进程在 ShouldInstall 通过后自动选第一个可用应用组并写 marker，
+ *    扩展进程（NSE / 分享）靠 marker 反查主 App 选定组，三类功能（通知详情/头像/分享跳转）即生效。
  *
  *  ── 私有函数（本文件按原样重建）─────────────────────────────────────────
  *  0x8f5490  WCRCurrentGroupID        扩展:0x8f3f40(nil)  主App:0x1481ec0
- *  0x8f4b9c  WCRFixActive             扩展:当前组非空    主App:config.sideloadShareFixEnabled
+ *  0x8f4b9c  WCRFixActive             扩展:当前组非空    主App:默认 YES（纯本地，无开关）
  *  0x8f4cd0  WCRShouldRemapGroup      空→NO；在可用组里→YES；hasPrefix "group.com.tencent."→YES
  *  0x8f4e50  WCRRemappedContainerURL  LSBundleProxy.groupContainerURLs[gid] → 回退原 IMP
  *  0x8f3f40  WCRRemapGroupID          扩展进程：扫所有容器找 marker，得到主 App 选定的组
@@ -72,6 +77,15 @@
 #import <stdio.h>
 #import <string.h>
 #import <stdlib.h>
+
+/* 手动声明 WCPluginsMgr 接口（DD收款助手同款插件管理器；用户确认在 8.0.78 真实存在，
+ * 故不再走 objc_getClass 运行期取类，改为编译期静态调用）。 */
+@interface WCPluginsMgr : NSObject
++ (instancetype)sharedInstance;
+- (void)registerControllerWithTitle:(NSString *)title
+                            version:(NSString *)version
+                         controller:(NSString *)controller;
+@end
 
 #pragma mark - 常量（全部来自 __cstring / __cfstring）
 
@@ -121,7 +135,6 @@ static NSString * const kWCRInfoPlistName        = @"Info.plist";           // @
 static NSString * const kWCRBundleExecutableKey  = @"CFBundleExecutable";   // @0x22bf7a0
 
 /* 配置键（WCRefineConfig，classref @0x238f810） */
-static NSString * const kWCRCfgEnabled  = @"sideloadShareFixEnabled";
 static NSString * const kWCRCfgGroupID  = @"sideloadShareFixAppGroupId";
 
 #pragma mark - 前向声明
@@ -130,7 +143,6 @@ static NSString *WCRPreferredHostBinaryPath(void);
 static NSArray<NSString *> *WCRApplicationGroupIDs(void);
 static NSString *WCRMarkerGroupID(void);
 static BOOL WCRWriteGroupMarker(NSString *groupID);
-static void WCRClearGroupMarker(void);
 static NSString *WCRResolvedGroupID(void);
 static NSString *WCRCurrentGroupID(void);
 static BOOL WCRFixActive(void);
@@ -141,9 +153,7 @@ static NSArray<NSString *> *WCRCachedAvailableGroups(void);
 static void WCREnsureDirectory(NSString *path);
 static BOOL WCRPreferredHostLinked(void);
 static BOOL WCRShouldInstall(void);
-static NSString *WCRStatusText(void);
-static void WCRApplySelectedGroupID(NSString *groupID);
-static void WCRPresentGroupPickerOn(UIViewController *presenter);
+static void WCRSelectGroup(NSString *groupID);          /* 设置页选组：写 picked + marker + 清缓存 */
 
 #pragma mark - 运行时状态（一一对应 WCR 的 __DATA,__bss 槽位）
 
@@ -402,15 +412,6 @@ static BOOL WCRWriteGroupMarker(NSString *groupID) {
     return ok;
 }
 
-/* 0x14810f8 */
-static void WCRClearGroupMarker(void) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    for (NSURL *mu in WCRMarkerFileURLs()) {
-        [fm removeItemAtURL:mu error:NULL];
-    }
-    gCachedRemappedGroup = nil;
-}
-
 #pragma mark - 配置
 
 static Class WCRConfigClass(void) {
@@ -428,24 +429,9 @@ static id WCRConfig(void) {
 #pragma clang diagnostic pop
 }
 
-static BOOL WCRFixEnabledFromConfig(void) {
-    id cfg = WCRConfig();
-    if (!cfg) return NO;
-    if (![cfg respondsToSelector:NSSelectorFromString(kWCRCfgEnabled)]) return NO;
-    return [[cfg valueForKey:kWCRCfgEnabled] boolValue];
-}
-
-static void WCRSetFixEnabledInConfig(BOOL on) {
-    id cfg = WCRConfig();
-    if (!cfg) return;
-    if ([cfg respondsToSelector:NSSelectorFromString(@"setSideloadShareFixEnabled:")]) {
-        [cfg setValue:@(on) forKey:kWCRCfgEnabled];
-    } else {
-        [[NSUserDefaults standardUserDefaults] setBool:on forKey:kWCRCfgEnabled];
-        [[NSUserDefaults standardUserDefaults] synchronize];
-    }
-}
-
+/* 纯本地版：功能默认生效，无开关、无设置界面。
+ * WCR 原版此处读 WCRefineConfig.sideloadShareFixEnabled（@0x8f4c30），
+ * 独立插件版去掉该开关，主 App 分支统一走 WCRShouldInstall 的宿主检查后默认放行。 */
 static NSString *WCRPickedGroupID(void) {
     id cfg = WCRConfig();
     id v = [cfg respondsToSelector:NSSelectorFromString(kWCRCfgGroupID)]
@@ -711,7 +697,7 @@ static BOOL WCRFixActive(void) {
     if (WCRIsGroupRemapExtensionProcess()) {
         return WCRCurrentGroupID().length > 0;   /* 扩展：有解析出组就生效 */
     }
-    return WCRFixEnabledFromConfig();            /* 主 App：跟随开关 */
+    return YES;                                  /* 主 App：无开关，默认生效 */
 }
 
 /* 0x8f54e4 —— 带缓存的可用组列表 */
@@ -1077,10 +1063,28 @@ static void WCRInstallOtherHooks(void) {
 static BOOL WCRShouldInstall(void) {
     if (WCRIsShareExtensionProcess()) return YES;             /* 0x1482108 分支 */
     if (WCRIsNotificationServiceProcess()) return YES;        /* 0x148230c 分支 */
-    if (!WCRFixEnabledFromConfig()) return NO;
     if (!WCRPreferredHostLinked()) return NO;                 /* 0x14804f8 */
-    return YES;   /* 纯本地运行，不接 WCR 私有云控（原函数 0x148236c） */
+    return YES;   /* 纯本地运行：无开关，默认生效（原函数 0x148236c 云控点已删除） */
 }
+
+/* 设置页「选择分组」：把用户选定的应用组固化下来并立刻生效（对应 WCR 原版
+ * 0x1482888 WCRSideloadFixApplySelectedGroupID 的写入部分）。扩展进程（NSE /
+ * 分享扩展）下次启动扫 marker 时才切换到新组，故选完需杀对应进程后重开微信。 */
+static void WCRSelectGroup(NSString *groupID) {
+    if (![groupID isKindOfClass:[NSString class]] || groupID.length == 0) return;
+    if (![WCRApplicationGroupIDs() containsObject:groupID]) return;   /* 只接受当前包声明过的组 */
+
+    WCRSetPickedGroupID(groupID);          /* 写 sideloadShareFixAppGroupId（NSUserDefaults / WCRefineConfig） */
+    WCRWriteGroupMarker(groupID);          /* 写进所有可用容器，供扩展进程反向查组 */
+
+    /* 清缓存，让下一次容器访问按新组重新解析（0x8f3f40 / 0x8f4e50 的 memo） */
+    gCachedRemappedGroup  = nil;
+    gCachedAvailableGroups = nil;
+    gCachedContainerURL   = nil;
+    gCachedContainerGroup = nil;
+}
+
+#pragma mark - 安装流程
 
 /* 0x8f3508 —— 完整安装流程 */
 static void WCRSideloadFixInstall(void) {
@@ -1099,175 +1103,132 @@ static void WCRSideloadFixInstall(void) {
         return;
     }
 
-    /* 主 App：把当前选定的应用组写进所有可用容器的 marker 文件 */
+    /* 主 App：把当前选定的应用组写进所有可用容器的 marker 文件。
+     * 纯本地版默认生效，未选组时自动选第一个可用组；
+     * 可在微信「插件」页的「自签修复」设置界面手动切换分组（多开防串号）。 */
     NSString *gid = WCRResolvedGroupID();                      /* 0x8f3574 */
+    if (gid.length == 0) {
+        NSArray<NSString *> *ids = WCRApplicationGroupIDs();   /* 自动选第一个 */
+        if (ids.count) {
+            WCRSetPickedGroupID(ids.firstObject);
+            gid = ids.firstObject;
+        }
+    }
     if (gid.length > 0) WCRWriteGroupMarker(gid);              /* 0x8f35b8 */
 
     WCRInstallOtherHooks();                                    /* 0x8f3614 */
 }
 
-#pragma mark - 应用组选择（对应 0x1482b10 PresentGroupPicker / 0x1482888 ApplySelectedGroupID）
+#pragma mark - 设置界面（参考 DD收款助手：父 cell 展开 + 子 cell 选择）
 
-static void WCRApplySelectedGroupID(NSString *gid) {            /* 0x1482888 */
-    WCRSetPickedGroupID(gid);
-    gCachedRemappedGroup = nil;
-    gCachedAvailableGroups = nil;
-    gCachedContainerURL = nil;
-    gCachedContainerGroup = nil;
-    if (gid.length) WCRWriteGroupMarker(gid);
+/* 单 section、单父 cell「证书分组（应用组）」，点按展开成应用组列表，
+ * 点子 cell 即选定该组。沿用 DD 收款助手的交互模式，但底层用原生 UITableView
+ * —— 8.0.78 的 WCTableViewManager initWithFrame:style: 第二参是 CGSize（DD 那版
+ * 微信 76 是 NSInteger/UITableViewStyle），照搬会 ABI 错位崩溃，故不依赖微信内部表格类。 */
+@interface WCRSideloadFixSettingsViewController : UIViewController <UITableViewDelegate, UITableViewDataSource>
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic) BOOL expanded;
+@end
+
+@implementation WCRSideloadFixSettingsViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"自签修复";
+
+    /* 与 DD 收款助手一致的导航栏外观：去底部分割线 */
+    if (@available(iOS 13.0, *)) {
+        UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+        [appearance configureWithDefaultBackground];
+        appearance.shadowColor = nil;
+        self.navigationItem.standardAppearance   = appearance;
+        self.navigationItem.scrollEdgeAppearance = appearance;
+        self.navigationItem.compactAppearance    = appearance;
+    }
+
+    self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds
+                                                  style:UITableViewStyleInsetGrouped];
+    self.tableView.autoresizingMask =
+        UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.tableView.delegate   = self;
+    self.tableView.dataSource = self;
+    self.tableView.tableFooterView = [[UIView alloc] initWithFrame:CGRectZero];
+    [self.view addSubview:self.tableView];
+    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
 }
 
-static NSString *WCRStatusText(void) {
-    NSArray *ids = WCRApplicationGroupIDs();
-    if (ids.count == 0) {
-        return @"当前包没有应用组权限。请确认描述文件或签名含 application-groups。";
-    }
-    NSMutableArray *parts = [NSMutableArray array];
-    [parts addObject:[NSString stringWithFormat:@"应用组权限：%lu 个",
-                      (unsigned long)ids.count]];
-    NSString *cur = WCRResolvedGroupID();
-    [parts addObject:[NSString stringWithFormat:@"当前应用组：%@",
-                      cur.length ? cur : @"无应用组"]];
-    if (!WCRPreferredHostLinked()) {
-        /* 与 0x14804f8 的判定口径一致：没把 WCRefine 注进宿主二进制 */
-        NSString *host = WCRPreferredHostBinaryPath();
-        if (host.length) {
-            [parts addObject:[NSString stringWithFormat:
-                @"宿主 %@ 未注入 WCRefine，请用 Icsign 注入后再试。",
-                host.lastPathComponent]];
-        } else {
-            [parts addObject:@"未找到 ProtobufLite3 / ProtobufLite，请用 Icsign 注入后再试。"];
-        }
-    }
-    [parts addObject:@"多开请选不同应用组，防止串号。"];
-    return [parts componentsJoinedByString:@"\n"];
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 1; }
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return self.expanded ? (1 + [WCRApplicationGroupIDs() count]) : 1;
 }
 
-static void WCRPresentGroupPickerOn(UIViewController *presenter) {
-    NSArray<NSString *> *ids = WCRApplicationGroupIDs();
-    UIAlertController *ac =
-        [UIAlertController alertControllerWithTitle:@"选择你的应用组"
-                                            message:WCRStatusText()
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
-    if (ids.count == 0) {
-        [ac addAction:[UIAlertAction actionWithTitle:@"无应用组"
-                                               style:UIAlertActionStyleDefault
-                                             handler:nil]];
-    }
-    for (NSString *gid in ids) {
-        NSString *title = [gid isEqualToString:WCRPickedGroupID()]
-                        ? [NSString stringWithFormat:@"✓ %@", gid] : gid;
-        [ac addAction:[UIAlertAction actionWithTitle:title
-                                               style:UIAlertActionStyleDefault
-                                             handler:^(UIAlertAction * _Nonnull a) {
-            WCRApplySelectedGroupID(gid);
-        }]];
-    }
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消"
-                                           style:UIAlertActionStyleCancel
-                                         handler:nil]];
-    if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
-        UIPopoverPresentationController *pop = ac.popoverPresentationController;
-        pop.sourceView = presenter.view;
-        pop.sourceRect = CGRectMake(CGRectGetMidX(presenter.view.bounds),
-                                    CGRectGetMidY(presenter.view.bounds), 0, 0);
-    }
-    [presenter presentViewController:ac animated:YES completion:nil];
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    return @"即签名证书中的 application-groups。多开请选不同应用组，防止串号。";
 }
 
-#pragma mark - 主 App 设置页入口
-
-%group WCRMainAppGroup
-
-%hook NewSettingViewController
-
-- (void)reloadTableData {
-    %orig;
-    /* Logos 只会生成 @class NewSettingViewController;（前向声明），
-     * 直接 [self respondsToSelector:] 会报
-     * "receiver type ... for instance message is a forward declaration"。
-     * 先经 (id) 中转再 cast，绕开静态类型检查，运行期完全等价。 */
-    UIViewController *vc = (UIViewController *)(id)self;
-    if (![(id)self isKindOfClass:[UIViewController class]]) return;
-    if (![(id)self respondsToSelector:@selector(navigationItem)]) return;
-
-    if (objc_getAssociatedObject(vc, @selector(reloadTableData))) return;
-    objc_setAssociatedObject(vc, @selector(reloadTableData), @YES,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    vc.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"自签修复"
-                                         style:UIBarButtonItemStylePlain
-                                        target:vc
-                                        action:@selector(wcr_openSideloadFix)];
-}
-
-%new
-- (void)wcr_openSideloadFix {
-    UIViewController *vc = (UIViewController *)(id)self;
-    __weak typeof(vc) weakVC = vc;
-
-    UIAlertController *ac = [UIAlertController
-        alertControllerWithTitle:@"自签修复"
-                         message:WCRStatusText()
-                  preferredStyle:UIAlertControllerStyleActionSheet];
-
-    [ac addAction:[UIAlertAction
-        actionWithTitle:(WCRFixEnabledFromConfig() ? @"关闭修复" : @"开启修复")
-                  style:UIAlertActionStyleDefault
-                handler:^(UIAlertAction * _Nonnull action) {
-        BOOL next = !WCRFixEnabledFromConfig();
-        WCRSetFixEnabledInConfig(next);
-        if (!next) { WCRClearGroupMarker(); return; }
-
-        NSArray *ids = WCRApplicationGroupIDs();
-        if (ids.count == 0) { WCRPresentGroupPickerOn(weakVC); return; }
-        if (WCRPickedGroupID().length == 0) WCRApplySelectedGroupID(ids.firstObject);
-
-        UIAlertController *tip = [UIAlertController
-            alertControllerWithTitle:@"已更新修复自签分享"
-                             message:@"需杀进程后重开微信"
-                      preferredStyle:UIAlertControllerStyleAlert];
-        [tip addAction:[UIAlertAction actionWithTitle:@"好"
-                                               style:UIAlertActionStyleDefault
-                                             handler:nil]];
-        [weakVC presentViewController:tip animated:YES completion:nil];
-    }]];
-
-    [ac addAction:[UIAlertAction actionWithTitle:@"选择应用组"
-                                           style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction * _Nonnull action) {
-        WCRPresentGroupPickerOn(weakVC);
-    }]];
-
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消"
-                                           style:UIAlertActionStyleCancel
-                                         handler:nil]];
-
-    if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
-        UIPopoverPresentationController *pop = ac.popoverPresentationController;
-        pop.sourceView = vc.view;
-        pop.sourceRect = CGRectMake(CGRectGetMidX(vc.view.bounds),
-                                    CGRectGetMidY(vc.view.bounds), 0, 0);
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"WCRCell"];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1
+                                      reuseIdentifier:@"WCRCell"];
     }
-    [vc presentViewController:ac animated:YES completion:nil];
+    NSArray<NSString *> *groups = WCRApplicationGroupIDs();
+    NSString *picked = WCRPickedGroupID();
+
+    if (indexPath.row == 0) {
+        cell.textLabel.text = @"证书分组（应用组）";
+        cell.detailTextLabel.text = picked.length ? picked : @"未选择";
+        cell.accessoryType = self.expanded ? UITableViewCellAccessoryNone
+                                           : UITableViewCellAccessoryDisclosureIndicator;
+    } else {
+        NSString *gid = groups[indexPath.row - 1];
+        cell.textLabel.text = gid;
+        cell.detailTextLabel.text = nil;
+        cell.accessoryType = [gid isEqualToString:picked]
+                             ? UITableViewCellAccessoryCheckmark
+                             : UITableViewCellAccessoryNone;
+    }
+    return cell;
 }
 
-%end
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
 
-%end // WCRMainAppGroup
+    if (indexPath.row == 0) {
+        self.expanded = !self.expanded;
+        [tableView reloadSections:[NSIndexSet indexSetWithIndex:0]
+                 withRowAnimation:UITableViewRowAnimationAutomatic];
+        return;
+    }
+
+    NSString *gid = [WCRApplicationGroupIDs() objectAtIndex:indexPath.row - 1];
+    WCRSelectGroup(gid);                  /* 写 picked + marker + 清缓存，立刻生效 */
+    self.expanded = NO;
+    [tableView reloadSections:[NSIndexSet indexSetWithIndex:0]
+             withRowAnimation:UITableViewRowAnimationAutomatic];
+}
+
+@end
 
 #pragma mark - 构造
 
 %ctor {
     @autoreleasepool {
         /* WCR 在 0x8f3508 里同样是"先判定进程/开关，再装 hook"，
-         * 且所有 hook 都在**主 App 与扩展进程**里都装（由 WCRFixActive 运行期决定生效）。
-         * 因此这里不做进程分流的 %init，只按 WCR 的顺序执行安装。 */
+         * 所有 hook 在主 App 与扩展进程里都会装（由 WCRFixActive 运行期决定生效）。
+         * 纯本地版默认生效，这里只按 WCR 顺序执行安装。 */
         WCRSideloadFixInstall();
 
-        if (!WCRIsGroupRemapExtensionProcess()) {
-            %init(WCRMainAppGroup);
+        /* 插件入口：照搬 DD收款助手 的 WCPluginsMgr 注册方式。
+         * WCPluginsMgr 已在文件顶部手动声明（用户确认存在于 8.0.78），
+         * 直接编译期调用 [WCPluginsMgr sharedInstance]，不再走 objc_getClass。
+         * 用户在微信「插件」页点「自签修复」即进入上面的设置界面。 */
+        WCPluginsMgr *mgr = [WCPluginsMgr sharedInstance];
+        if (mgr && [mgr respondsToSelector:@selector(registerControllerWithTitle:version:controller:)]) {
+            [mgr registerControllerWithTitle:@"自签修复"
+                                     version:@"1.0.0"
+                                  controller:@"WCRSideloadFixSettingsViewController"];
         }
     }
 }
