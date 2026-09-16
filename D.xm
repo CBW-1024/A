@@ -1075,8 +1075,22 @@ static void WCRInstallOtherHooks(void) {
 static BOOL WCRShouldInstall(void) {
     if (WCRIsShareExtensionProcess()) return YES;             /* 0x1482108 分支 */
     if (WCRIsNotificationServiceProcess()) return YES;        /* 0x148230c 分支 */
-    if (!WCRPreferredHostLinked()) return NO;                 /* 0x14804f8 */
-    return YES;   /* 纯本地运行：无开关，默认生效（原函数 0x148236c 云控点已删除） */
+
+    /* 纯本地运行：无开关，默认生效（原函数 0x148236c 云控点已删除）。
+     *
+     * 注意：原版 WCR 这里还有一行 `if (!WCRPreferredHostLinked()) return NO;`
+     * —— 那是给「WCRefine.dylib 被静态链接进重打包宿主（Mach-O 的 LC_LOAD_DYLIB
+     * 表里出现 "WCRefine"）」的场景用的。我们这是 Theos/Substrate 运行时注入的
+     * 独立 tweak，宿主微信二进制的 LC_LOAD_DYLIB 里不会有 "WCRefine" /
+     * "WCRSideloadFix"，于是 WCRMachOLinksWCRefine() 恒返回 NO，若保留该行会导致
+     * 主 App 分支 WCRShouldInstall() 返回 NO → WCRSideloadFixInstall 提前 return、
+     * 一个 marker 都不写 → 扩展进程 WCRCurrentGroupID() 恒为 nil →
+     * WCRFixActive() 在扩展里恒 NO → 通知详情 / 通知头像 / 修复分享 全部失效。
+     *
+     * 参考 zxPluginsInject.dylib（同款自签修复实现）：其 getAppGroupPathIfExists
+     * 完全不门控宿主链接，直接用 LSBundleProxy 无条件重定向。我们的独立版同理，
+     * 宿主链接检查对运行时注入无效，必须去掉，才能落到默认生效。 */
+    return YES;
 }
 
 /* 设置页「选择分组」：把用户选定的应用组固化下来并立刻生效（对应 WCR 原版
