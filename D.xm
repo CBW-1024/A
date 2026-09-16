@@ -1220,15 +1220,14 @@ static void WCRSideloadFixInstall(void) {
          * 纯本地版默认生效，这里只按 WCR 顺序执行安装。 */
         WCRSideloadFixInstall();
 
-        /* 插件入口：照搬 DD收款助手 的 WCPluginsMgr 注册方式。
-         * WCPluginsMgr 已在文件顶部手动声明（用户确认存在于 8.0.78），
-         * 直接编译期调用 [WCPluginsMgr sharedInstance]，不再走 objc_getClass。
-         * 用户在微信「插件」页点「自签修复」即进入上面的设置界面。 */
-        WCPluginsMgr *mgr = [WCPluginsMgr sharedInstance];
-        if (mgr && [mgr respondsToSelector:@selector(registerControllerWithTitle:version:controller:)]) {
-            [mgr registerControllerWithTitle:@"自签修复"
-                                     version:@"1.0.0"
-                                  controller:@"WCRSideloadFixSettingsViewController"];
+        /* 插件入口：照搬 DD收款助手 的 WCPluginsMgr 注册方式（DD 第599-604行同款写法）。
+         * 用 objc_getClass 取 id 变量再发消息，可正常链接编译；用户在微信「插件」页
+         * 点「自签修复」即进入上面的 WCRSideloadFixSettingsViewController 设置界面。 */
+        id mgr = objc_getClass("WCPluginsMgr");
+        if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
+            [[mgr sharedInstance] registerControllerWithTitle:@"自签修复"
+                                                     version:@"1.0.0"
+                                                  controller:@"WCRSideloadFixSettingsViewController"];
         }
     }
 }
