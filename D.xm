@@ -145,6 +145,7 @@ static NSString *WCRCurrentGroupID(void);
 static BOOL WCRFixActive(void);
 static BOOL WCRShouldRemapGroup(NSString *groupID);
 static NSURL *WCRRemappedContainerURL(void);
+static NSURL *WCRContainerURLViaLSBundleProxy(NSString *gid);   /* LSBundleProxy.groupContainerURLs[gid]，绕过 entitlement 取容器 */
 static NSString *WCRRemapGroupID(NSString *groupID);
 static NSArray<NSString *> *WCRCachedAvailableGroups(void);
 static void WCREnsureDirectory(NSString *path);
@@ -362,12 +363,22 @@ static NSArray<NSURL *> *WCRMarkerFileURLs(void) {
     NSMutableArray *urls = [NSMutableArray array];
     NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *gid in WCRApplicationGroupIDs()) {
-        NSURL *u = nil;
-        if (gOrigContainerURL) {
-            u = gOrigContainerURL(fm,
-                    @selector(containerURLForSecurityApplicationGroupIdentifier:), gid);
-        } else {
-            u = [fm containerURLForSecurityApplicationGroupIdentifier:gid];
+        /* 优先 LSBundleProxy.groupContainerURLs[gid]：该私有 API 不受
+         * com.apple.security.application-groups entitlement 约束，自签包里原版
+         * -[NSFileManager containerURLForSecurityApplicationGroupIdentifier:] 对未授权
+         * 组返回 nil，而 LSBundleProxy 仍能返回正确容器 URL（文档第五节：这就是自签修复
+         * 成立的根本原因）。WCR 的 WCRSideloadShareFixMarkerGroupID(0x148190c) /
+         * RemapGroupID(0x8f3f40) 取容器均走此路径，故 marker 读写必须对齐；
+         * 否则主 App 写不进、扩展进程读不到 → FixActive 在扩展进程恒为 NO →
+         * 通知详情 / 通知头像 / 分享跳转 全部失效。 */
+        NSURL *u = WCRContainerURLViaLSBundleProxy(gid);
+        if (![u isKindOfClass:[NSURL class]]) {
+            if (gOrigContainerURL) {
+                u = gOrigContainerURL(fm,
+                        @selector(containerURLForSecurityApplicationGroupIdentifier:), gid);
+            } else {
+                u = [fm containerURLForSecurityApplicationGroupIdentifier:gid];
+            }
         }
         if (![u isKindOfClass:[NSURL class]]) continue;
         NSURL *dir = [u URLByAppendingPathComponent:kWCRPrefsSubPath isDirectory:YES];
@@ -820,8 +831,12 @@ static NSString *WCRRemapGroupID(NSString *groupID) {
 
     NSFileManager *fm = [NSFileManager defaultManager];            /* 0x8f4394 */
     for (NSString *g in candidates) {
-        NSURL *u = gOrigContainerURL(fm,
-            @selector(containerURLForSecurityApplicationGroupIdentifier:), g);
+        NSURL *u = WCRContainerURLViaLSBundleProxy(g);             /* 优先 LSBundleProxy，绕过 entitlement */
+        if (![u isKindOfClass:[NSURL class]]) {
+            if (!gOrigContainerURL) return nil;                   /* 0x8f40d0 */
+            u = gOrigContainerURL(fm,
+                @selector(containerURLForSecurityApplicationGroupIdentifier:), g);
+        }
         if (![u isKindOfClass:[NSURL class]]) continue;            /* 0x8f4520 */
 
         NSURL *dir = [u URLByAppendingPathComponent:kWCRPrefsSubPath isDirectory:YES];
