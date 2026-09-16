@@ -78,13 +78,10 @@
 #import <string.h>
 #import <stdlib.h>
 
-/* 手动声明 WCPluginsMgr 接口（DD收款助手同款插件管理器；用户确认在 8.0.78 真实存在，
- * 故不再走 objc_getClass 运行期取类，改为编译期静态调用）。 */
+/* WCPluginsMgr —— 照搬 DD收款助手 第95-97行手动声明 */
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
-- (void)registerControllerWithTitle:(NSString *)title
-                            version:(NSString *)version
-                         controller:(NSString *)controller;
+- (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
 @end
 
 #pragma mark - 常量（全部来自 __cstring / __cfstring）
