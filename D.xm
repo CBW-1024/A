@@ -1814,8 +1814,9 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
 
 
 #pragma mark - 用户账号自定义（按用户名，聊天详情页逐人设置）
-// 这里不发通知：账号改完由微信自己重绘资料页（弹窗收起即触发），
-// 不像头像那样需要主动 reloadTableData。
+// 改完必须发 kDDProfileChangedNotification（与头像共用）：资料页不会自己重绘，
+// 弹窗收起也不触发刷新，不发就只有杀进程重开才能看到变化。
+// 该通知在 AddContactToChatRoomViewController -viewDidLoad 注册，走 reloadTableData。
 
 static NSString * const kDDFriendWxidMapKey = @"DDFriendWxidMap";
 
@@ -2353,6 +2354,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 
     if (DDFriendWxidForUser(usrName)) {
         DDFriendWxidRemoveForUser(usrName);
+        [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
         return;
     }
 
@@ -2383,6 +2385,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
             // 空格 / 文字：原样保存（空格=空白账号即隐藏）
             DDFriendWxidSetForUser(text, usrName);
         }
+        [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
         blockAlert = nil;
     }];
     [alert show];
