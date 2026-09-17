@@ -1456,19 +1456,13 @@ static double DDTimeStampFromString(NSString *s) {
 %end
 
 %hook ContactsViewController
+// m_countLabel（ContactsViewController.h:6）才是「N个朋友」的显示出口。
+// 微信的 updateCount 读的不是 m_uiNormalContact（ContactsDataLogic 另有 getContactCount
+// 与 m_uiContactCount），光 hook 那个 getter 只在页面首次建 label 时生效，改完数字切回来
+// 不会变。所以让微信自己刷完之后，再直接把 label 文本覆盖成改后的值。
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
-    // 只重刷「N个朋友」计数；标题不碰，微信自己是什么就显示什么。
-    // updateCount 见 ContactsViewController.h:50，微信刷新计数绑在联系人数据变化上，
-    // 改插件配置不会触发，所以每次进页面手动补一次。
     [self updateCount];
-}
-// 微信的 updateCount 读的不是 m_uiNormalContact（ContactsDataLogic 另有 getContactCount
-// 与 m_uiContactCount），所以光 hook 那个 getter 只在页面首次建 label 时生效，改完数字
-// 切回来不会变。这里在微信自己刷完之后再覆盖一次 m_countLabel（ContactsViewController.h:6），
-// 直接兜住显示结果，不依赖它内部读哪个数据源。
-- (void)updateCount {
-    %orig;
     [self dd_forceCountLabel];
 }
 %new
@@ -1478,12 +1472,9 @@ static double DDTimeStampFromString(NSString *s) {
     NSInteger v = [cfg.contactsValue integerValue];
     if (v <= 0) return;
     Ivar iv = class_getInstanceVariable([self class], "m_countLabel");
-    if (!iv) return;
-    id obj = object_getIvar(self, iv);
-    if (![obj isKindOfClass:[UILabel class]]) return;
-    NSString *want = [NSString stringWithFormat:@"%ld个朋友", (long)v];
-    UILabel *lb = (UILabel *)obj;
-    if (![lb.text isEqualToString:want]) lb.text = want;
+    id lb = iv ? object_getIvar(self, iv) : nil;
+    if (![lb isKindOfClass:[UILabel class]]) return;
+    ((UILabel *)lb).text = [NSString stringWithFormat:@"%ld个朋友", (long)v];
 }
 %end
 
