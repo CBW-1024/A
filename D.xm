@@ -432,7 +432,9 @@ static NSString * const kDDJokerTextCacheKey = @"DDJokerTextCache";
 static NSString * const kDDJokerAmountCacheKey = @"DDJokerAmountCache";
 static NSString * const kDDJokerTimeCacheKey = @"DDJokerTimeCache";
 
-static NSString * const kDDJokerTextOriginalKey = @"DDJokerTextOriginal";
+// 原文不落盘，挂在 CMessageWrap 上的关联对象键：它只在 wrap 存活期间有意义，
+// wrap 重建时会从数据库读回原文，持久化反而留下清不干净的垃圾。
+static char kDDJokerOriginalTextKey;
 
 // localID 仅在单个会话内唯一（CMessageMgr.h:136 强制 usrName+localID 二元组定位），
 // 不同会话的 localID 各自从 1 递增会碰撞。用 (fromUsr|toUsr|localID) 三元组作为全局唯一键，
@@ -532,8 +534,18 @@ static NSString *DDJokerCachedText(CMessageWrap *msg) {
     return [v isKindOfClass:[NSString class]] && [v length] ? v : nil;
 }
 
-// 前向声明：原文写入函数定义在本文件稍后，改写时需要先补记原文。
-static void DDJokerSetOriginalText(CMessageWrap *msg, NSString *text);
+static NSString *DDJokerOriginalText(CMessageWrap *msg) {
+    if (!msg) return nil;
+    NSString *v = objc_getAssociatedObject(msg, &kDDJokerOriginalTextKey);
+    return [v isKindOfClass:[NSString class]] && [v length] ? v : nil;
+}
+
+// 已存在则不覆盖：第二次改写时 m_nsContent 已是上次的改写值，只有第一次存的才是最初原文。
+static void DDJokerSetOriginalText(CMessageWrap *msg, NSString *text) {
+    if (!msg || !text.length) return;
+    if (DDJokerOriginalText(msg)) return;
+    objc_setAssociatedObject(msg, &kDDJokerOriginalTextKey, text, OBJC_ASSOCIATION_COPY_NONATOMIC);
+}
 
 // 原文只在真正改写时记录一次：此刻 m_nsContent 还没被改写过，存下来的才是真原文。
 // 留空还原不删这条记录，保证再次改写 / 还原始终能回到最初原文。
@@ -546,18 +558,6 @@ static void DDJokerSetCachedText(CMessageWrap *msg, NSString *text) {
     } else {
         DDJokerCacheSet(kDDJokerTextCacheKey, key, nil);
     }
-}
-
-static NSString *DDJokerOriginalText(CMessageWrap *msg) {
-    if (!msg) return nil;
-    NSString *v = DDJokerCacheGet(kDDJokerTextOriginalKey, DDJokerMessageKey(msg));
-    return [v isKindOfClass:[NSString class]] && [v length] ? v : nil;
-}
-
-static void DDJokerSetOriginalText(CMessageWrap *msg, NSString *text) {
-    if (!msg || !text.length) return;
-    if (DDJokerOriginalText(msg)) return;
-    DDJokerCacheSet(kDDJokerTextOriginalKey, DDJokerMessageKey(msg), text);
 }
 
 static NSString *DDJokerCachedAmount(CMessageWrap *msg) {
@@ -684,7 +684,7 @@ static void DDJokerClearAllMessageCache(void) {
     DDJokerCacheClear(kDDJokerTextCacheKey);
     DDJokerCacheClear(kDDJokerAmountCacheKey);
     DDJokerCacheClear(kDDJokerTimeCacheKey);
-    DDJokerCacheClear(kDDJokerTextOriginalKey);
+    // 原文挂在 wrap 上、不落盘，无需清理。
 
     [fm removeItemAtPath:DDJokerImagesDir() error:nil];
     DDTransferDetailLeave();
@@ -918,7 +918,7 @@ static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *origin
 
 // 套用改写值；没有改写值时用已记录的原文还原。
 // 原文不在这里记录——只在用户真正改写时（DDJokerSetCachedText）才存一次，
-// 否则浏览过的每条文本消息都会往 original 表写一份用不上的原文。
+// 否则浏览过的每条文本消息都会白记一份用不上的原文。
 static void DDJokerApplyTextOverride(CMessageWrap *msg) {
     if (!msg) return;
     if (!JokerIsTextMessage(msg) && !JokerIsReferMessage(msg)) return;
@@ -1281,6 +1281,9 @@ static double DDTimeStampFromString(NSString *s) {
     if (!vm) return;
     NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(vm) : nil;
     if (!cached) return;
+    // 去重：showingTime 已经等于缓存值说明这条时间已改写过，cell 复用 / 滑动进出窗口时
+    // 不必再跑一遍 updateLayouts + 布局，否则每个时间 cell 每次露面都白刷一次。
+    if (DDShowingTimeOf(vm) == [cached doubleValue]) return;
 
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!self.window) return;
