@@ -463,62 +463,19 @@ static NSString *DDJokerAmountKey(CMessageWrap *msg) {
 }
 
 static NSString *DDJokerCacheDir(void) {
-    static NSString *dir = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/DDJoker"];
-        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    });
+    NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/DDJoker"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     return dir;
 }
 static NSString *DDJokerCacheFile(NSString *name) {
     return [DDJokerCacheDir() stringByAppendingPathComponent:[name stringByAppendingString:@".plist"]];
 }
-
-// 缓存内存层：每个 plist 进程内只解析一次，之后读写全部命中内存，
-// 落盘走同一条串行队列异步执行，避免在消息渲染路径上做同步磁盘 IO。
-static dispatch_queue_t DDJokerCacheQueue(void) {
-    static dispatch_queue_t q = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ q = dispatch_queue_create("com.ddjoker.cache", DISPATCH_QUEUE_SERIAL); });
-    return q;
+static NSMutableDictionary *DDJokerLoadCache(NSString *name) {
+    NSMutableDictionary *d = [NSMutableDictionary dictionaryWithContentsOfFile:DDJokerCacheFile(name)];
+    return d ?: [NSMutableDictionary dictionary];
 }
-static NSMutableDictionary *DDJokerMemCaches(void) {
-    static NSMutableDictionary *c = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ c = [NSMutableDictionary dictionary]; });
-    return c;
-}
-// 只能在 DDJokerCacheQueue() 内调用：首次访问时载入 plist，之后复用同一份内存字典。
-static NSMutableDictionary *DDJokerMemCacheFor(NSString *name) {
-    NSMutableDictionary *d = DDJokerMemCaches()[name];
-    if (!d) {
-        d = [NSMutableDictionary dictionaryWithContentsOfFile:DDJokerCacheFile(name)];
-        if (!d) d = [NSMutableDictionary dictionary];
-        DDJokerMemCaches()[name] = d;
-    }
-    return d;
-}
-static id DDJokerCacheGet(NSString *name, NSString *key) {
-    if (!key) return nil;
-    __block id v = nil;
-    dispatch_sync(DDJokerCacheQueue(), ^{ v = DDJokerMemCacheFor(name)[key]; });
-    return v;
-}
-// 内存同步更新（保证后续读取立即可见），磁盘异步落盘（不阻塞主线程）。
-static void DDJokerCacheSet(NSString *name, NSString *key, id value) {
-    if (!key) return;
-    NSString *path = DDJokerCacheFile(name);
-    dispatch_sync(DDJokerCacheQueue(), ^{
-        if (value) DDJokerMemCacheFor(name)[key] = value;
-        else [DDJokerMemCacheFor(name) removeObjectForKey:key];
-    });
-    dispatch_async(DDJokerCacheQueue(), ^{ [DDJokerMemCacheFor(name) writeToFile:path atomically:YES]; });
-}
-static void DDJokerCacheClear(NSString *name) {
-    NSString *path = DDJokerCacheFile(name);
-    dispatch_sync(DDJokerCacheQueue(), ^{ [DDJokerMemCaches() removeObjectForKey:name]; });
-    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+static void DDJokerSaveCache(NSString *name, NSDictionary *d) {
+    [d writeToFile:DDJokerCacheFile(name) atomically:YES];
 }
 static NSString *DDJokerImagesDir(void) {
     NSString *dir = [DDJokerCacheDir() stringByAppendingPathComponent:@"DDJokerImages"];
@@ -528,40 +485,51 @@ static NSString *DDJokerImagesDir(void) {
 
 static NSString *DDJokerCachedText(CMessageWrap *msg) {
     if (!msg) return nil;
-    NSString *v = DDJokerCacheGet(kDDJokerTextCacheKey, DDJokerMessageKey(msg));
-    return [v isKindOfClass:[NSString class]] && [v length] ? v : nil;
+    NSDictionary *d = DDJokerLoadCache(kDDJokerTextCacheKey);
+    NSString *v = d[DDJokerMessageKey(msg)];
+    return v.length ? v : nil;
 }
 
 static void DDJokerSetCachedText(CMessageWrap *msg, NSString *text) {
     if (!msg) return;
-    DDJokerCacheSet(kDDJokerTextCacheKey, DDJokerMessageKey(msg), text.length ? text : nil);
+    NSMutableDictionary *d = DDJokerLoadCache(kDDJokerTextCacheKey);
+    if (text.length) d[DDJokerMessageKey(msg)] = text;
+    else [d removeObjectForKey:DDJokerMessageKey(msg)];
+    DDJokerSaveCache(kDDJokerTextCacheKey, d);
 }
 
 static NSString *DDJokerOriginalText(CMessageWrap *msg) {
     if (!msg) return nil;
-    NSString *v = DDJokerCacheGet(kDDJokerTextOriginalKey, DDJokerMessageKey(msg));
-    return [v isKindOfClass:[NSString class]] && [v length] ? v : nil;
+    NSDictionary *d = DDJokerLoadCache(kDDJokerTextOriginalKey);
+    NSString *v = d[DDJokerMessageKey(msg)];
+    return v.length ? v : nil;
 }
 
 static void DDJokerSetOriginalText(CMessageWrap *msg, NSString *text) {
     if (!msg || !text.length) return;
     if (DDJokerOriginalText(msg)) return;
-    DDJokerCacheSet(kDDJokerTextOriginalKey, DDJokerMessageKey(msg), text);
+    NSMutableDictionary *d = DDJokerLoadCache(kDDJokerTextOriginalKey);
+    d[DDJokerMessageKey(msg)] = text;
+    DDJokerSaveCache(kDDJokerTextOriginalKey, d);
 }
 
 static NSString *DDJokerCachedAmount(CMessageWrap *msg) {
     if (!msg) return nil;
     NSString *key = DDJokerAmountKey(msg);
     if (!key) return nil;
-    NSString *v = DDJokerCacheGet(kDDJokerAmountCacheKey, key);
-    return [v isKindOfClass:[NSString class]] && [v length] ? v : nil;
+    NSDictionary *d = DDJokerLoadCache(kDDJokerAmountCacheKey);
+    NSString *v = d[key];
+    return v.length ? v : nil;
 }
 
 static void DDJokerSetCachedAmount(CMessageWrap *msg, NSString *amount) {
     if (!msg) return;
     NSString *key = DDJokerAmountKey(msg);
     if (!key) return;
-    DDJokerCacheSet(kDDJokerAmountCacheKey, key, amount.length ? amount : nil);
+    NSMutableDictionary *d = DDJokerLoadCache(kDDJokerAmountCacheKey);
+    if (amount.length) d[key] = amount;
+    else [d removeObjectForKey:key];
+    DDJokerSaveCache(kDDJokerAmountCacheKey, d);
 }
 
 // 转账详情页作用域：由 WCPayTransferMoneyStatusViewController 的存活状态控制，
@@ -650,13 +618,17 @@ static NSString *DDJokerTimeKey(id vm) {
 
 static NSNumber *DDJokerCachedTime(id vm) {
     if (!vm) return nil;
-    id v = DDJokerCacheGet(kDDJokerTimeCacheKey, DDJokerTimeKey(vm));
+    NSDictionary *d = DDJokerLoadCache(kDDJokerTimeCacheKey);
+    id v = d[DDJokerTimeKey(vm)];
     return [v isKindOfClass:[NSNumber class]] ? v : nil;
 }
 
 static void DDJokerSetCachedTime(id vm, double timestamp) {
     if (!vm) return;
-    DDJokerCacheSet(kDDJokerTimeCacheKey, DDJokerTimeKey(vm), timestamp > 0 ? @(timestamp) : nil);
+    NSMutableDictionary *d = DDJokerLoadCache(kDDJokerTimeCacheKey);
+    if (timestamp > 0) d[DDJokerTimeKey(vm)] = @(timestamp);
+    else [d removeObjectForKey:DDJokerTimeKey(vm)];
+    DDJokerSaveCache(kDDJokerTimeCacheKey, d);
 }
 
 static void DDApplyTimeOverride(id vm) {
@@ -670,9 +642,9 @@ static void DDApplyTimeOverride(id vm) {
 static void DDJokerClearAllMessageCache(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
 
-    DDJokerCacheClear(kDDJokerTextCacheKey);
-    DDJokerCacheClear(kDDJokerAmountCacheKey);
-    DDJokerCacheClear(kDDJokerTimeCacheKey);
+    [fm removeItemAtPath:DDJokerCacheFile(kDDJokerTextCacheKey) error:nil];
+    [fm removeItemAtPath:DDJokerCacheFile(kDDJokerAmountCacheKey) error:nil];
+    [fm removeItemAtPath:DDJokerCacheFile(kDDJokerTimeCacheKey) error:nil];
 
     [fm removeItemAtPath:DDJokerImagesDir() error:nil];
     DDTransferDetailLeave();
