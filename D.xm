@@ -1468,13 +1468,12 @@ static double DDTimeStampFromString(NSString *s) {
 %new
 - (void)dd_forceCountLabel {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (!cfg.contactsEnabled || ![cfg hasContactsValue]) return;
-    NSInteger v = [cfg.contactsValue integerValue];
+    // 开关关 / 没填值 / 填了非数字，integerValue 都是 0，一律不改写（显示微信真实数量）。
+    NSInteger v = cfg.contactsEnabled ? [cfg.contactsValue integerValue] : 0;
     if (v <= 0) return;
     Ivar iv = class_getInstanceVariable([self class], "m_countLabel");
-    id lb = iv ? object_getIvar(self, iv) : nil;
-    if (![lb isKindOfClass:[UILabel class]]) return;
-    ((UILabel *)lb).text = [NSString stringWithFormat:@"%ld个朋友", (long)v];
+    id lb = iv ? object_getIvar(self, iv) : nil;   // 拿不到就是 nil，发消息无操作
+    [(UILabel *)lb setText:[NSString stringWithFormat:@"%ld个朋友", (long)v]];
 }
 %end
 
