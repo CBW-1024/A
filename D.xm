@@ -2915,6 +2915,12 @@ static BOOL DDHideChatName(void) {
     [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
+- (void)setFriendWxidEnabled:(BOOL)friendWxidEnabled {
+    _friendWxidEnabled = friendWxidEnabled;
+    [[NSUserDefaults standardUserDefaults] setBool:friendWxidEnabled forKey:kDDFeatureFriendWxidEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
 - (void)setWxidEnabled:(BOOL)wxidEnabled {
     _wxidEnabled = wxidEnabled;
     [[NSUserDefaults standardUserDefaults] setBool:wxidEnabled forKey:kDDFeatureWxidEnabled];
