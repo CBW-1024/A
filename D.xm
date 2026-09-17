@@ -2059,14 +2059,40 @@ static NSString *DDCustomWxid(void) {
 
 #pragma mark - 数据源（微信"账号"统一拦截）
 
+// 原始账号底稿（纯内存，不落盘）：m_nsAliasName 是可写 property（CBaseContact.h:12），
+// 微信有可能把我们返回的自定义值写回 ivar，之后 %orig 拿到的就不是原始账号了，
+// 表现为关掉开关也还原不了。首见即记、之后不再更新，无自定义时一律返回底稿。
+static NSMutableDictionary *DDOriginalAliasMap(void) {
+    static NSMutableDictionary *map = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ map = [NSMutableDictionary dictionary]; });
+    return map;
+}
+
 %hook CBaseContact
 
 // CBaseContact.h:12 —— m_nsAliasName 即"账号"。
 // 用户：查自定义表，命中返回自定义值（空串=隐藏），未命中回原值。
 - (id)m_nsAliasName {
-    NSString *alias = DDFriendWxidForUser([self m_nsUsrName]);
+    NSString *usrName = [self m_nsUsrName];
+    NSString *alias = DDFriendWxidForUser(usrName);
     if (alias) return alias;
-    return %orig;
+    NSString *orig = %orig;
+    if (usrName.length && orig.length && !DDOriginalAliasMap()[usrName]) {
+        DDOriginalAliasMap()[usrName] = orig;
+    }
+    return DDOriginalAliasMap()[usrName] ?: orig;
+}
+
+// 堵住回写：m_nsAliasName 是可写 property，微信保存联系人时会把上面返回的自定义值
+// 写回 ivar 进而落库，结果是原始账号被覆盖、重启后仍是修改值，还会串到别的联系人。
+// 凡是写进来的值等于当前自定义值，一律丢弃，保住 ivar 里的原始账号。
+- (void)setM_nsAliasName:(id)alias {
+    NSString *custom = DDFriendWxidForUser([self m_nsUsrName]);
+    if (custom.length && [alias isKindOfClass:[NSString class]] && [alias isEqualToString:custom]) {
+        return;
+    }
+    %orig(alias);
 }
 
 %end
