@@ -1,1259 +1,2971 @@
-/*
- * WCRSideloadFix — 自签修复（修复自签分享跳转 / 消息详情头像显示）
- *
- * 本文件按 WCRefine.dylib (微信 8.0.78) 的反汇编结果 1:1 重建，
- * 所有函数/常量后面都标注了其在二进制中的真实地址，不再是"我自己的设计"。
- *
- *  ── 证据总览 ────────────────────────────────────────────────────────────
- *  安装入口                     0x8f3508   WCRSideloadFixInstall
- *  swizzle NSFileManager        0x8f3630   （受 bss 0x2526a68 记忆位保护）
- *  swizzle 其余 8 处             0x8f3698
- *  手写 swizzle helper          0x8f393c   (Class, SEL, IMP newIMP, IMP *orig)
- *  被 hook 的 IMP                0x8f3af8   -[NSFileManager containerURLForSecurityApplicationGroupIdentifier:]
- *
- *  进程判定                     0x1482108  IsShareExtensionProcess
- *                               0x148230c  IsNotificationServiceProcess
- *                               0x14820c8  IsGroupRemapExtensionProcess (= 上两者取或)
- *   entitlement 四级回退         0x147d4e8  ReadEffectiveEntitlements
- *  可用应用组                    0x147e154  WCRSideloadShareFixApplicationGroupIDs
- *  marker 读/写                  0x148190c / 0x14815d8 / 0x14810f8
- *  主 App 解析出的组             0x1481ec0  WCRSideloadShareFixResolvedGroupID
- *  ProtobufLite 链接检查          0x14804f8  WCRSideloadShareFixPreferredHostLinked
- *  云控开关                      0x148236c  WCRSideloadShareFixCloudAllowed
- *  总开关 ShouldInstall          0x14823ec
- *
- *  ── 「需注入 ProtobufLite3（没有则 ProtobufLite）」的真实判定 ──────────────
- *  0x14804f8  PreferredHostLinked      memo: bss 0x253a6f0/0x253a6f1
- *  0x148056c  找宿主二进制  <bundle>/{Frameworks,Contents/Frameworks}/
- *                          {ProtobufLite3(@0x205b4b6),ProtobufLite(@0x205b4c4)}.framework
- *                          可执行文件取 Info.plist["CFBundleExecutable"]
- *  0x147f6a4  fopen(path,"rb") 解析 Mach-O，只看
- *             LC_LOAD_DYLIB(0x0c) / LC_LOAD_WEAK_DYLIB(0x80000018) /
- *             LC_REEXPORT_DYLIB(0x8000001f) / LC_LOAD_UPWARD_DYLIB(0x80000023)
- *             的 dylib 名字，strnstr(name, "WCRefine")  ← 标记串 @0x202a8b8
- *  0x147ccf4  fat 中定位 arm64 slice（CPU_TYPE_ARM64），thin 返回 0，失败 -1
- *  0x147cff4  BOOL ReadAt(FILE *, uint64_t off, void *buf, size_t len)
- *  0x147d0b4  be32（fat_header/fat_arch 全是大端）
- *
- *  结论：判的不是"ProtobufLite 被没被加载"，而是
- *        **磁盘上那份 ProtobufLite 二进制有没有被 Icsign 注入 WCRefine**
- *        （注入后 Mach-O 会多一条指向 WCRefine.dylib 的 LC_LOAD_DYLIB）。
- *  实测微信 8.0.78 的 Frameworks/ 只有 ProtobufLite.framework（无 ProtobufLite3），
- *  且其依赖表里没有 WCRefine → 原始包下返回 NO，故未注入时功能不挂载。
- *
- *  ── 纯本地运行形态 ───────────────────────────────────────────────────────
- *  · 无云控（0x148236c 已删除）；无本地开关；无设置页 UI。
- *  · 功能默认生效：主 App 进程在 ShouldInstall 通过后自动选第一个可用应用组并写 marker，
- *    扩展进程（NSE / 分享）靠 marker 反查主 App 选定组，三类功能（通知详情/头像/分享跳转）即生效。
- *
- *  ── 私有函数（本文件按原样重建）─────────────────────────────────────────
- *  0x8f5490  WCRCurrentGroupID        扩展:0x8f3f40(nil)  主App:0x1481ec0
- *  0x8f4b9c  WCRFixActive             扩展:当前组非空    主App:默认 YES（纯本地，无开关）
- *  0x8f4cd0  WCRShouldRemapGroup      空→NO；在可用组里→YES；hasPrefix "group.com.tencent."→YES
- *  0x8f4e50  WCRRemappedContainerURL  LSBundleProxy.groupContainerURLs[gid] → 回退原 IMP
- *  0x8f3f40  WCRRemapGroupID          扩展进程：扫所有容器找 marker，得到主 App 选定的组
- *  0x8f54e4  WCRCachedAvailableGroups
- *  0x8f6af4  WCREnsureDirectory
- *  0x8f53b8  WCRProbe                 （WCR 内已被裁成空实现，本文件同样保留为 no-op）
- *
- *  ── 关键结论 ────────────────────────────────────────────────────────────
- *  WCR 真正拿到容器的首选路径是私有 API：
- *      Class  LSBundleProxy                      (@"LSBundleProxy"             @0x20447ac)
- *      +[LSBundleProxy bundleProxyForCurrentProcess]  (@"bundleProxyForCurrentProcess" @0x20447ba)
- *      -[LSBundleProxy groupContainerURLs]        (@"groupContainerURLs"       @0x20447d7)
- *      NSDictionary *urls;  urls[resolvedGroupID]  → NSURL
- *  它**绕过 com.apple.security.application-groups entitlement 校验**，
- *  这正是自签包（无 entitlement）也能拿到正确容器 URL 的原因。
- *  只有在 LSBundleProxy 不可用时才回退到原始 IMP。
- */
+//  DD小丑助手  (WeChat Jailbreak Tweak, Theos/Logos 单文件)
+//  在微信内自定义聊天 / 资料 / 余额等显示
+//  功能：聊天文字、图片、时间、转账改写；运动步数、好友数量；余额 / 零钱通自定义；微信账号 / 头像自定义
+//  入口：微信 → 插件入口 → "DD小丑助手"设置页
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#import <Security/Security.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
-#import <dlfcn.h>
-#import <mach-o/dyld.h>
-#import <stdio.h>
-#import <string.h>
-#import <stdlib.h>
+#import <substrate.h>
+#include <string.h>
 
-/* WCPluginsMgr —— 照搬 DD收款助手 第95-97行手动声明 */
+#pragma mark - 微信类声明
+// 本插件 hook 的微信原生类与方法签名，均锚定微信8.0.78头文件 dump。
+
+
+@interface WCUIAlertView : NSObject
+- (id)initWithTitle:(id)a0 message:(id)a1;
+- (void)showTextFieldWithMaxLen:(unsigned int)a0;
+- (UITextField *)getTextField;
+- (id)getTextFieldText;
+- (void)setTextFieldDefaultText:(id)a0;
+- (void)addBtnTitle:(id)a0 handler:(void (^)(void))a1;
+- (void)addCancelBtnTitle:(id)a0 handler:(void (^)(void))a1;
+- (void)show;
+@end
+
+@interface WeToast : NSObject
++ (id)toast;
+- (void)showDoneToastWithText:(id)a0;
+- (void)showErrorToastWithText:(id)a0;
+@end
+
 @interface WCPluginsMgr : NSObject
 + (instancetype)sharedInstance;
 - (void)registerControllerWithTitle:(NSString *)title version:(NSString *)version controller:(NSString *)controller;
 @end
 
-#pragma mark - 常量（全部来自 __cstring / __cfstring）
+@interface WCTableViewCellManager : NSObject
++ (id)switchCellForSel:(SEL)sel target:(id)target title:(id)title on:(BOOL)on;
++ (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightValue:(id)rightValue;
++ (id)normalCellForSel:(SEL)sel target:(id)target title:(id)title rightView:(id)rightView;
+@property (nonatomic, retain) id userInfo;
+@end
 
-/* @0x204476c —— marker 文件名：主 App 把"选定的应用组"写进所有可用容器的
- *   <container>/Library/Preferences/ 下；扩展进程反过来扫这些文件找回组 id。 */
-static NSString * const kWCRMarkerFileName = @"com.qimiao.WCRefine.sideload-share-fix-group";
-/* @0x205b1b9 —— 探针日志（WCR 内 0 调用，保留） */
-static NSString * const kWCRProbeLogName   = @"com.qimiao.WCRefine.sideload-share-fix.log";
+@interface WCTableViewSectionManager : NSObject
++ (id)sectionWithHeader:(NSString *)header;
++ (id)sectionWithFooter:(NSString *)footer;
++ (id)sectionWithHeader:(NSString *)header Footer:(NSString *)footer;
++ (id)defaultSection;
+@property (nonatomic, copy) NSString *footerTitle;
+- (void)addCell:(id)arg1;
+- (unsigned long long)getCellCount;
+- (id)getCellAt:(unsigned long long)a0;
+@end
 
-static NSString * const kWCREntitlementAppGroups = @"com.apple.security.application-groups"; // @0x22bf480
-static NSString * const kWCRExtShareService       = @"com.apple.share-services";              // @0x1482130
-static NSString * const kWCRExtNotificationService= @"com.apple.usernotifications.service";   // @0x1482334
+@interface WCTableViewManager : NSObject
+- (id)initWithFrame:(CGRect)frame style:(NSInteger)style;
+@property (nonatomic, readonly) UITableView *tableView;
+@property (nonatomic, weak) id delegate;
+- (void)clearAllSection;
+- (void)addSection:(id)arg1;
+- (id)cellInfoAtIndexPath:(NSIndexPath *)indexPath;
+- (void)reloadTableView;
+- (id)getTableView;
+- (id)getAllSections;
+- (void)insertSection:(id)arg1 At:(unsigned int)a1;
+@end
 
-/* 0x8f45bc / 0x8f5f2c / 0x8f4df0 */
-static NSString * const kWCRPrefsSubPath   = @"Library/Preferences";   // @0x2290280
-static NSString * const kWCRGroupPrefix    = @"group";                 // @0x226f000
-static NSString * const kWCRTencentPrefix  = @"group.com.tencent.";    // @0x22902c0
+@interface CBaseContact : NSObject
+@property (retain, nonatomic) NSString *m_nsUsrName;
+@property (retain, nonatomic) NSString *m_nsAliasName;
+- (BOOL)isSelf;
+@end
 
-/* 0x8f4f50 起的动态私有调用 */
-static NSString * const kWCRLSBundleProxyClass = @"LSBundleProxy";                    // @0x20447ac
-static NSString * const kWCRLSBundleProxySel   = @"bundleProxyForCurrentProcess";     // @0x20447ba
-static NSString * const kWCRGroupContainerURLs = @"groupContainerURLs";               // @0x20447d7
+@interface CSetting : NSObject
+- (id)m_nsAliasName;
+@end
 
-/* 0x8f3698 中被 swizzle 的类 / 方法名（全部用字符串，避免链接期依赖） */
-static NSString * const kWCRCKEntitlementsClass   = @"CKEntitlements";                 // @0x20447ea
-static NSString * const kWCRCKEntitlementsInit    = @"initWithEntitlementsDict:";      // @0x20447f9
-static NSString * const kWCRCKContainerClass      = @"CKContainer";                    // @0x2044813
-static NSString * const kWCRCKInitWithID          = @"_initWithContainerIdentifier:";  // @0x204481f
-static NSString * const kWCRCKSetupWithID         = @"_setupWithContainerID:options:"; // @0x204483d
-static NSString * const kWCRUserDefaultsSuiteInit = @"_initWithSuiteName:container:";  // @0x204485c
-static NSString * const kWCRAppExtDataUtilClass   = @"WCAppExtensionDataUtil";         // @0x204487a
-static NSString * const kWCRExtDataUtilClass      = @"WCExtDataUtil";                  // @0x204489c
-static NSString * const kWCRAppGroupIDSel         = @"appGroupID";                     // @0x2044891
-static NSString * const kWCRShareMainVCClass      = @"MSEShareMainViewController";     // @0x20448aa
-static NSString * const kWCRDoAuthenticateCheck   = @"doAuthenticateCheck";            // @0x20448c5
-static NSString * const kWCRAuthDidFinish         = @"onCheckAuthenticateDidFinish:";  // @0x20448d9
+@interface AddContactToChatRoomViewController : UIViewController
+@property (retain, nonatomic) CBaseContact *m_contact;
+- (void)ddWxidSwitchChanged:(UISwitch *)sender;        // 自定义用户账号
+- (void)ddAvatarSwitchChanged:(UISwitch *)sender;      // 自定义用户头像
+- (void)dd_injectProfileSection;                       // 聊天详情页插入头像 + 账号开关
+@end
 
-static NSString * const kWCRProtobufLite3 = @"ProtobufLite3";  // @0x205b4b6
-static NSString * const kWCRProtobufLite  = @"ProtobufLite";   // @0x205b4c4
-/* 0x147f6a4 在宿主 Mach-O 的 LC_LOAD_DYLIB* 名字里搜的标记 */
-static NSString * const kWCRInjectToken   = @"WCRefine";       // @0x202a8b8
-/* 0x14806a8 / 0x14806b4：宿主 framework 的候选目录（后者为 macOS 布局兼容） */
-static NSString * const kWCRFrameworksDir        = @"Frameworks";           // @0x22b3620
-static NSString * const kWCRContentsFrameworksDir= @"Contents/Frameworks";  // @0x22bf840
-static NSString * const kWCRFrameworkExt         = @"framework";            // @0x22bf860
-static NSString * const kWCRInfoPlistName        = @"Info.plist";           // @0x22b3740
-static NSString * const kWCRBundleExecutableKey  = @"CFBundleExecutable";   // @0x22bf7a0
+@interface CContact : CBaseContact
+@end
 
-/* 配置键（WCRefineConfig，classref @0x238f810） */
-static NSString * const kWCRCfgGroupID  = @"sideloadShareFixAppGroupId";
+@interface MMHeadImageView : UIView
+@property (readonly, nonatomic) NSString *nsUsrName;
+- (void)setHeadImageByName:(id)usrName;
+- (void)doUpdateHeadImg:(BOOL)force;
+- (void)updateUsrName:(id)usrName withHeadImgUrl:(id)headImgUrl;
+- (void)updateHeadImage:(id)image;
+- (void)ImageDidLoad:(id)image Url:(id)url;
+- (void)didMoveToWindow;
+@end
 
-#pragma mark - 前向声明
+@interface ImageScrollView : UIView
+- (void)updateImage:(id)image;
+@end
 
-static NSString *WCRPreferredHostBinaryPath(void);
-static NSArray<NSString *> *WCRApplicationGroupIDs(void);
-static NSString *WCRMarkerGroupID(void);
-static BOOL WCRWriteGroupMarker(NSString *groupID);
-static NSString *WCRResolvedGroupID(void);
-static NSString *WCRCurrentGroupID(void);
-static BOOL WCRFixActive(void);
-static BOOL WCRShouldRemapGroup(NSString *groupID);
-static NSURL *WCRRemappedContainerURL(void);
-static NSURL *WCRContainerURLViaLSBundleProxy(NSString *gid);   /* LSBundleProxy.groupContainerURLs[gid]，绕过 entitlement 取容器 */
-static NSString *WCRRemapGroupID(NSString *groupID);
-static NSArray<NSString *> *WCRCachedAvailableGroups(void);
-static void WCREnsureDirectory(NSString *path);
-static BOOL WCRPreferredHostLinked(void);
-static BOOL WCRShouldInstall(void);
-static void WCRSelectGroup(NSString *groupID);          /* 设置页选组：写 picked + marker + 清缓存 */
+@interface MMHDHeadImageView : UIView
+@property (retain, nonatomic) CBaseContact *m_contact;
+- (void)updateHead;
+- (void)updateHDHead;
+- (void)dd_applyCustomHDHead;
+@end
 
-#pragma mark - 运行时状态（一一对应 WCR 的 __DATA,__bss 槽位）
+@interface BaseMsgContentLogicController : NSObject
+- (id)GetUsrTitle;
+- (id)getSubTitle;
+- (id)GetTitleTailImageView;
+@end
 
-static BOOL  gSwizzledFileManager = NO;   /* bss 0x2526a68 —— 0x8f3630 的记忆位 */
-static NSURL *(*gOrigContainerURL)(id, SEL, NSString *) = NULL; /* bss 0x2526a70 */
-/* WCR 的替换 IMP 自己就用 gOrigContainerURL 递归调用原始实现，所以必须在
- * 任何 swizzle 发生之前由 WCRSwizzle 写入 —— 这正是 WCR 在 0x8f367c 传
- * x3 = &0x2526a70 的原因。 */
+@interface RoomContentLogicController : BaseMsgContentLogicController
+- (id)GetUsrTitle;
+- (id)getSubTitle;
+- (id)getDefaultTitleTailSubViews;
+- (id)getMemeberCountLabel;
+@end
 
-static id   (*gOrigCKEntitlementsInit)(id, SEL, NSDictionary *)          = NULL; /* 0x2526a78 */
-static id   (*gOrigCKInitWithID)(id, SEL, NSString *)                    = NULL; /* 0x2526a80 */
-static id   (*gOrigCKSetupWithID)(id, SEL, NSString *, id)               = NULL; /* 0x2526a88 */
-static id   (*gOrigUserDefaultsSuiteInit)(id, SEL, NSString *, id)       = NULL; /* 0x2526a90 */
-static id   (*gOrigAppExtDataUtilGroupID)(id, SEL)                       = NULL; /* 0x2526a98 */
-static id   (*gOrigExtDataUtilGroupID)(id, SEL)                          = NULL; /* 0x2526aa0 */
-static id   (*gOrigDoAuthenticateCheck)(id, SEL)                         = NULL; /* 0x2526aa8 */
-static void (*gOrigAuthDidFinish)(id, SEL, id)                           = NULL; /* 0x2526ab0 */
+@interface CMessageWrap : NSObject
+@property (nonatomic, assign) unsigned int m_uiMesLocalID;
+@property (nonatomic, retain) NSString *m_nsContent;
+@property (nonatomic, retain) NSString *m_nsFromUsr;
+@property (nonatomic, retain) NSString *m_nsToUsr;
+- (BOOL)IsTextMsg;
+- (BOOL)IsImgMsg;
+- (BOOL)isReferMsgType;
+- (NSString *)GetDisplayContent;
+@end
 
-static NSString *gCachedRemappedGroup  = nil; /* bss 0x2526a58 —— 0x8f3f40 的结果缓存 */
-static NSArray  *gCachedAvailableGroups= nil; /* bss 0x2526a60 —— 0x8f54e4 的结果缓存 */
-static NSURL    *gCachedContainerURL   = nil; /* bss 0x2526a48 */
-static NSString *gCachedContainerGroup = nil; /* bss 0x2526a50 */
+@interface BaseMessageViewModel : NSObject
+@property (nonatomic, retain) CMessageWrap *messageWrap;
+- (void)resetLayoutCache;
+@end
 
-#pragma mark - 手写 swizzle helper（1:1 对应 0x8f393c）
+@interface CommonMessageViewModel : BaseMessageViewModel
+@end
 
-/*
- * BOOL WCRSwizzle(Class cls, SEL sel, IMP newIMP, IMP *origIMP)
- *
- * 0x8f3948~0x8f3988 : cls / sel / newIMP / origIMP 任一为 NULL 直接返回 NO
- * 0x8f39a8          : class_copyMethodList(cls, &count)
- * 0x8f39dc          : 逐个 method_getName(list[i]) == sel ?
- *     命中 → 0x8f3a3c method_setImplementation(found, newIMP)，把旧 IMP 存进 *origIMP
- *     未命中 → 0x8f3a64 class_getInstanceMethod(cls, sel)
- *              为 NULL 返回 NO
- *              否则 *origIMP = method_getImplementation(m)（继承来的实现）
- *              0x8f3ad4 class_addMethod(cls, sel, newIMP, method_getTypeEncoding(m))
- */
-static BOOL WCRSwizzle(Class cls, SEL sel, IMP newIMP, IMP *origIMP) {
-    if (!cls || !sel || !newIMP || !origIMP) return NO;
+@interface BaseMessageCellView : UIView
+- (void)layoutContentView;
+- (void)layoutInternal;
+- (void)prepareForReuse;
+- (id)operationMenuItems;
+@end
 
-    unsigned int count = 0;
-    Method *list = class_copyMethodList(cls, &count);
-    Method found = NULL;
-    for (unsigned int i = 0; i < count; i++) {
-        if (method_getName(list[i]) == sel) { found = list[i]; break; }
+@interface CommonMessageCellView : BaseMessageCellView
+@property (nonatomic, readonly) CommonMessageViewModel *viewModel;
+- (void)setViewModel:(id)vm;
+@end
+
+@interface BaseMsgContentViewController : UIViewController
+- (void)clearNodeLayoutCache;
+- (void)reloadNodeWithMessageWrap:(CMessageWrap *)msgWrap;
+- (void)reloadVisibleNodeWithCellView:(UIView *)cellView;
+- (UITableView *)getMsgTableView;
+@end
+
+@interface TextMessageViewModel : CommonMessageViewModel
+@property (readonly, nonatomic) NSString *contentText;
+- (void)resetLayoutCache;
+@end
+
+// RichTextView：JokerApplyTextToRichView 以 id 接收并调用，类名在代码里不出现，
+//   但方法确在调用（编译期需要声明，删了会 "no known instance method"）。
+//   签名锚定 WeChat/RichTextView.h:131/132/146/223。
+@interface RichTextView : UIView
+- (id)getContent;
+- (void)setContent:(id)content;
+- (void)calculateAndUpdateFrame;
+- (void)forceDisplayInSync;
+@end
+
+@interface TextMessageCellView : CommonMessageCellView
+- (id)getRichTextView;
+- (id)getTextString;
+- (void)layoutContentView;
+- (void)setViewModel:(id)vm;
+
+@end
+
+@interface WCPayTransferMessageViewModel : NSObject
+- (CMessageWrap *)messageWrap;
+- (NSString *)titleText;
+- (NSString *)descText;
+@end
+
+@interface WCPayBaseMessageCellView : CommonMessageCellView
+- (void)onTouchUpInside;
+@end
+
+@interface WCPayTransferMessageCellView : WCPayBaseMessageCellView
+- (void)updateTitleLabel;
+- (void)updateDescLabel;
+@end
+
+@interface WCPayControlData : NSObject
+@property (retain, nonatomic) CMessageWrap *m_oSelectedMessageWrap;
+@end
+
+@interface WCPayBaseViewController : UIViewController
+- (WCPayControlData *)data;
+@end
+
+@interface WCPayTransferMoneyStatusViewController : WCPayBaseViewController
+@end
+
+@interface ImageMessageCellView : CommonMessageCellView
+- (void)showImage;
+- (void)OnDownloadImageOk:(id)a0;
+@end
+
+@interface ChatTimeViewModel : BaseMessageViewModel
+- (NSString *)timeText;
+- (void)updateLayouts;
+@end
+
+@interface ChatTimeCellView : UIView
+- (id)initWithViewModel:(id)vm;
+- (void)setViewModel:(id)vm;
+- (void)layoutInternal;
+- (UILabel *)dk_timeLabel;
+- (void)dk_installTimeEditGesture;
+- (void)dk_handleTimeLongPress:(UILongPressGestureRecognizer *)g;
+- (void)dk_showTimeInput;
+@end
+
+@interface MMMenuItem : UIMenuItem
+- (instancetype)initWithTitle:(NSString *)title icon:(UIImage *)icon target:(id)target action:(SEL)action;
+// MMMenuItem.h:29 —— 直接吃 svg 资源名，由微信内部渲染，无需自行转 UIImage
+- (instancetype)initWithTitle:(NSString *)title svgName:(NSString *)svgName target:(id)target action:(SEL)action;
+@end
+
+@interface WCDeviceStepObject : NSObject
+- (unsigned int)m7StepCount;
+- (unsigned int)hkStepCount;
+@end
+
+@interface ContactsDataLogic : NSObject
+- (unsigned int)m_uiNormalContact;
+@end
+@interface ContactsViewController : UIViewController
+- (void)updateCount;
+@end
+
+@interface WCPayBalanceDetailViewController : UIViewController
+- (id)balanceTitleLabel;
+- (void)updateBalanceTitleLabel;
+- (void)refreshViewWithData:(id)arg;
+@end
+
+// TimeoutNumber 是 ScrollNumber 的外层容器，金额宽度/布局由它管，
+//   改它的 updateNumber: 才会连带重算容器尺寸；直接改内层 ScrollNumber 会右溢顶格。
+@interface TimeoutNumber : UIView
+- (void)updateNumber:(unsigned long long)a0;
+- (void)defaultNumber:(unsigned long long)a0;
+- (void)updateScrollNumber;
+- (id)scrollNumber;
+- (CGSize)scrollNumberSize;
+@end
+
+// ScrollNumber：钱包页金额数字容器，运行时为 UIView（dump 声明为 NSObject，故按 UIView 声明以访问 frame）。
+//   scrollNumberSize / widthOfNumber: 均以 currentNumber 推算文字宽度；改写余额须同时拦住
+//   三个写入口（updateNumber: / defaultNumber: / setCurrentNumber:）与 currentNumber getter，
+//   使容器宽度与改写值匹配，否则数字右溢顶格。
+@interface ScrollNumber : UIView
+- (unsigned long long)currentNumber;
+- (void)setCurrentNumber:(unsigned long long)a0;
+- (void)defaultNumber:(unsigned long long)a0;
+- (void)updateNumber:(unsigned long long)a0;
+- (id)container;      // dump 中存在：外层容器（TimeoutNumber）
+@end
+
+#pragma mark - 配置管理（接口）
+// 全局开关与各功能自定义值；以 NSUserDefaults 持久化（见文件末"配置管理（实现）"）。
+
+
+static NSString * const kDDFeatureTextEnabled = @"DDFeatureTextEnabled";
+static NSString * const kDDFeatureTransferEnabled = @"DDFeatureTransferEnabled";
+static NSString * const kDDFeatureImageEnabled = @"DDFeatureImageEnabled";
+static NSString * const kDDFeatureTimeEnabled = @"DDFeatureTimeEnabled";
+static NSString * const kDDFeatureBalanceEnabled = @"DDFeatureBalanceEnabled";
+static NSString * const kDDFeatureStepsEnabled = @"DDFeatureStepsEnabled";
+static NSString * const kDDFeatureContactsEnabled = @"DDFeatureContactsEnabled";
+static NSString * const kDDFeatureFriendWxidEnabled = @"DDFeatureFriendWxidEnabled";
+static NSString * const kDDFeatureWxidEnabled = @"DDFeatureWxidEnabled";
+static NSString * const kDDFeatureWxidValue = @"DDFeatureWxidValue";
+static NSString * const kDDFeatureAvatarEnabled = @"DDFeatureAvatarEnabled";
+static NSString * const kDDFeatureHideChatName = @"DDFeatureHideChatName";
+
+static NSString * const kDDStepsValueStringKey = @"DDStepsValueString";
+static NSString * const kDDContactsCountValueKey = @"DDContactsCountValue";
+static NSString * const kDDBalanceValueKey = @"DDBalanceValue";
+static NSString * const kDDLingtongValueKey = @"DDLingtongValue";
+
+@interface DDGlobalConfig : NSObject
++ (instancetype)shared;
+@property (nonatomic) BOOL textEnabled;
+@property (nonatomic) BOOL imageEnabled;
+@property (nonatomic) BOOL timeEnabled;
+@property (nonatomic) BOOL transferEnabled;
+@property (nonatomic) BOOL balanceEnabled;
+@property (nonatomic) BOOL stepsEnabled;
+@property (nonatomic) BOOL contactsEnabled;
+@property (nonatomic) BOOL friendWxidEnabled;
+@property (nonatomic) BOOL wxidEnabled;
+@property (nonatomic, copy) NSString *wxidValue;
+@property (nonatomic) BOOL avatarEnabled;
+@property (nonatomic) BOOL hideChatName;
+
+@property (nonatomic, copy) NSString *stepsValueString;
+@property (nonatomic, copy) NSString *contactsValue;
+@property (nonatomic, copy) NSString *balanceValue;
+@property (nonatomic, copy) NSString *lingtongValue;
+- (NSInteger)stepsIntegerValue;
+- (BOOL)hasStepsValue;
+- (BOOL)hasContactsValue;
+- (BOOL)hasBalanceValue;
+- (BOOL)hasLingtongValue;
+- (void)saveSteps;
+- (void)saveContacts;
+@end
+
+#pragma mark - 通用辅助
+
+
+static BOOL DDStringHas(const char *haystack, const char *needle) {
+    if (!haystack || !needle || !*needle) return NO;
+    NSString *h = [[NSString stringWithUTF8String:haystack] lowercaseString];
+    NSString *n = [[NSString stringWithUTF8String:needle] lowercaseString];
+    return (h && n) ? ([h rangeOfString:n].location != NSNotFound) : NO;
+}
+
+#pragma mark - 聊天消息改写（文字 / 图片 / 转账）
+// 长按消息弹出"小丑"菜单：文字改内容与引用标题、图片替换为相册所选图、转账改金额。
+// 改写值按消息会话唯一键缓存到 plist，刷新走 cell/viewModel 重绘。
+
+
+static CMessageWrap *JokerGetMessageWrapFromCell(CommonMessageCellView *cell) {
+    return cell.viewModel.messageWrap;
+}
+
+static id JokerGetViewControllerFromView(UIView *view) {
+    UIResponder *responder = view;
+    while (responder) {
+        if ([responder isKindOfClass:[UIViewController class]]) {
+            return responder;
+        }
+        responder = [responder nextResponder];
     }
-    if (list) free(list);
+    return nil;
+}
 
-    if (found) {
-        IMP old = method_setImplementation(found, newIMP);
-        *origIMP = old;
-        return YES;
+static BOOL JokerIsTextMessage(CMessageWrap *msg) {
+    return [msg IsTextMsg];
+}
+
+static BOOL JokerIsReferMessage(CMessageWrap *msg) {
+    return [msg isReferMsgType];
+}
+
+static NSString *JokerUnescapeXML(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || !s.length) return s;
+    NSDictionary *map = @{@"&lt;":@"<", @"&gt;":@">", @"&amp;":@"&",
+            @"&quot;":@"\"", @"&apos;":@"'"};
+    NSMutableString *m = [s mutableCopy];
+    for (NSString *key in map) {
+        [m replaceOccurrencesOfString:key withString:map[key]
+                options:NSLiteralSearch range:NSMakeRange(0, m.length)];
     }
-
-    Method m = class_getInstanceMethod(cls, sel);   // 可能是父类实现
-    if (!m) return NO;
-
-    *origIMP = method_getImplementation(m);
-    return class_addMethod(cls, sel, newIMP, method_getTypeEncoding(m));
+    return m;
 }
 
-#pragma mark - 进程判定（0x1482108 / 0x148230c / 0x14820c8）
-
-static NSString *WCRExtensionPointIdentifier(void) {
-    NSDictionary *ext = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"NSExtension"];
-    id v = ext[@"NSExtensionPointIdentifier"];
-    return [v isKindOfClass:[NSString class]] ? (NSString *)v : nil;
+static NSString *JokerReferMessageTitle(CMessageWrap *msg) {
+    NSString *xml = [msg m_nsContent];
+    if (![xml isKindOfClass:[NSString class]] || !xml.length) return nil;
+    static NSRegularExpression *re;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:@"<title\\s*>(.*?)</title\\s*>"
+                options:NSRegularExpressionCaseInsensitive | NSRegularExpressionDotMatchesLineSeparators
+                error:nil];
+    });
+    NSTextCheckingResult *r = [re firstMatchInString:xml options:0 range:NSMakeRange(0, xml.length)];
+    if (!r || r.numberOfRanges < 2) return nil;
+    NSString *t = [xml substringWithRange:[r rangeAtIndex:1]];
+    t = [t stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    t = JokerUnescapeXML(t);
+    return t.length ? t : nil;
 }
 
-static BOOL WCRIsShareExtensionProcess(void) {            /* 0x1482108 */
-    return [WCRExtensionPointIdentifier() isEqualToString:kWCRExtShareService];
+static BOOL JokerIsTransferCell(CommonMessageCellView *cell) {
+    return [cell isKindOfClass:%c(WCPayTransferMessageCellView)];
 }
 
-static BOOL WCRIsNotificationServiceProcess(void) {       /* 0x148230c */
-    return [WCRExtensionPointIdentifier() isEqualToString:kWCRExtNotificationService];
-}
-
-/* 0x14820c8 = IsShareExtensionProcess() || IsNotificationServiceProcess()
- * 注意：Notification Service Extension 正是"消息详情头像显示"那条线 ——
- * 头像由 NSExtension 生成 UNNotificationAttachment，图片源在 App Group 容器里，
- * 容器拿不到 → 没头像。修复容器 → 头像回来。 */
-static BOOL WCRIsGroupRemapExtensionProcess(void) {       /* 0x14820c8 */
-    return WCRIsShareExtensionProcess() || WCRIsNotificationServiceProcess();
-}
-
-#pragma mark - entitlement 读取（0x147d4e8 四级回退）
-
-static NSArray<NSString *> *WCRGroupsFromEntitlements(NSDictionary *ent) {
-    if (![ent isKindOfClass:[NSDictionary class]]) return nil;
-    id v = ent[kWCREntitlementAppGroups];
-    if (![v isKindOfClass:[NSArray class]]) return nil;
-    NSMutableArray *out = [NSMutableArray array];
-    for (id g in (NSArray *)v) {
-        if ([g isKindOfClass:[NSString class]] && [(NSString *)g length] > 0) [out addObject:g];
+static BOOL JokerIsSupportedCell(CommonMessageCellView *cell) {
+    if (!cell) return NO;
+    if (JokerIsTransferCell(cell)) return YES;
+    if ([cell isKindOfClass:%c(TextMessageCellView)]) {
+        CMessageWrap *msg = JokerGetMessageWrapFromCell(cell);
+        return JokerIsTextMessage(msg) || JokerIsReferMessage(msg);
     }
-    return out.count ? out : nil;
+    return NO;
 }
 
-/* SecTask 系列在 iOS SDK 的公开头文件里没有声明，但 Security.framework 里确实有符号。
- * 这里用 dlsym 在运行期解析，符号不存在就跳过该级回退 —— 既不依赖私有头，也不会链接失败。 */
-typedef struct __WCRSecTask *WCRSecTaskRef;
-typedef WCRSecTaskRef (*WCRSecTaskCreateFromSelfFunc)(CFAllocatorRef);
-typedef CFTypeRef     (*WCRSecTaskCopyValueFunc)(WCRSecTaskRef, CFStringRef, CFErrorRef *);
+static BOOL JokerEnabledForCell(CommonMessageCellView *cell) {
+    if (JokerIsTransferCell(cell)) return [DDGlobalConfig shared].transferEnabled;
+    return [DDGlobalConfig shared].textEnabled;
+}
 
-static CFTypeRef WCRCopyEntitlementViaSecTask(NSString *key) {
-    static void *sSecTaskCreate = NULL, *sSecTaskCopy = NULL;
-    static BOOL sResolved = NO;
-    if (!sResolved) {
-        sResolved = YES;
-        sSecTaskCreate = dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
-        sSecTaskCopy   = dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+static NSString *JokerNormalizeAmount(NSString *amount) {
+    NSString *trimmed = [amount stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!trimmed.length) return nil;
+    NSMutableString *filtered = [NSMutableString string];
+    for (NSUInteger i = 0; i < trimmed.length; i++) {
+        unichar c = [trimmed characterAtIndex:i];
+        if ((c >= '0' && c <= '9') || c == '.') {
+            [filtered appendFormat:@"%C", c];
+        }
     }
-    if (!sSecTaskCreate || !sSecTaskCopy) return NULL;
+    if (!filtered.length) return nil;
 
-    WCRSecTaskRef task = ((WCRSecTaskCreateFromSelfFunc)sSecTaskCreate)(NULL);
-    if (!task) return NULL;
-    CFErrorRef err = NULL;
-    CFTypeRef v = ((WCRSecTaskCopyValueFunc)sSecTaskCopy)(
-                      task, (__bridge CFStringRef)key, &err);
-    CFRelease(task);
-    if (err) CFRelease(err);
+    if ([filtered rangeOfString:@"."].location == NSNotFound) {
+        [filtered appendString:@".00"];
+    }
+    return filtered;
+}
+
+static NSString * const kDDJokerTextCacheKey = @"DDJokerTextCache";
+static NSString * const kDDJokerAmountCacheKey = @"DDJokerAmountCache";
+static NSString * const kDDJokerTimeCacheKey = @"DDJokerTimeCache";
+
+static NSString * const kDDJokerTextOriginalKey = @"DDJokerTextOriginal";
+
+// localID 仅在单个会话内唯一（CMessageMgr.h:136 强制 usrName+localID 二元组定位），
+// 不同会话的 localID 各自从 1 递增会碰撞。用 (fromUsr|toUsr|localID) 三元组作为全局唯一键，
+// 确保不同会话的改写互不串扰。
+static NSString *DDJokerMessageKey(CMessageWrap *msg) {
+    NSString *from = [msg m_nsFromUsr] ?: @"";
+    NSString *to = [msg m_nsToUsr] ?: @"";
+    return [NSString stringWithFormat:@"%@|%@|%u", from, to, [msg m_uiMesLocalID]];
+}
+
+// 转账金额以 transferid 作为全局唯一缓存键：同一条转账在聊天列表与详情页的
+// localID/from/to 可能不一致，但 transferid 必然相同（取自 m_nsContent 的 <transferid>），
+// 用它才能稳定命中同一笔改写。
+static NSString *DDTransferIDFromContent(NSString *xml) {
+    if (!xml.length) return nil;
+    NSRange ro = [xml rangeOfString:@"<transferid>" options:NSCaseInsensitiveSearch];
+    if (ro.location == NSNotFound) return nil;
+    NSUInteger start = ro.location + ro.length;
+    NSRange rc = [xml rangeOfString:@"</transferid>" options:NSCaseInsensitiveSearch
+            range:NSMakeRange(start, xml.length - start)];
+    if (rc.location == NSNotFound) return nil;
+    NSString *tid = [xml substringWithRange:NSMakeRange(start, rc.location - start)];
+    return tid.length ? tid : nil;
+}
+static NSString *DDJokerAmountKey(CMessageWrap *msg) {
+    NSString *tid = DDTransferIDFromContent([msg m_nsContent]);
+    return tid.length ? [@"TRF:" stringByAppendingString:tid] : nil;
+}
+
+static NSString *DDJokerCacheDir(void) {
+    static NSString *dir = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/DDJoker"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    });
+    return dir;
+}
+static NSString *DDJokerCacheFile(NSString *name) {
+    return [DDJokerCacheDir() stringByAppendingPathComponent:[name stringByAppendingString:@".plist"]];
+}
+
+// 缓存内存层：每个 plist 进程内只解析一次，之后读写全部命中内存，
+// 落盘走同一条串行队列异步执行，避免在消息渲染路径上做同步磁盘 IO。
+static dispatch_queue_t DDJokerCacheQueue(void) {
+    static dispatch_queue_t q = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("com.ddjoker.cache", DISPATCH_QUEUE_SERIAL); });
+    return q;
+}
+static NSMutableDictionary *DDJokerMemCaches(void) {
+    static NSMutableDictionary *c = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ c = [NSMutableDictionary dictionary]; });
+    return c;
+}
+// 只能在 DDJokerCacheQueue() 内调用：首次访问时载入 plist，之后复用同一份内存字典。
+static NSMutableDictionary *DDJokerMemCacheFor(NSString *name) {
+    NSMutableDictionary *d = DDJokerMemCaches()[name];
+    if (!d) {
+        d = [NSMutableDictionary dictionaryWithContentsOfFile:DDJokerCacheFile(name)];
+        if (!d) d = [NSMutableDictionary dictionary];
+        DDJokerMemCaches()[name] = d;
+    }
+    return d;
+}
+static id DDJokerCacheGet(NSString *name, NSString *key) {
+    if (!key) return nil;
+    __block id v = nil;
+    dispatch_sync(DDJokerCacheQueue(), ^{ v = DDJokerMemCacheFor(name)[key]; });
     return v;
 }
-
-/* 1) 0x147d944 内部缓存  2) 0x147bd34+0x147c2d0 embedded.mobileprovision
- *    3) 0x147c448 可执行文件  4) 0x147d254 CodeSignature
- * 每一级都用 @selector(count) 判空后再 objectForKeyedSubscript:。
- * iOS SDK 不导出 SecStaticCode / kSecCSDefaultFlags，级别 3/4 改用
- * 直接读 Mach-O __TEXT,__entitlements 段的方式兜底。 */
-static NSArray<NSString *> *WCRDeclaredAppGroupIDs(void) {
-    /* 级别 1：SecTaskCopyValueForEntitlement（进程真实生效的 entitlement） */
-    CFTypeRef ent = WCRCopyEntitlementViaSecTask(kWCREntitlementAppGroups);
-    if (ent) {
-        NSArray *a = CFBridgingRelease(ent);
-        NSArray *g = WCRGroupsFromEntitlements(@{ kWCREntitlementAppGroups : (a ?: @[]) });
-        if (g.count) return g;
-    }
-
-    /* 级别 2：embedded.mobileprovision（自签场景真正的来源） */
-    NSURL *profileURL = [[NSBundle mainBundle] URLForResource:@"embedded"
-                                                withExtension:@"mobileprovision"];
-    if (!profileURL) {
-        NSString *p = [[NSBundle mainBundle] pathForResource:@"embedded"
-                                                      ofType:@"mobileprovision"];
-        if (p) profileURL = [NSURL fileURLWithPath:p];
-    }
-    if (profileURL) {
-        NSData *data = [NSData dataWithContentsOfURL:profileURL];
-        if (data.length) {
-            NSRange s = [data rangeOfData:[NSData dataWithBytes:"<?xml" length:5]
-                                  options:0 range:NSMakeRange(0, data.length)];
-            NSRange e = [data rangeOfData:[NSData dataWithBytes:"</plist>" length:8]
-                                  options:0 range:NSMakeRange(0, data.length)];
-            if (s.location != NSNotFound && e.location != NSNotFound &&
-                e.location > s.location) {
-                NSRange r = NSMakeRange(s.location,
-                                        NSMaxRange(e) - s.location);
-                NSData *xml = [data subdataWithRange:r];
-                NSDictionary *plist =
-                    [NSPropertyListSerialization propertyListWithData:xml
-                                                              options:0
-                                                               format:NULL
-                                                                error:NULL];
-                NSArray *a = WCRGroupsFromEntitlements(
-                    ((NSDictionary *)plist)[@"Entitlements"]);
-                if (a.count) return a;
-            }
-        }
-    }
-
-    /* 级别 3/4：可执行文件自身的 entitlement。
-     * 现代签名把 entitlements 放在 __TEXT,__entitlements（<plist>...</plist>），
-     * 老签名放在 __TEXT,__info_plist / CodeResources，这里只扫 __TEXT,__entitlements。 */
-    NSURL *exeURL = [[NSBundle mainBundle] executableURL];
-    if (exeURL) {
-        NSData *bin = [NSData dataWithContentsOfURL:exeURL];
-        if (bin.length) {
-            NSData *head = [NSData dataWithBytes:"<?xml" length:5];
-            NSData *tail = [NSData dataWithBytes:"</plist>" length:8];
-            NSRange s = [bin rangeOfData:head options:0 range:NSMakeRange(0, bin.length)];
-            if (s.location != NSNotFound) {
-                NSRange search = NSMakeRange(NSMaxRange(s), bin.length - NSMaxRange(s));
-                NSRange e = [bin rangeOfData:tail options:0 range:search];
-                if (e.location != NSNotFound) {
-                    NSData *xml = [bin subdataWithRange:
-                                   NSMakeRange(s.location, NSMaxRange(e) - s.location)];
-                    NSDictionary *plist =
-                        [NSPropertyListSerialization propertyListWithData:xml
-                                                                  options:0
-                                                                   format:NULL
-                                                                    error:NULL];
-                    NSArray *a = WCRGroupsFromEntitlements(plist);
-                    if (a.count) return a;
-                }
-            }
-        }
-    }
-    return @[];
+// 内存同步更新（保证后续读取立即可见），磁盘异步落盘（不阻塞主线程）。
+static void DDJokerCacheSet(NSString *name, NSString *key, id value) {
+    if (!key) return;
+    NSString *path = DDJokerCacheFile(name);
+    dispatch_sync(DDJokerCacheQueue(), ^{
+        if (value) DDJokerMemCacheFor(name)[key] = value;
+        else [DDJokerMemCacheFor(name) removeObjectForKey:key];
+    });
+    dispatch_async(DDJokerCacheQueue(), ^{ [DDJokerMemCacheFor(name) writeToFile:path atomically:YES]; });
+}
+static void DDJokerCacheClear(NSString *name) {
+    NSString *path = DDJokerCacheFile(name);
+    dispatch_sync(DDJokerCacheQueue(), ^{ [DDJokerMemCaches() removeObjectForKey:name]; });
+    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+}
+static NSString *DDJokerImagesDir(void) {
+    NSString *dir = [DDJokerCacheDir() stringByAppendingPathComponent:@"DDJokerImages"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
 }
 
-/* 0x147e154 */
-static NSArray<NSString *> *WCRApplicationGroupIDs(void) {
-    return WCRDeclaredAppGroupIDs() ?: @[];
+static NSString *DDJokerCachedText(CMessageWrap *msg) {
+    if (!msg) return nil;
+    NSString *v = DDJokerCacheGet(kDDJokerTextCacheKey, DDJokerMessageKey(msg));
+    return [v isKindOfClass:[NSString class]] && [v length] ? v : nil;
 }
 
-#pragma mark - marker 读写（0x148190c / 0x14815d8 / 0x14810f8）
+static void DDJokerSetCachedText(CMessageWrap *msg, NSString *text) {
+    if (!msg) return;
+    DDJokerCacheSet(kDDJokerTextCacheKey, DDJokerMessageKey(msg), text.length ? text : nil);
+}
 
-static NSArray<NSURL *> *WCRMarkerFileURLs(void) {
-    NSMutableArray *urls = [NSMutableArray array];
+static NSString *DDJokerOriginalText(CMessageWrap *msg) {
+    if (!msg) return nil;
+    NSString *v = DDJokerCacheGet(kDDJokerTextOriginalKey, DDJokerMessageKey(msg));
+    return [v isKindOfClass:[NSString class]] && [v length] ? v : nil;
+}
+
+static void DDJokerSetOriginalText(CMessageWrap *msg, NSString *text) {
+    if (!msg || !text.length) return;
+    if (DDJokerOriginalText(msg)) return;
+    DDJokerCacheSet(kDDJokerTextOriginalKey, DDJokerMessageKey(msg), text);
+}
+
+static NSString *DDJokerCachedAmount(CMessageWrap *msg) {
+    if (!msg) return nil;
+    NSString *key = DDJokerAmountKey(msg);
+    if (!key) return nil;
+    NSString *v = DDJokerCacheGet(kDDJokerAmountCacheKey, key);
+    return [v isKindOfClass:[NSString class]] && [v length] ? v : nil;
+}
+
+static void DDJokerSetCachedAmount(CMessageWrap *msg, NSString *amount) {
+    if (!msg) return;
+    NSString *key = DDJokerAmountKey(msg);
+    if (!key) return;
+    DDJokerCacheSet(kDDJokerAmountCacheKey, key, amount.length ? amount : nil);
+}
+
+// 转账详情页作用域：由 WCPayTransferMoneyStatusViewController 的存活状态控制，
+// viewDidLoad 时进入（同时取出缓存金额）、dealloc 时退出。金额统一经
+// DDTransferDetailSetAmount 写入，label 每次刷新时实时取用，不依赖刷新时序。
+static NSInteger gDDTransferDetailCount = 0;
+static BOOL gDDInTransferDetail = NO;
+static NSString *gDDTransferDetailAmount = nil;
+
+static void DDTransferDetailSetAmount(NSString *amount) {
+    gDDTransferDetailAmount = amount.length ? [amount copy] : nil;
+}
+static void DDTransferDetailEnter(CMessageWrap *msg) {
+    gDDTransferDetailCount++;
+    gDDInTransferDetail = YES;
+    DDTransferDetailSetAmount(DDJokerCachedAmount(msg));
+}
+static void DDTransferDetailLeave(void) {
+    gDDTransferDetailCount--;
+    if (gDDTransferDetailCount <= 0) {
+        gDDTransferDetailCount = 0;
+        gDDInTransferDetail = NO;
+        gDDTransferDetailAmount = nil;
+    }
+}
+
+#pragma mark - 聊天时间 · 缓存与 ivar 读写
+// 直接读写 ChatTimeViewModel 的 _showingTime ivar（double 时间戳）；缓存按消息或原始时间戳索引。
+
+
+static Ivar DDShowingTimeIvarOf(id vm) {
+    if (!vm) return NULL;
+    Class cls = [vm class];
+    Ivar iv = class_getInstanceVariable(cls, "_showingTime");
+    if (iv) return iv;
+
+    Class c = cls;
+    while (c && !iv) {
+        unsigned int n = 0;
+        Ivar *list = class_copyIvarList(c, &n);
+        for (unsigned int i = 0; i < n; i++) {
+            const char *nm = ivar_getName(list[i]) ?: "";
+            const char *ty = ivar_getTypeEncoding(list[i]) ?: "";
+            if (strcmp(ty, "d") == 0 && DDStringHas(nm, "showingtime")) { iv = list[i]; break; }
+        }
+        free(list);
+        c = class_getSuperclass(c);
+    }
+    return iv;
+}
+
+static double DDShowingTimeOf(id vm) {
+    Ivar iv = DDShowingTimeIvarOf(vm);
+    if (!iv) return 0.0;
+    return *(double *)((uint8_t *)(__bridge void *)vm + ivar_getOffset(iv));
+}
+
+static void DDSetShowingTime(id vm, double ts) {
+    Ivar iv = DDShowingTimeIvarOf(vm);
+    if (!iv) return;
+    *(double *)((uint8_t *)(__bridge void *)vm + ivar_getOffset(iv)) = ts;
+}
+
+static void DDRefreshTimeText(id vm) {
+    [(ChatTimeViewModel *)vm updateLayouts];
+}
+
+static char kDDRawTimeKey;
+static double DDRawShowingTimeOf(id vm) {
+    if (!vm) return 0.0;
+    NSNumber *raw = objc_getAssociatedObject(vm, &kDDRawTimeKey);
+    if (!raw) {
+        raw = @(DDShowingTimeOf(vm));
+        objc_setAssociatedObject(vm, &kDDRawTimeKey, raw, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return [raw doubleValue];
+}
+
+static NSString *DDJokerTimeKey(id vm) {
+    id wrap = [vm respondsToSelector:@selector(messageWrap)] ? [vm messageWrap] : nil;
+    if ([wrap respondsToSelector:@selector(m_uiMesLocalID)] && [wrap m_uiMesLocalID] != 0) {
+        return DDJokerMessageKey((CMessageWrap *)wrap);
+    }
+    return [NSString stringWithFormat:@"ts_%.3f", DDRawShowingTimeOf(vm)];
+}
+
+static NSNumber *DDJokerCachedTime(id vm) {
+    if (!vm) return nil;
+    id v = DDJokerCacheGet(kDDJokerTimeCacheKey, DDJokerTimeKey(vm));
+    return [v isKindOfClass:[NSNumber class]] ? v : nil;
+}
+
+static void DDJokerSetCachedTime(id vm, double timestamp) {
+    if (!vm) return;
+    DDJokerCacheSet(kDDJokerTimeCacheKey, DDJokerTimeKey(vm), timestamp > 0 ? @(timestamp) : nil);
+}
+
+static void DDApplyTimeOverride(id vm) {
+    if (!vm || ![DDGlobalConfig shared].timeEnabled) return;
+    NSNumber *cached = DDJokerCachedTime(vm);
+    if (cached && DDShowingTimeOf(vm) != [cached doubleValue]) {
+        DDSetShowingTime(vm, [cached doubleValue]);
+    }
+}
+
+static void DDJokerClearAllMessageCache(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    for (NSString *gid in WCRApplicationGroupIDs()) {
-        /* 优先 LSBundleProxy.groupContainerURLs[gid]：该私有 API 不受
-         * com.apple.security.application-groups entitlement 约束，自签包里原版
-         * -[NSFileManager containerURLForSecurityApplicationGroupIdentifier:] 对未授权
-         * 组返回 nil，而 LSBundleProxy 仍能返回正确容器 URL（文档第五节：这就是自签修复
-         * 成立的根本原因）。WCR 的 WCRSideloadShareFixMarkerGroupID(0x148190c) /
-         * RemapGroupID(0x8f3f40) 取容器均走此路径，故 marker 读写必须对齐；
-         * 否则主 App 写不进、扩展进程读不到 → FixActive 在扩展进程恒为 NO →
-         * 通知详情 / 通知头像 / 分享跳转 全部失效。 */
-        NSURL *u = WCRContainerURLViaLSBundleProxy(gid);
-        if (![u isKindOfClass:[NSURL class]]) {
-            if (gOrigContainerURL) {
-                u = gOrigContainerURL(fm,
-                        @selector(containerURLForSecurityApplicationGroupIdentifier:), gid);
-            } else {
-                u = [fm containerURLForSecurityApplicationGroupIdentifier:gid];
-            }
-        }
-        if (![u isKindOfClass:[NSURL class]]) continue;
-        NSURL *dir = [u URLByAppendingPathComponent:kWCRPrefsSubPath isDirectory:YES];
-        [urls addObject:[dir URLByAppendingPathComponent:kWCRMarkerFileName]];
-    }
-    return urls;
+
+    DDJokerCacheClear(kDDJokerTextCacheKey);
+    DDJokerCacheClear(kDDJokerAmountCacheKey);
+    DDJokerCacheClear(kDDJokerTimeCacheKey);
+
+    [fm removeItemAtPath:DDJokerImagesDir() error:nil];
+    DDTransferDetailLeave();
 }
 
-static NSArray<NSString *> *WCRMarkerGroupIDsInternal(void) {
+
+static void JokerCollectViewControllers(UIViewController *root, NSMutableArray *out) {
+    if (!root || [out containsObject:root]) return;
+    [out addObject:root];
+    if (root.presentedViewController) JokerCollectViewControllers(root.presentedViewController, out);
+    for (UIViewController *c in root.childViewControllers) JokerCollectViewControllers(c, out);
+    if ([root isKindOfClass:[UINavigationController class]]) {
+        for (UIViewController *c in ((UINavigationController *)root).viewControllers) JokerCollectViewControllers(c, out);
+    }
+    if ([root isKindOfClass:[UITabBarController class]]) {
+        for (UIViewController *c in ((UITabBarController *)root).viewControllers) JokerCollectViewControllers(c, out);
+    }
+}
+
+static NSArray *JokerAllChatViewControllers(void) {
+    NSMutableArray *all = [NSMutableArray array];
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+            JokerCollectViewControllers(w.rootViewController, all);
+        }
+    }
+    NSMutableArray *chats = [NSMutableArray array];
+    for (UIViewController *vc in all) {
+        if ([vc isKindOfClass:%c(BaseMsgContentViewController)]) [chats addObject:vc];
+    }
+    return chats;
+}
+
+static void JokerReloadAllMsgContent(void) {
+    for (UIViewController *vc in JokerAllChatViewControllers()) {
+        UITableView *tv = [(BaseMsgContentViewController *)vc getMsgTableView];
+        if ([tv isKindOfClass:[UITableView class]]) [tv reloadData];
+    }
+}
+
+static void DDCollectViewsOfClass(UIView *root, Class cls, NSMutableArray *out) {
+    if (!root) return;
+    if ([root isKindOfClass:cls]) {
+        if (![out containsObject:root]) [out addObject:root];
+        return;
+    }
+    for (UIView *v in root.subviews) DDCollectViewsOfClass(v, cls, out);
+}
+
+static NSArray *DDVisibleCellViewsOfClass(UITableView *tv, Class cls) {
     NSMutableArray *out = [NSMutableArray array];
-    NSArray<NSString *> *available = WCRApplicationGroupIDs();
-    for (NSURL *mu in WCRMarkerFileURLs()) {
-        NSString *content = [NSString stringWithContentsOfURL:mu
-                                                     encoding:NSUTF8StringEncoding
-                                                        error:NULL];
-        NSString *gid = [content stringByTrimmingCharactersInSet:
-                            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (gid.length == 0) continue;
-        if (![available containsObject:gid]) continue;
-        if (![out containsObject:gid]) [out addObject:gid];
+    if (![tv isKindOfClass:[UITableView class]] || !cls) return out;
+    for (UITableViewCell *c in [tv visibleCells]) {
+        DDCollectViewsOfClass(c.contentView, cls, out);
+        DDCollectViewsOfClass(c, cls, out);
     }
     return out;
 }
 
-/* 0x148190c */
-static NSString *WCRMarkerGroupID(void) {
-    return WCRMarkerGroupIDsInternal().firstObject;
+static void JokerRefreshVisibleImageCells(void) {
+    for (UIViewController *vc in JokerAllChatViewControllers()) {
+        UITableView *tv = [(BaseMsgContentViewController *)vc getMsgTableView];
+        if (![tv isKindOfClass:[UITableView class]]) continue;
+        for (ImageMessageCellView *cellView in DDVisibleCellViewsOfClass(tv, %c(ImageMessageCellView))) {
+            if ([cellView respondsToSelector:@selector(showImage)]) [cellView showImage];
+        }
+    }
 }
 
-/* 0x14815d8 —— 主 App 把选定组写进**所有**可用容器（多开防串号：不同实例选不同组） */
-static BOOL WCRWriteGroupMarker(NSString *groupID) {
-    if (groupID.length == 0) return NO;
-    BOOL ok = NO;
-    for (NSURL *mu in WCRMarkerFileURLs()) {
-        WCREnsureDirectory([mu URLByDeletingLastPathComponent].path);
-        if ([groupID writeToURL:mu atomically:YES
-                       encoding:NSUTF8StringEncoding error:NULL]) ok = YES;
+static NSString *DDTransferFeedescAmount(NSString *xml);
+static NSString *JokerGetDisplayText(CMessageWrap *msg, BOOL isTransfer) {
+    if (isTransfer) {
+        NSString *cached = DDJokerCachedAmount(msg);
+        if (cached.length) return cached;
+        NSString *raw = DDTransferFeedescAmount([msg m_nsContent]);
+        return JokerNormalizeAmount(raw) ?: @"";
+    }
+    NSString *cached = DDJokerCachedText(msg);
+    if (cached) return cached;
+
+    if (JokerIsReferMessage(msg)) {
+        NSString *t = JokerReferMessageTitle(msg);
+        if (t) return t;
+    }
+    return [msg GetDisplayContent] ?: @"";
+}
+
+static UITableView *JokerFindTableView(UIView *view) {
+    UIView *v = view;
+    while (v) {
+        if ([v isKindOfClass:[UITableView class]]) return (UITableView *)v;
+        v = v.superview;
+    }
+    return nil;
+}
+
+static void JokerApplyTextToRichView(id richView, NSString *text) {
+    if (!richView || !text) return;
+    [richView setContent:text];
+    [richView calculateAndUpdateFrame];
+    [richView forceDisplayInSync];
+    [richView setNeedsDisplay];
+}
+
+static void JokerResetViewModelCache(CommonMessageCellView *cell) {
+    id vm = cell.viewModel;
+    [vm resetLayoutCache];
+}
+
+static void JokerRefreshCellDirectly(CommonMessageCellView *cell) {
+    if (!cell) return;
+    JokerResetViewModelCache(cell);
+    CMessageWrap *msg = JokerGetMessageWrapFromCell(cell);
+
+    if ([cell isKindOfClass:%c(TextMessageCellView)]) {
+        NSString *cached = [DDGlobalConfig shared].textEnabled ? DDJokerCachedText(msg) : nil;
+
+        if (!cached && (JokerIsTextMessage(msg) || JokerIsReferMessage(msg))) {
+            if (JokerIsReferMessage(msg)) {
+                cached = JokerReferMessageTitle(msg) ?: [msg GetDisplayContent];
+            } else {
+                cached = [msg GetDisplayContent];
+            }
+        }
+        JokerApplyTextToRichView([(TextMessageCellView *)cell getRichTextView], cached);
+        [(TextMessageCellView *)cell layoutContentView];
+    } else if ([cell isKindOfClass:%c(WCPayTransferMessageCellView)]) {
+        [(WCPayTransferMessageCellView *)cell layoutContentView];
+
+        [(WCPayTransferMessageCellView *)cell updateTitleLabel];
+        [(WCPayTransferMessageCellView *)cell updateDescLabel];
+    } else if ([cell isKindOfClass:%c(ImageMessageCellView)]) {
+        [(ImageMessageCellView *)cell showImage];
+    }
+    [cell setNeedsLayout];
+}
+
+static void JokerInvalidateAllLayout(void);
+
+static void JokerReloadCellAfterReplace(id vc, CMessageWrap *msg, CommonMessageCellView *cell) {
+    JokerRefreshCellDirectly(cell);
+    UITableView *tv = cell ? JokerFindTableView((UIView *)cell) : nil;
+    if (![tv isKindOfClass:[UITableView class]] && [vc isKindOfClass:%c(BaseMsgContentViewController)]) {
+        tv = [(BaseMsgContentViewController *)vc getMsgTableView];
+    }
+    if (![tv isKindOfClass:[UITableView class]]) {
+
+        JokerReloadAllMsgContent();
+        return;
+    }
+
+    CGPoint center = [cell convertPoint:CGPointMake(CGRectGetMidX(cell.bounds), CGRectGetMidY(cell.bounds)) toView:tv];
+    NSIndexPath *ip = [tv indexPathForRowAtPoint:center];
+    if (ip) {
+        [UIView performWithoutAnimation:^{
+            [tv reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
+        }];
+        return;
+    }
+    JokerInvalidateAllLayout();
+}
+
+static void JokerPresentEditor(CommonMessageCellView *cell) {
+
+    if (!JokerIsSupportedCell(cell)) return;
+    CMessageWrap *msg = JokerGetMessageWrapFromCell(cell);
+    id vc = JokerGetViewControllerFromView(cell);
+
+    BOOL isTransfer = JokerIsTransferCell(cell);
+    NSString *current = JokerGetDisplayText(msg, isTransfer);
+
+    NSString *editorTitle = isTransfer ? @"转账修改" : @"文字修改";
+    NSString *editorMessage = isTransfer ? @"请输入需要修改的金额\n留空还原" : @"请输入需要修改的文字\n留空还原";
+    WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:editorTitle message:editorMessage];
+    if (!alert) return;
+    [alert showTextFieldWithMaxLen:1000];
+    [alert setTextFieldDefaultText:current];
+
+    __block WCUIAlertView *blockAlert = alert;
+    __block UITextField *inputField = nil;
+    [alert addCancelBtnTitle:@"取消" handler:^{}];
+    [alert addBtnTitle:@"确定" handler:^{
+        NSString *raw = blockAlert ? [blockAlert getTextFieldText] : nil;
+        if (!raw.length) raw = inputField.text;
+        NSString *newText = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (newText.length) {
+            if ([newText isEqualToString:current]) { blockAlert = nil; return; }
+            if (isTransfer) {
+                NSString *normalized = JokerNormalizeAmount(newText);
+                if (normalized) { DDJokerSetCachedAmount(msg, normalized); }
+            } else {
+                DDJokerSetCachedText(msg, newText);
+            }
+            JokerReloadCellAfterReplace(vc, msg, cell);
+        } else if (isTransfer ? DDJokerCachedAmount(msg) : DDJokerCachedText(msg)) {
+
+            if (isTransfer) DDJokerSetCachedAmount(msg, nil);
+            else DDJokerSetCachedText(msg, nil);
+            JokerReloadCellAfterReplace(vc, msg, cell);
+        }
+        blockAlert = nil;
+    }];
+    [alert show];
+    UITextField *tf = [alert getTextField];
+    if (tf) {
+        inputField = tf;
+        if (isTransfer) tf.keyboardType = UIKeyboardTypeDecimalPad;
+    }
+}
+
+// 菜单项：直接用微信内置 svg 图标 icons_filled_sticker（MMMenuItem.h:29 原生支持 svg 资源名）。
+static MMMenuItem *DDJokerMenuItem(NSString *title, id target, SEL action) {
+    id item = [%c(MMMenuItem) alloc];
+    return [item initWithTitle:title
+            svgName:@"icons_filled_sticker"
+            target:target
+            action:action];
+}
+
+static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *original) {
+
+    if (!JokerEnabledForCell(cell)) return original;
+    if (!JokerIsSupportedCell(cell)) return original;
+
+    MMMenuItem *newItem = DDJokerMenuItem(@"小丑", cell, @selector(joker_handleMenuItem:));
+    NSMutableArray *newItems = [NSMutableArray arrayWithArray:original];
+    [newItems insertObject:newItem atIndex:0];
+    return newItems;
+}
+
+static void DDJokerApplyTextOverride(CMessageWrap *msg) {
+    if (!msg) return;
+    if (!JokerIsTextMessage(msg) && !JokerIsReferMessage(msg)) return;
+    NSString *original = DDJokerOriginalText(msg);
+    if (!original.length) {
+        DDJokerSetOriginalText(msg, msg.m_nsContent);
+        original = msg.m_nsContent;
+    }
+    NSString *cached = [DDGlobalConfig shared].textEnabled ? DDJokerCachedText(msg) : nil;
+    NSString *target = cached ?: original;
+    if (target.length && ![target isEqualToString:msg.m_nsContent]) {
+        [msg setM_nsContent:target];
+    }
+}
+
+%hook TextMessageViewModel
+- (NSString *)contentText {
+    DDJokerApplyTextOverride(self.messageWrap);
+    NSString *origin = %orig;
+    if (![DDGlobalConfig shared].textEnabled) return origin;
+    CMessageWrap *msg = self.messageWrap;
+
+    if (!JokerIsTextMessage(msg) && !JokerIsReferMessage(msg)) return origin;
+    NSString *cached = DDJokerCachedText(msg);
+    return cached ?: origin;
+}
+%end
+
+static BOOL gJokerNeedsResetLayout = NO;
+
+static void JokerInvalidateAllLayout(void) {
+    gJokerNeedsResetLayout = YES;
+    JokerReloadAllMsgContent();
+    JokerRefreshVisibleImageCells();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        gJokerNeedsResetLayout = NO;
+    });
+}
+
+%hook TextMessageCellView
+
+- (void)setViewModel:(id)vm {
+    %orig;
+    if (![vm respondsToSelector:@selector(resetLayoutCache)]) return;
+    CMessageWrap *msg = [(CommonMessageViewModel *)vm messageWrap];
+    if (!JokerIsTextMessage(msg) && !JokerIsReferMessage(msg)) return;
+
+    if (gJokerNeedsResetLayout || DDJokerCachedText(msg) || ![DDGlobalConfig shared].textEnabled) {
+        [(TextMessageViewModel *)vm resetLayoutCache];
+    }
+}
+- (id)getTextString {
+    CMessageWrap *msg = JokerGetMessageWrapFromCell(self);
+    DDJokerApplyTextOverride(msg);
+    id origin = %orig;
+    if (![DDGlobalConfig shared].textEnabled) return origin;
+    if (!JokerIsTextMessage(msg) && !JokerIsReferMessage(msg)) return origin;
+    NSString *cached = DDJokerCachedText(msg);
+    return cached ?: origin;
+}
+- (NSArray *)operationMenuItems {
+    return JokerInjectMenuItem(self, %orig);
+}
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+    if (action == @selector(joker_handleMenuItem:)) {
+        return JokerEnabledForCell(self) && JokerIsSupportedCell(self);
+    }
+    return %orig;
+}
+%new
+- (void)joker_handleMenuItem:(id)sender {
+    JokerPresentEditor(self);
+}
+%end
+
+static NSString *DDTransferFeedescAmount(NSString *xml) {
+    if (!xml.length) return nil;
+    NSString *open = @"<feedesc><![CDATA[";
+    NSString *close = @"]]></feedesc>";
+    NSRange ro = [xml rangeOfString:open];
+    if (ro.location == NSNotFound) return nil;
+    NSUInteger start = ro.location + ro.length;
+    NSRange rc = [xml rangeOfString:close options:0 range:NSMakeRange(start, xml.length - start)];
+    if (rc.location == NSNotFound) return nil;
+    return [xml substringWithRange:NSMakeRange(start, rc.location - start)];
+}
+
+static NSString *DDTransferReplaceAmountInText(NSString *text, NSString *override) {
+    if (!text.length || !override.length) return text;
+    // 转账消息金额：必带 ¥、两位小数（允许千分位逗号）。
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"¥\\d[\\d,]*\\.\\d{2}"
+            options:0
+            error:nil];
+    if (!re) return text;
+    NSString *newAmount = [@"¥" stringByAppendingString:override];
+    return [re stringByReplacingMatchesInString:text
+            options:0
+            range:NSMakeRange(0, text.length)
+            withTemplate:newAmount];
+}
+
+// 转账详情页金额改写：进入详情页时按 transferid 命中缓存金额并进入作用域；
+// 金额 label 渲染时由 MMUILabel 的 hook 实时改写为目标值。
+%hook WCPayTransferMoneyStatusViewController
+- (void)viewDidLoad {
+    DDTransferDetailEnter([self data].m_oSelectedMessageWrap);
+    %orig;
+}
+- (void)dealloc {
+    %orig;
+    DDTransferDetailLeave();
+}
+%end
+
+%hook WCPayTransferMessageCellView
+
+- (NSArray *)operationMenuItems {
+    return JokerInjectMenuItem(self, %orig);
+}
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+
+    if (action == @selector(joker_handleMenuItem:)) {
+        return [DDGlobalConfig shared].transferEnabled;
+    }
+    return %orig;
+}
+%new
+- (void)joker_handleMenuItem:(id)sender {
+    JokerPresentEditor(self);
+}
+%end
+
+%hook WCPayTransferMessageViewModel
+- (NSString *)titleText {
+    NSString *origin = %orig;
+    if (![DDGlobalConfig shared].transferEnabled) return origin;
+    NSString *cached = DDJokerCachedAmount(self.messageWrap);
+    NSString *out = cached ? DDTransferReplaceAmountInText(origin, cached) : origin;
+    return out;
+}
+- (NSString *)descText {
+    NSString *origin = %orig;
+    if (![DDGlobalConfig shared].transferEnabled) return origin;
+    NSString *cached = DDJokerCachedAmount(self.messageWrap);
+    return cached ? DDTransferReplaceAmountInText(origin, cached) : origin;
+}
+%end
+
+// 转账详情页金额 label 为 MMUILabel，直接 hook 其 setText:/setAttributedText:：
+// 当处于转账详情页作用域、功能开启且文本为 ¥ 金额时，改写为目标金额。
+// 每次 setText: 实时取用最新目标值，覆盖微信的状态刷新与重布局。
+
+%hook MMUILabel
+- (void)setText:(NSString *)text {
+    if (gDDInTransferDetail && [DDGlobalConfig shared].transferEnabled && gDDTransferDetailAmount.length && [text hasPrefix:@"¥"]) {
+        %orig([@"¥" stringByAppendingString:gDDTransferDetailAmount]);
+    } else {
+        %orig;
+    }
+}
+- (void)setAttributedText:(NSAttributedString *)attr {
+    if (gDDInTransferDetail && [DDGlobalConfig shared].transferEnabled && gDDTransferDetailAmount.length
+        && attr.string.length && [attr.string hasPrefix:@"¥"]) {
+        NSDictionary *attrs = [attr attributesAtIndex:0 effectiveRange:NULL];
+        %orig([[NSAttributedString alloc] initWithString:[@"¥" stringByAppendingString:gDDTransferDetailAmount] attributes:attrs]);
+    } else {
+        %orig;
+    }
+}
+%end
+
+#pragma mark - 聊天图片改写
+// hook ImageMessageCellView 各渲染入口注入替换图；相册选图回调见下一段。
+
+
+@interface DDWeChatImagePickerDelegate : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
+@property (nonatomic, copy) NSString *sessionKey;   // 会话唯一键（from|to|localID），区分不同会话的图片改写
+@property (nonatomic, weak) id cellView;
+@end
+
+static NSString *DDImageReplacementPath(NSString *sessionKey) {
+    NSString *folder = DDJokerImagesDir();
+    NSString *safe = [sessionKey stringByReplacingOccurrencesOfString:@"|" withString:@"_"];
+    return [folder stringByAppendingPathComponent:[safe stringByAppendingString:@".png"]];
+}
+
+static UIImage *DDImageReplacementForMessage(CMessageWrap *msg) {
+    if (!msg || ![msg IsImgMsg]) return nil;
+    NSString *path = DDImageReplacementPath(DDJokerMessageKey(msg));
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return nil;
+    return [UIImage imageWithContentsOfFile:path];
+}
+
+static UIImageView *DDImageViewFromCell(UIView *cell) {
+    if (!cell) return nil;
+    // 图片视图为 ImageMessageCellView 的 m_imageView ivar，直接读取，无需遍历。
+    Ivar ivar = class_getInstanceVariable([cell class], "m_imageView");
+    if (ivar) {
+        id value = object_getIvar(cell, ivar);
+        if ([value isKindOfClass:[UIImageView class]]) return (UIImageView *)value;
+    }
+    return nil;
+}
+
+static void DDImageApplyReplacementToCell(id cell) {
+    if (![DDGlobalConfig shared].imageEnabled) return;
+    CMessageWrap *msg = ((CommonMessageCellView *)cell).viewModel.messageWrap;
+    UIImage *rep = DDImageReplacementForMessage(msg);
+    if (rep) {
+        UIImageView *iv = DDImageViewFromCell((UIView *)cell);
+        [iv setImage:rep];
+    }
+}
+
+%hook ImageMessageCellView
+- (void)setViewModel:(id)vm {
+    %orig;
+    DDImageApplyReplacementToCell(self);
+}
+- (NSArray *)operationMenuItems {
+    NSArray *original = %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (!cfg.imageEnabled) return original;
+    CMessageWrap *msg = self.viewModel.messageWrap;
+    if (![msg IsImgMsg]) return original;
+    MMMenuItem *newItem = DDJokerMenuItem(@"小丑", self, @selector(dk_changeChatImage));
+    NSMutableArray *newItems = [NSMutableArray arrayWithArray:original];
+    [newItems insertObject:newItem atIndex:0];
+    return newItems;
+}
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+    if (action == @selector(dk_changeChatImage)) {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (!cfg.imageEnabled) return NO;
+        CMessageWrap *msg = self.viewModel.messageWrap;
+        return [msg IsImgMsg];
+    }
+    return %orig;
+}
+%new
+- (void)dk_changeChatImage {
+    CMessageWrap *msg = self.viewModel.messageWrap;
+    if (![msg IsImgMsg]) return;
+    id vc = JokerGetViewControllerFromView((UIView *)(id)self);
+    if (!vc) return;
+    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+    picker.allowsEditing = NO;
+    picker.title = @"图片修改";
+    DDWeChatImagePickerDelegate *delegate = [[DDWeChatImagePickerDelegate alloc] init];
+    delegate.sessionKey = DDJokerMessageKey(msg);
+    delegate.cellView = self;
+    picker.delegate = delegate;
+
+    // 关联对象只为在 picker 存活期间强持有 delegate（picker.delegate 是 assign，不持有）
+    objc_setAssociatedObject(picker, "dd_picker_delegate", delegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [vc presentViewController:picker animated:YES completion:nil];
+}
+- (void)showImage {
+    %orig;
+    DDImageApplyReplacementToCell(self);
+}
+- (void)OnDownloadImageOk:(id)a0 {
+
+    %orig;
+    DDImageApplyReplacementToCell(self);
+}
+- (void)layoutContentView {
+    %orig;
+    DDImageApplyReplacementToCell(self);
+}
+%end
+
+@implementation DDWeChatImagePickerDelegate
+
+#pragma mark - 系统相册选图回调
+// 选图后落盘到以 sessionKey（from|to|localID）命名的 png，并刷新对应 cell。
+
+
+- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<NSString *,id> *)info {
+    UIImage *image = info[UIImagePickerControllerOriginalImage];
+    if (image) [self dd_saveImage:image dismissPicker:picker];
+    else [picker dismissViewControllerAnimated:YES completion:nil];
+}
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)dd_saveImage:(UIImage *)image dismissPicker:(UIImagePickerController *)picker {
+    NSString *path = DDImageReplacementPath(self.sessionKey);
+    NSData *data = UIImagePNGRepresentation(image);
+    if (!data) { [picker dismissViewControllerAnimated:YES completion:nil]; return; }
+    [data writeToFile:path atomically:YES];
+
+    id cellView = self.cellView;
+    if ([cellView isKindOfClass:%c(ImageMessageCellView)]) {
+        DDImageApplyReplacementToCell(cellView);
+        [(UIView *)cellView setNeedsLayout];
+    } else {
+        JokerInvalidateAllLayout();
+    }
+    [picker dismissViewControllerAnimated:YES completion:nil];
+}
+@end
+
+#pragma mark - 聊天时间改写
+// hook ChatTimeViewModel / ChatTimeCellView：接管时间条显示，长按弹输入改时间。
+
+
+static char kDDTimeVMKey;
+
+static NSDateFormatter *DDTimeInputFormatter(void) {
+    NSDateFormatter *f = [[NSDateFormatter alloc] init];
+    f.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    f.dateFormat = @"yyyy-MM-dd HH:mm";
+    return f;
+}
+
+static double DDTimeStampFromString(NSString *s) {
+    if (!s.length) return 0;
+    NSDate *d = [DDTimeInputFormatter() dateFromString:s];
+    return d ? [d timeIntervalSince1970] : 0;
+}
+
+%hook ChatTimeViewModel
+- (NSString *)timeText {
+
+    double raw = DDRawShowingTimeOf(self);
+    NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(self) : nil;
+    double target = cached ? [cached doubleValue] : raw;
+
+    if (target > 0 && DDShowingTimeOf(self) != target) {
+        DDSetShowingTime(self, target);
+        DDRefreshTimeText(self);
+    }
+
+    return %orig;
+}
+
+%end
+
+%hook ChatTimeCellView
+- (id)initWithViewModel:(id)vm {
+    id r = %orig;
+
+    objc_setAssociatedObject(r, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [(ChatTimeCellView *)r dk_installTimeEditGesture];
+    return r;
+}
+- (void)setViewModel:(id)vm {
+    %orig;
+    objc_setAssociatedObject(self, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [self dk_installTimeEditGesture];
+}
+- (void)didMoveToWindow {
+    %orig;
+    [self dk_installTimeEditGesture];
+    if (!self.window) return;
+    id vm = objc_getAssociatedObject(self, &kDDTimeVMKey);
+    if (!vm) return;
+    NSNumber *cached = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(vm) : nil;
+    if (!cached) return;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.window) return;
+        id v = objc_getAssociatedObject(self, &kDDTimeVMKey);
+        if (!v) return;
+        NSNumber *c = [DDGlobalConfig shared].timeEnabled ? DDJokerCachedTime(v) : nil;
+        if (!c) return;
+        DDApplyTimeOverride(v);
+        DDRefreshTimeText(v);
+        [(ChatTimeCellView *)self layoutInternal];
+        [self setNeedsLayout];
+    });
+}
+%new
+- (UILabel *)dk_timeLabel {
+    // 时间 label 为 ChatTimeCellView 的 m_timeLabel ivar，直接读取，无需遍历。
+    Ivar iv = class_getInstanceVariable([self class], "m_timeLabel");
+    if (iv) {
+        id v = object_getIvar(self, iv);
+        if ([v isKindOfClass:[UILabel class]]) return (UILabel *)v;
+    }
+    return nil;
+}
+%new
+- (void)dk_installTimeEditGesture {
+    if (![DDGlobalConfig shared].timeEnabled) return;
+    UILabel *label = [self dk_timeLabel];
+    if (!label) return;
+    for (UIGestureRecognizer *g in label.gestureRecognizers) {
+        if ([g isKindOfClass:[UILongPressGestureRecognizer class]]) return;
+    }
+    label.userInteractionEnabled = YES;
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(dk_handleTimeLongPress:)];
+    lp.minimumPressDuration = 0.5;
+    lp.allowableMovement = 24;
+    lp.cancelsTouchesInView = NO;
+    [label addGestureRecognizer:lp];
+}
+%new
+- (void)dk_handleTimeLongPress:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    [self dk_showTimeInput];
+}
+%new
+- (void)dk_showTimeInput {
+    if (![DDGlobalConfig shared].timeEnabled) return;
+    id vm = objc_getAssociatedObject(self, &kDDTimeVMKey);
+    if (!vm || !%c(WCUIAlertView)) return;
+
+    NSNumber *cached = DDJokerCachedTime(vm);
+    double base = cached ? [cached doubleValue]
+            : DDShowingTimeOf(vm);
+    NSString *defaultText = base > 0 ? [DDTimeInputFormatter() stringFromDate:[NSDate dateWithTimeIntervalSince1970:base]] : @"";
+
+    WCUIAlertView *alert = [(WCUIAlertView *)[%c(WCUIAlertView) alloc] initWithTitle:@"时间修改"
+            message:@"输入格式如下\n2024-08-01 22:30\n留空还原"];
+    [alert showTextFieldWithMaxLen:100];
+    [alert setTextFieldDefaultText:defaultText];
+
+    __block WCUIAlertView *blockAlert = alert;
+    __block UITextField *inputField = nil;
+    [alert addCancelBtnTitle:@"取消" handler:^{ blockAlert = nil; }];
+    [alert addBtnTitle:@"确定" handler:^{
+        NSString *raw = blockAlert ? [blockAlert getTextFieldText] : nil;
+        if (!raw.length) raw = inputField.text;
+        NSString *t = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        double ts = DDTimeStampFromString(t);
+        if (ts > 0) {
+
+            DDJokerSetCachedTime(vm, ts);
+            DDSetShowingTime(vm, ts);
+            DDRefreshTimeText(vm);
+            [self layoutInternal];
+            [self setNeedsLayout];
+        } else if (DDJokerCachedTime(vm)) {
+
+            DDJokerSetCachedTime(vm, 0);
+            double rawTime = DDRawShowingTimeOf(vm);
+            if (rawTime > 0) DDSetShowingTime(vm, rawTime);
+            DDRefreshTimeText(vm);
+            [self layoutInternal];
+            [self setNeedsLayout];
+        }
+        blockAlert = nil;
+    }];
+    [alert show];
+    UITextField *tf = [alert getTextField];
+    if (tf) inputField = tf;
+    objc_setAssociatedObject(self, &kDDTimeVMKey, vm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+%end
+
+#pragma mark - 运动步数改写
+// hook WCDeviceStepObject 的 m7StepCount / hkStepCount getter，返回自定义步数。
+
+
+%hook WCDeviceStepObject
+- (unsigned int)m7StepCount {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.stepsEnabled && [cfg hasStepsValue]) {
+        NSInteger v = [cfg stepsIntegerValue];
+        if (v > 0) return (unsigned int)MIN(v, 99999);
+    }
+    return %orig;
+}
+
+- (unsigned int)hkStepCount {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.stepsEnabled && [cfg hasStepsValue]) {
+        NSInteger v = [cfg stepsIntegerValue];
+        if (v > 0) return (unsigned int)MIN(v, 99999);
+    }
+    return %orig;
+}
+%end
+
+#pragma mark - 好友数量改写
+// hook ContactsDataLogic 数量 getter 与通讯录页标题。
+
+
+%hook ContactsDataLogic
+- (unsigned int)m_uiNormalContact {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.contactsEnabled && [cfg hasContactsValue]) {
+        NSInteger v = [cfg.contactsValue integerValue];
+        if (v > 0) return (unsigned int)v;
+    }
+    return %orig;
+}
+%end
+
+%hook ContactsViewController
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.contactsEnabled && [cfg hasContactsValue]) {
+        self.title = [NSString stringWithFormat:@"通讯录(%@)", cfg.contactsValue];
+    }
+
+    if ([self respondsToSelector:@selector(updateCount)]) [self updateCount];
+}
+%end
+
+#pragma mark - 余额 / 零钱通改写（工具）
+// 元→分换算、页面类型判定（余额 / 零钱通 / 无关）、金额文本正则改写。
+
+
+static unsigned long long DDBalanceFenValue(void) {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (![cfg hasBalanceValue]) return 0;
+    double v = [cfg.balanceValue doubleValue];
+    if (v < 0) v = 0;
+    return (unsigned long long)(v * 100.0 + 0.5);
+}
+
+static unsigned long long DDLingtongFenValue(void) {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (![cfg hasLingtongValue]) return 0;
+    double v = [cfg.lingtongValue doubleValue];
+    if (v < 0) v = 0;
+    return (unsigned long long)(v * 100.0 + 0.5);
+}
+
+typedef NS_ENUM(NSInteger, DDBalancePageKind) {
+    DDBalancePageNone = 0,
+    DDBalancePageBalance,
+    DDBalancePageLQT
+};
+
+// 页面判定：沿响应链上溯，命中的第一条规则即返回。
+//   钱包页单元格：祖先 accessibilityIdentifier 为 balance_cell → 余额，lqt_cell → 零钱通
+//   详情/服务页（VC description）：balanceEntryUIPage / WCPayMainViewControllerV2 → 余额，lqtDetailUIPage → 零钱通
+static DDBalancePageKind DDBalancePageKindOf(id sn) {
+    @try {
+        if (![sn isKindOfClass:[UIView class]]) return DDBalancePageNone;
+        UIResponder *r = (UIResponder *)sn;
+        for (int depth = 0; depth < 24 && r; depth++) {
+            if ([r isKindOfClass:[UIView class]]) {
+                NSString *ai = ((UIView *)r).accessibilityIdentifier;
+                if ([ai isEqualToString:@"lqt_cell"])
+                    return DDBalancePageLQT;
+                if ([ai isEqualToString:@"balance_cell"])
+                    return DDBalancePageBalance;
+            }
+            if ([r isKindOfClass:[UIViewController class]]) {
+                NSString *cls = NSStringFromClass([r class]) ?: @"";
+                NSString *all = [NSString stringWithFormat:@"%@ %@", cls, [r description] ?: @""];
+                if ([all rangeOfString:@"lqtDetailUIPage"].location != NSNotFound)
+                    return DDBalancePageLQT;
+                if ([all rangeOfString:@"balanceEntryUIPage"].location != NSNotFound ||
+                    [cls rangeOfString:@"WCPayMainViewControllerV2"].location != NSNotFound)
+                    return DDBalancePageBalance;
+            }
+            r = r.nextResponder;
+        }
+    } @catch (NSException *e) {}
+    return DDBalancePageNone;
+}
+
+// 帧修正专用判定：只认钱包页零钱/零钱通单元格的标识符，
+// 不认任何 VC，避免把微信支付总页（WCPayMainViewControllerV2 等）下其他页面的
+// TimeoutNumber 也卷进 frame 重设（那种布局不同，强行右对齐会把数字顶没）。
+static DDBalancePageKind DDBalanceCellKindOf(id sn) {
+    @try {
+        if (![sn isKindOfClass:[UIView class]]) return DDBalancePageNone;
+        UIResponder *r = (UIResponder *)sn;
+        for (int depth = 0; depth < 24 && r; depth++) {
+            if ([r isKindOfClass:[UIView class]]) {
+                NSString *ai = ((UIView *)r).accessibilityIdentifier;
+                if ([ai isEqualToString:@"lqt_cell"]) return DDBalancePageLQT;
+                if ([ai isEqualToString:@"balance_cell"]) return DDBalancePageBalance;
+            }
+            r = r.nextResponder;
+        }
+    } @catch (NSException *e) {}
+    return DDBalancePageNone;
+}
+
+// 判定基准归一化：ScrollNumber 在部分 dump 里被标成 NSObject，运行时未必是 UIView。
+//   若传入的对象不是 UIView，就改用它持有的 container（外层 TimeoutNumber）或 superview
+//   作为判定基准 —— 否则所有 isKindOfClass:[UIView class] 的守卫都会直接返回"未命中"。
+static id DDBalanceAnchorOf(id v) {
+    if ([v isKindOfClass:[UIView class]]) return v;
+    @try {
+        if ([v respondsToSelector:@selector(container)]) {
+            id c = [v container];
+            if ([c isKindOfClass:[UIView class]]) return c;
+        }
+        if ([v respondsToSelector:@selector(superview)]) {
+            id sp = [v superview];
+            if ([sp isKindOfClass:[UIView class]]) return sp;
+        }
+    } @catch (NSException *e) {}
+    return v;
+}
+
+// 改值判定（宽）：认 cell 标识符，也认详情页 / 服务页的 VC —— 这些页面的金额都要改，
+//   覆盖面要广。与下面修帧用的窄判定刻意分开：改值可以广，动 frame 必须窄。
+static DDBalancePageKind DDBalanceResolveKind(id v) {
+    return DDBalancePageKindOf(DDBalanceAnchorOf(v));
+}
+
+// 修帧判定（窄）：只认钱包页两个金额单元格 balance_cell（零钱）/ lqt_cell（零钱通）。
+//   这两个 cell 的金额行右侧有箭头，改值后数字变长会右溢盖住它，才需要重排；
+//   服务页钱包入口、零钱 / 零钱通详情页的金额本来就不顶格，动它们的 frame 反而会被推歪。
+static DDBalancePageKind DDBalanceFixKindFor(id v) {
+    return DDBalanceCellKindOf(DDBalanceAnchorOf(v));
+}
+
+// 前向声明：DDClampFen 定义在本文件稍后（取目标值时要先钳位）
+static unsigned long long DDClampFen(unsigned long long fen);
+
+// 取该 view 应改成的目标值（分）；不需要改写返回 NO。
+static BOOL DDBalanceWantFenFor(id v, DDBalancePageKind kind, unsigned long long *out) {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { *out = DDClampFen(DDLingtongFenValue()); return YES; }
+    if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { *out = DDClampFen(DDBalanceFenValue()); return YES; }
+    return NO;
+}
+
+// 钱包页金额行右侧箭头 + 间距占用的宽度，沿用 28pt 右缘边距常量（不压箭头）。
+static const CGFloat kDDWalletArrowGap = 28.0;
+
+// frame 是否已足够接近（避免重复赋值触发反复重排 → 闪烁）
+static BOOL DDBalanceFrameNear(CGRect a, CGRect b) {
+    return (fabs(a.origin.x - b.origin.x) < 0.5 && fabs(a.origin.y - b.origin.y) < 0.5 &&
+            fabs(a.size.width - b.size.width) < 0.5 && fabs(a.size.height - b.size.height) < 0.5);
+}
+
+static unsigned long long DDClampFen(unsigned long long fen) {
+    const unsigned long long kMaxFen = 99999999999ULL;
+    return fen > kMaxFen ? kMaxFen : fen;
+}
+
+static NSString *DDBalanceRewriteMoneyText(NSString *text, unsigned long long fen) {
+    if (!text.length) return text;
+    // 金额由 ScrollNumber 以两位小数渲染，¥ 为独立 label，故匹配可选 ¥ + 两位小数数字。
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"[¥￥]?\\s*\\d[\\d,]*\\.\\d{2}" options:0 error:nil];
+    NSTextCheckingResult *m = [re firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
+    if (!m || m.range.location == NSNotFound) return text;
+    NSRange r = m.range;
+    NSString *num = [text substringWithRange:r];
+    BOOL sym = ([num hasPrefix:@"¥"] || [num hasPrefix:@"￥"]);
+    NSString *core = sym ? [num substringFromIndex:1] : num;
+    core = [core stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    BOOL comma = ([core rangeOfString:@","].location != NSNotFound);
+    NSInteger dec = 0;
+    NSRange dot = [core rangeOfString:@"."];
+    if (dot.location != NSNotFound) dec = (NSInteger)core.length - (NSInteger)dot.location - 1;
+    unsigned long long scaled = fen;
+    if (dec > 2) { for (int i = 0; i < dec - 2; i++) scaled *= 10; }
+    else { for (int i = 0; i < 2 - dec; i++) scaled /= 10; }
+    unsigned long long ip = scaled / (unsigned long long)pow(10, dec);
+    unsigned long long fp = scaled % (unsigned long long)pow(10, dec);
+    NSMutableString *ipStr = [NSMutableString stringWithFormat:@"%llu", ip];
+    if (comma) {
+        NSMutableString *tmp = [NSMutableString string];
+        NSInteger c = 0;
+        for (NSInteger i = (NSInteger)ipStr.length - 1; i >= 0; i--) {
+            [tmp insertString:[ipStr substringWithRange:NSMakeRange(i, 1)] atIndex:0];
+            if (++c % 3 == 0 && c < (NSInteger)ipStr.length) [tmp insertString:@"," atIndex:0];
+        }
+        ipStr = tmp;
+    }
+    NSString *newNum = dec > 0 ? [NSString stringWithFormat:@"%@.%0*llu", ipStr, (int)dec, fp] : [ipStr copy];
+    if (sym) newNum = [@"¥" stringByAppendingString:newNum];
+    NSMutableString *out = [text mutableCopy];
+    [out replaceCharactersInRange:r withString:newNum];
+    return out;
+}
+
+static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
+    @try {
+        if (![vc respondsToSelector:@selector(balanceTitleLabel)]) return;
+        id lb = [vc balanceTitleLabel];
+        if (![lb isKindOfClass:[UILabel class]]) return;
+        NSString *t = ((UILabel *)lb).text;
+        if (!t.length) return;
+        NSString *nt = DDBalanceRewriteMoneyText(t, fen);
+        if (![nt isEqualToString:t]) { ((UILabel *)lb).text = nt; }
+    } @catch (NSException *e) {}
+}
+
+#pragma mark - 余额 / 零钱通改写
+// 金额由 TimeoutNumber（容器）内的 ScrollNumber（滚轮）渲染，两条链都要接管：
+//   · 改值 —— 三个写入口 updateNumber: / defaultNumber: / setCurrentNumber: 全部换成目标值，
+//     外加 currentNumber 读路径（原生按它推算宽度，只改写入口会导致宽度与新值不匹配）。
+//     三个写入口缺一不可：服务页金额由 WCPayWalletGetAllFunctionCgi 回调经 setCurrentNumber:
+//     异步直赋，漏了它就会先闪一下真实金额。
+//   · 修帧 —— 钱包页两个金额单元格右侧有箭头，数字变长后原生 frame 仍是旧宽度会右溢盖住，
+//     故在 layoutSubviews 里按 scrollNumberSize 重设滚轮与自身 frame，把右缘钉在箭头左侧。
+
+%hook TimeoutNumber
+- (void)updateNumber:(unsigned long long)original {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled) {
+            DDBalancePageKind kind = DDBalanceResolveKind(self);
+            unsigned long long want = 0; BOOL rewrite = NO;
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
+            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { want = DDClampFen(DDBalanceFenValue()); rewrite = YES; }
+            if (rewrite) { %orig(want); return; }
+        }
+    } @catch (NSException *e) {}
+    %orig(original);
+}
+- (void)defaultNumber:(unsigned long long)original {
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled) {
+            DDBalancePageKind kind = DDBalanceResolveKind(self);
+            unsigned long long want = 0; BOOL rewrite = NO;
+            if (kind == DDBalancePageLQT && [cfg hasLingtongValue]) { want = DDClampFen(DDLingtongFenValue()); rewrite = YES; }
+            else if (kind == DDBalancePageBalance && [cfg hasBalanceValue]) { want = DDClampFen(DDBalanceFenValue()); rewrite = YES; }
+            if (rewrite) { %orig(want); return; }
+        }
+    } @catch (NSException *e) {}
+    %orig(original);
+}
+// 顶格三步，缺一不可：
+//   1) [sn setFrame:] 原点不变、尺寸换成 scrollNumberSize —— 滚轮按新值的正确尺寸重设
+//   2) [self updateScrollNumber] —— 容器按新滚轮尺寸重排内部
+//   3) [self setFrame:] x = superview 宽度 - 28 - 宽度 —— 右缘钉在箭头左侧，数字往左长
+// 前提：scrollNumberSize 按改后的值算，故 currentNumber 读路径须一并改写，
+//   否则宽度仍按旧值算，仅改 frame 无法对齐。
+- (void)layoutSubviews {
+    %orig;
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (!cfg.balanceEnabled) return;
+        // 只命中钱包页两个金额单元格才修帧，其余页面一律不碰。
+        DDBalancePageKind fixKind = DDBalanceFixKindFor(self);
+        if (fixKind != DDBalancePageBalance && fixKind != DDBalancePageLQT) return;
+        unsigned long long want = 0;
+        if (!DDBalanceWantFenFor(self, fixKind, &want)) return;
+        if (![self respondsToSelector:@selector(scrollNumber)] ||
+            ![self respondsToSelector:@selector(scrollNumberSize)]) return;
+        UIView *sn = [self scrollNumber];
+        if (![sn isKindOfClass:[UIView class]]) return;
+        // 几何加固：须在任何 frame 改动之前判定，父容器接近全宽的一律跳过：
+        //   钱包页金额行位于 cell 内，父容器宽度有限；父容器接近全宽的必然是
+        //   零钱/零钱通详情页那种居中的大数字，一旦右对齐就会被推到屏幕边上。
+        UIView *sp = self.superview;
+        if (!sp) return;
+        CGFloat spW = sp.bounds.size.width;
+        CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
+        if (screenW > 0 && spW > screenW * 0.7) return;
+        CGSize sz = [self scrollNumberSize];
+        if (sz.width <= 0 || sz.height <= 0) return;
+        // ① 滚轮尺寸按新值重设（原点保持不变）
+        CGRect snF = sn.frame;
+        CGRect snNew = CGRectMake(snF.origin.x, snF.origin.y, sz.width, sz.height);
+        if (!DDBalanceFrameNear(snF, snNew)) sn.frame = snNew;
+        // ② 容器按新的滚轮尺寸重排内部
+        if ([self respondsToSelector:@selector(updateScrollNumber)]) [self updateScrollNumber];
+        // ③ 自身右对齐：右缘钉在 superview 宽度 - 箭头区(28)，数字往左长 → 永远压不到箭头
+        CGRect selfF = self.frame;
+        CGFloat newX = spW - kDDWalletArrowGap - sz.width;
+        // 越界处理：算出的位置越过左边界（或 superview 宽度异常）时退化为"右缘原地不动"
+        if (spW <= 0 || newX < 0) newX = (selfF.origin.x + selfF.size.width) - sz.width;
+        CGRect selfNew = CGRectMake(newX, selfF.origin.y, sz.width, selfF.size.height);
+        if (!DDBalanceFrameNear(selfF, selfNew)) self.frame = selfNew;
+    } @catch (NSException *e) {}
+}
+%end
+
+// 读路径必须一起改：scrollNumberSize / widthOfNumber: 都读 currentNumber 推算宽度，
+//   否则内部宽度仍按旧值算，容器与内容对不上 → 数字右溢盖箭头（顶格）。
+%hook ScrollNumber
+// 写入口③：property setter 直赋。服务页（WCPayMainViewControllerV2）的金额由
+//   WCPayWalletGetAllFunctionCgi 回调异步写入，须一并拦截，否则会闪出真实金额。
+//   与 currentNumber getter 的改写自洽：写入假值 → 重排按假值算宽 → getter 返回同值。
+- (void)setCurrentNumber:(unsigned long long)original {
+    unsigned long long v = original;
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled) {
+            DDBalancePageKind kind = DDBalanceResolveKind(self);
+            unsigned long long want = 0;
+            if (DDBalanceWantFenFor(self, kind, &want)) v = want;
+        }
+    } @catch (NSException *e) {}
+    %orig(v);
+}
+- (unsigned long long)currentNumber {
+    unsigned long long orig = %orig;
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (!cfg.balanceEnabled) return orig;
+        DDBalancePageKind kind = DDBalanceResolveKind(self);
+        unsigned long long want = 0;
+        if (!DDBalanceWantFenFor(self, kind, &want)) return orig;
+        return want;
+    } @catch (NSException *e) {}
+    return orig;
+}
+- (void)defaultNumber:(unsigned long long)original {
+    unsigned long long v = original;
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled) {
+            DDBalancePageKind kind = DDBalanceResolveKind(self);
+            unsigned long long want = 0;
+            if (DDBalanceWantFenFor(self, kind, &want)) v = want;
+        }
+    } @catch (NSException *e) {}
+    %orig(v);
+}
+- (void)updateNumber:(unsigned long long)original {
+    unsigned long long v = original;
+    @try {
+        DDGlobalConfig *cfg = [DDGlobalConfig shared];
+        if (cfg.balanceEnabled) {
+            DDBalancePageKind kind = DDBalanceResolveKind(self);
+            unsigned long long want = 0;
+            if (DDBalanceWantFenFor(self, kind, &want)) v = want;
+        }
+    } @catch (NSException *e) {}
+    %orig(v);
+}
+%end
+
+%hook WCPayBalanceDetailViewController
+- (void)refreshViewWithData:(id)arg {
+    %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled && [cfg hasBalanceValue])
+        DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()));
+}
+- (void)updateBalanceTitleLabel {
+    %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled && [cfg hasBalanceValue])
+        DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()));
+}
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (cfg.balanceEnabled && [cfg hasBalanceValue])
+        DDBalancePatchTitleLabel(self, DDClampFen(DDBalanceFenValue()));
+}
+%end
+
+
+#pragma mark - 用户账号自定义（按用户名，聊天详情页逐人设置）
+
+static NSString * const kDDFriendWxidChangedNotification = @"DDFriendWxidChanged";
+
+static NSString *DDFriendWxidStorePath(void) {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *doc = paths.firstObject;
+    if (doc.length == 0) doc = @"/var/mobile/Documents";
+    return [doc stringByAppendingPathComponent:@"DDFriendWxid.plist"];
+}
+
+static NSMutableDictionary *DDFriendWxidMap(void) {
+    static NSMutableDictionary *map = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSDictionary *disk = [NSDictionary dictionaryWithContentsOfFile:DDFriendWxidStorePath()];
+        map = [disk mutableCopy];
+        if (!map) map = [NSMutableDictionary dictionary];
+    });
+    return map;
+}
+
+static NSString *DDFriendWxidForUser(NSString *usrName) {
+    if (![DDGlobalConfig shared].friendWxidEnabled) return nil;
+    if (usrName.length == 0) return nil;
+    NSString *value = DDFriendWxidMap()[usrName];
+    return [value isKindOfClass:[NSString class]] ? value : nil;   // 存了空串也算，效果=隐藏
+}
+
+static void DDFriendWxidSetForUser(NSString *value, NSString *usrName) {
+    if (usrName.length == 0) return;
+    DDFriendWxidMap()[usrName] = value ?: @"";
+    [DDFriendWxidMap() writeToFile:DDFriendWxidStorePath() atomically:YES];
+}
+
+static void DDFriendWxidRemoveForUser(NSString *usrName) {
+    if (usrName.length == 0) return;
+    [DDFriendWxidMap() removeObjectForKey:usrName];
+    [DDFriendWxidMap() writeToFile:DDFriendWxidStorePath() atomically:YES];
+}
+
+#pragma mark - 头像文件管理
+
+static void DDRefreshAvatarViewsForUser(NSString *usrName);
+
+static NSString *DDAvatarDir(void) {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *doc = paths.firstObject;
+    if (doc.length == 0) doc = @"/var/mobile/Documents";
+    NSString *dir = [doc stringByAppendingPathComponent:@"DDAvatar"];
+    BOOL isDir = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:dir isDirectory:&isDir]) {
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                withIntermediateDirectories:YES
+                attributes:nil
+                error:nil];
+    }
+    return dir;
+}
+
+static NSString *DDAvatarPathForUser(NSString *usrName) {
+    if (usrName.length == 0) return nil;
+    NSCharacterSet *keep = [NSCharacterSet alphanumericCharacterSet];
+    NSMutableString *safe = [NSMutableString string];
+    for (NSUInteger i = 0; i < usrName.length; i++) {
+        unichar c = [usrName characterAtIndex:i];
+        if ([keep characterIsMember:c]) {
+            [safe appendFormat:@"%C", c];
+        } else {
+            [safe appendString:@"_"];
+        }
+    }
+    return [DDAvatarDir() stringByAppendingPathComponent:[safe stringByAppendingPathExtension:@"png"]];
+}
+
+static NSCache *DDAvatarCache(void) {
+    static NSCache *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cache = [[NSCache alloc] init];
+        cache.countLimit = 64;
+    });
+    return cache;
+}
+
+static void DDAvatarCacheInvalidate(NSString *usrName) {
+    if (usrName.length) [DDAvatarCache() removeObjectForKey:usrName];
+    else [DDAvatarCache() removeAllObjects];
+}
+
+static UIImage *DDAvatarImageForUser(NSString *usrName) {
+    if (![DDGlobalConfig shared].avatarEnabled) return nil;
+    if (usrName.length == 0) return nil;
+    NSCache *cache = DDAvatarCache();
+    id cached = [cache objectForKey:usrName];
+    if (cached) return (cached == [NSNull null]) ? nil : (UIImage *)cached;
+
+    UIImage *img = [UIImage imageWithContentsOfFile:DDAvatarPathForUser(usrName)];
+    if (!(img && img.size.width > 0 && img.size.height > 0)) img = nil;
+    [cache setObject:(img ?: (UIImage *)[NSNull null]) forKey:usrName];
+    return img;
+}
+
+static UIImage *DDScaledImage(UIImage *image, CGFloat maxSide) {
+    if (!image || maxSide <= 0) return image;
+    CGSize size = image.size;
+    CGFloat longest = MAX(size.width, size.height);
+    if (longest <= maxSide) return image;
+    CGFloat ratio = maxSide / longest;
+    CGSize target = CGSizeMake(round(size.width * ratio), round(size.height * ratio));
+    UIGraphicsBeginImageContextWithOptions(target, NO, 0.0);
+    [image drawInRect:CGRectMake(0, 0, target.width, target.height)];
+    UIImage *scaled = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return scaled ?: image;
+}
+
+static BOOL DDAvatarSaveImage(UIImage *image, NSString *usrName) {
+    NSString *path = DDAvatarPathForUser(usrName);
+    if (!image || !path) return NO;
+    NSData *data = UIImagePNGRepresentation(DDScaledImage(image, 400.0));
+    if (data.length == 0) return NO;
+    BOOL ok = [data writeToFile:path atomically:YES];
+    if (ok) {
+        DDAvatarCacheInvalidate(usrName);
+        DDRefreshAvatarViewsForUser(usrName);
     }
     return ok;
 }
 
-#pragma mark - 配置
-
-static Class WCRConfigClass(void) {
-    Class c = NSClassFromString(@"WCRefineConfig");
-    return c;
+static BOOL DDAvatarRemoveForUser(NSString *usrName) {
+    NSString *path = DDAvatarPathForUser(usrName);
+    if (!path) return NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return NO;
+    BOOL ok = [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+    DDAvatarCacheInvalidate(usrName);
+    if (ok) DDRefreshAvatarViewsForUser(usrName);
+    return ok;
 }
 
-static id WCRConfig(void) {
-    Class c = WCRConfigClass();
-    if (!c) return nil;
-    if (![c respondsToSelector:@selector(shared)]) return nil;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-    return [c performSelector:@selector(shared)];
-#pragma clang diagnostic pop
-}
-
-/* 纯本地版：功能默认生效，无开关、无设置界面。
- * WCR 原版此处读 WCRefineConfig.sideloadShareFixEnabled（@0x8f4c30），
- * 独立插件版去掉该开关，主 App 分支统一走 WCRShouldInstall 的宿主检查后默认放行。 */
-static NSString *WCRPickedGroupID(void) {
-    id cfg = WCRConfig();
-    id v = [cfg respondsToSelector:NSSelectorFromString(kWCRCfgGroupID)]
-         ? [cfg valueForKey:kWCRCfgGroupID] : nil;
-    if ([v isKindOfClass:[NSString class]]) return (NSString *)v;
-    return [[NSUserDefaults standardUserDefaults] stringForKey:kWCRCfgGroupID];
-}
-
-static void WCRSetPickedGroupID(NSString *gid) {
-    id cfg = WCRConfig();
-    if ([cfg respondsToSelector:NSSelectorFromString(@"setSideloadShareFixAppGroupId:")]) {
-        [cfg setValue:(gid ?: @"") forKey:kWCRCfgGroupID];
-    } else {
-        [[NSUserDefaults standardUserDefaults] setObject:(gid ?: @"")
-                                                  forKey:kWCRCfgGroupID];
-        [[NSUserDefaults standardUserDefaults] synchronize];
+static NSInteger DDAvatarRemoveAll(void) {
+    NSString *dir = DDAvatarDir();
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+    NSInteger n = 0;
+    for (NSString *f in files) {
+        if (![f.pathExtension isEqualToString:@"png"]) continue;
+        if ([[NSFileManager defaultManager] removeItemAtPath:[dir stringByAppendingPathComponent:f] error:nil]) n++;
     }
+    if (n > 0) {
+        DDAvatarCacheInvalidate(nil);
+        DDRefreshAvatarViewsForUser(nil);
+    }
+    return n;
 }
 
-#pragma mark - ProtobufLite 链接检查（0x14804f8 / 0x148056c / 0x147f6a4 / 0x147ccf4 / 0x147cff4）
+#pragma mark - 选图（系统 UIImagePickerController）
 
-/*
- * 「需注入 ProtobufLite3（没有则 ProtobufLite）」这句 UI 文案的真正含义，
- * 由下面四个函数闭环给出，全部来自反汇编，不是推测：
- *
- *   0x148056c  在 <bundlePath>/{Frameworks,Contents/Frameworks}/ 下依次找
- *              ProtobufLite3.framework (@0x205b4b6) → ProtobufLite.framework (@0x205b4c4)
- *              读其 Info.plist 的 CFBundleExecutable 得到可执行文件名，
- *              拼出 <fw>/<exe> 并 isReadableFileAtPath:
- *   0x147f6a4  fopen(path,"rb") → 解析 Mach-O → 遍历 load commands，
- *              只认 LC_LOAD_DYLIB(0x0c) / LC_LOAD_WEAK_DYLIB(0x80000018) /
- *              LC_REEXPORT_DYLIB(0x8000001f) / LC_LOAD_UPWARD_DYLIB(0x80000023)
- *              取其中的 dylib 名字，strnstr(name, "WCRefine")  ← @0x202a8b8
- *   0x147ccf4  定位 fat 里的 arm64 slice（CPU_TYPE_ARM64），thin 直接返回 0
- *   0x147cff4  BOOL ReadAt(FILE *, uint64_t off, void *buf, size_t len)
- *
- * 换句话说：这不是"检查 ProtobufLite 有没有被加载"，而是
- * **检查磁盘上那份 ProtobufLite 二进制有没有被 Icsign 注入 WCRefine**
- * （注入后其 Mach-O 会多出一条指向 WCRefine.dylib 的 LC_LOAD_DYLIB）。
- *
- * 实测微信 8.0.78（Frameworks.zip）：只有 ProtobufLite.framework，没有
- * ProtobufLite3.framework；ProtobufLite 的 LC_LOAD_DYLIB 列表里没有 WCRefine，
- * 所以原始包下本函数返回 NO —— 正是设置页提示"需注入"的原因。
- */
+typedef void (^DDAvatarPickCompletion)(UIImage *image);
 
-/* 0x147d0b4 —— 大端读 32 位 */
-static uint32_t WCRBigEndian32(const void *p) {
-    const uint8_t *b = (const uint8_t *)p;
-    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
-           ((uint32_t)b[2] << 8)  |  (uint32_t)b[3];
+@interface DDAvatarPicker : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
+@property (nonatomic, copy) DDAvatarPickCompletion completion;
++ (void)presentFromViewController:(UIViewController *)vc completion:(DDAvatarPickCompletion)completion;
+@end
+
+@implementation DDAvatarPicker
+
+static char kDDAvatarPickerDelegateKey;
+
+static UIViewController *DDTopPresentedViewController(UIViewController *vc) {
+    UIViewController *top = vc;
+    NSInteger guard = 0;
+    while (top.presentedViewController && !top.presentedViewController.isBeingDismissed && guard++ < 8) {
+        top = top.presentedViewController;
+    }
+    return top;
 }
 
-/* 0x147cff4 */
-static BOOL WCRReadAt(FILE *f, uint64_t off, void *buf, size_t len) {
-    if (!f || !buf) return NO;
-    if (len == 0) return YES;
-    if (fseeko(f, (off_t)off, SEEK_SET) != 0) return NO;
-    return fread(buf, 1, len, f) == len;
-}
++ (void)presentFromViewController:(UIViewController *)vc completion:(DDAvatarPickCompletion)completion {
+    if (!vc) {
+        if (completion) completion(nil);
+        return;
+    }
+    if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypePhotoLibrary]) {
+        if (completion) completion(nil);
+        return;
+    }
 
-/* WCR 用的是 strnstr（桩 0x1f15a44）；这里自带一份，避免 SDK 声明差异 */
-static char *WCRStrNStr(const char *haystack, const char *needle, size_t len) {
-    if (!haystack || !needle) return NULL;
-    size_t n = strlen(needle);
-    if (n == 0) return (char *)haystack;
-    if (n > len) return NULL;
-    for (size_t i = 0; i + n <= len; i++) {
-        if (haystack[i] == needle[0] && strncmp(haystack + i, needle, n) == 0) {
-            return (char *)(haystack + i);
+    UIViewController *presenter = DDTopPresentedViewController(vc);
+
+    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+    picker.allowsEditing = YES;
+    picker.title = @"头像修改";
+
+    DDAvatarPicker *proxy = [[DDAvatarPicker alloc] init];
+    proxy.completion = completion;
+    picker.delegate = proxy;
+    objc_setAssociatedObject(picker, &kDDAvatarPickerDelegateKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!presenter.view.window || presenter.isBeingDismissed || presenter.presentedViewController) {
+            if (completion) completion(nil);
+            return;
         }
-    }
-    return NULL;
+        [presenter presentViewController:picker animated:YES completion:^{
+        }];
+    });
 }
 
-/* 0x147ccf4 —— 返回 arm64 slice 的文件偏移；thin 返回 0；失败返回 -1 */
-static int64_t WCRFindARM64Slice(FILE *f, uint32_t *magicOut) {
-    uint8_t head[8];
-    if (!WCRReadAt(f, 0, head, 8)) return -1;                  /* 0x147cd28 */
-    uint32_t m = 0;
-    memcpy(&m, head, 4);
-    if (m == 0xfeedfacf /* MH_MAGIC_64 */) {                    /* 0x147cd58 */
-        if (magicOut) *magicOut = m;                            /* 0x147cd78 */
-        return 0;                                               /* 0x147cd80 */
-    }
-
-    uint32_t nfat = WCRBigEndian32(head + 4);                   /* 0x147cdd8 */
-    if (nfat == 0 || nfat > 0x10) return -1;                    /* 0x147cde4 / 0x147cdf0 */
-    BOOL isFat64 = (m == 0xcafebabf);                           /* 0x147ce14 */
-    size_t archSize = isFat64 ? 0x20 : 0x14;                    /* 0x147ce24~0x147ce38 */
-    uint64_t off = 8;                                           /* 0x147ce40 */
-
-    for (uint32_t i = 0; i < nfat; i++) {                       /* 0x147ce4c */
-        if (archSize > 0x20) return -1;                         /* 0x147ce64 */
-        uint8_t arch[0x20];
-        if (!WCRReadAt(f, off, arch, archSize)) return -1;       /* 0x147ce80 */
-
-        uint32_t cputype = WCRBigEndian32(arch);                /* 0x147ce9c */
-        uint64_t sliceOff;
-        if (isFat64) {                                          /* 0x147cea4 */
-            uint64_t lo = WCRBigEndian32(arch + 0x8);
-            uint64_t hi = WCRBigEndian32(arch + 0xc);
-            sliceOff = (hi << 32) | lo;                         /* 0x147cedc */
-        } else {                                                /* 0x147ceec */
-            sliceOff = WCRBigEndian32(arch + 0x8);
-        }
-
-        if ((cputype & 0x01000000) != 0 &&                      /* CPU_ARCH_ABI64  0x147cf0c */
-            (cputype & 0xfeffffff) == 0xc) {                    /* CPU_TYPE_ARM64  0x147cf1c */
-            uint32_t sliceMagic = 0;
-            if (!WCRReadAt(f, sliceOff, &sliceMagic, 4)) return -1;   /* 0x147cf3c */
-            if (sliceMagic == 0xfeedfacf) {                     /* 0x147cf54 */
-                if (magicOut) *magicOut = sliceMagic;           /* 0x147cf74 */
-                return (int64_t)sliceOff;                       /* 0x147cf7c */
-            }
-        }
-        off += archSize;                                        /* 0x147cf8c~0x147cf98 */
-    }
-    return -1;                                                  /* 0x147cfb0 */
+- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<NSString *,id> *)info {
+    UIImage *image = info[UIImagePickerControllerEditedImage] ?: info[UIImagePickerControllerOriginalImage];
+    DDAvatarPickCompletion cb = self.completion;
+    [picker dismissViewControllerAnimated:YES completion:^{
+        if (cb) cb(image);
+    }];
 }
 
-/* 0x147f6a4 —— 该二进制的 dylib 依赖里是否含 "WCRefine"（@0x202a8b8） */
-static BOOL WCRMachOLinksWCRefine(NSString *path) {
-    if (![path isKindOfClass:[NSString class]]) return NO;
-    if (path.length == 0) return NO;                            /* 0x147f6ec */
-    FILE *f = fopen(path.fileSystemRepresentation, "rb");       /* 0x147f724 / 0x147f73c */
-    if (!f) return NO;                                          /* 0x147f748 */
-
-    BOOL found = NO;
-    uint32_t magic = 0;
-    int64_t base = WCRFindARM64Slice(f, &magic);                /* 0x147f778 */
-    if (base == -1) { fclose(f); return NO; }                   /* 0x147f784 */
-    if (magic != 0xfeedfacf) { fclose(f); return NO; }          /* 0x147f79c */
-
-    uint8_t hdr[0x20];
-    if (!WCRReadAt(f, (uint64_t)base, hdr, 0x20)) { fclose(f); return NO; }  /* 0x147f7dc */
-
-    uint32_t ncmds = 0, sizeofcmds = 0;
-    memcpy(&ncmds,      hdr + 0x10, 4);                         /* sp+0x60 */
-    memcpy(&sizeofcmds, hdr + 0x14, 4);                         /* sp+0x64 */
-    if (ncmds == 0 || ncmds > 0x200) { fclose(f); return NO; }              /* 0x147f81c */
-    if (sizeofcmds == 0 || sizeofcmds > 0x1000000) { fclose(f); return NO; } /* 0x147f838 */
-
-    uint64_t off = (uint64_t)base + 0x20;                       /* 0x147f868~0x147f86c */
-    for (uint32_t i = 0; i < ncmds && !found; i++) {            /* 0x147f880 */
-        uint32_t pair[2] = {0, 0};
-        if (!WCRReadAt(f, off, pair, 8)) break;                 /* 0x147f8cc */
-        uint32_t cmd = pair[0], cmdsize = pair[1];
-        if (cmdsize < 8 || cmdsize > sizeofcmds) break;         /* 0x147f8f4 / 0x147f904 */
-
-        if (cmd == 0x0c        ||    /* LC_LOAD_DYLIB         0x147f918 */
-            cmd == 0x80000018  ||    /* LC_LOAD_WEAK_DYLIB    0x147f92c */
-            cmd == 0x8000001f  ||    /* LC_REEXPORT_DYLIB     0x147f944 */
-            cmd == 0x80000023) {     /* LC_LOAD_UPWARD_DYLIB  0x147f95c */
-            uint32_t nameoff = 0;
-            if (cmdsize >= 0xc &&                               /* 0x147f970 */
-                WCRReadAt(f, off + 8, &nameoff, 4) &&           /* 0x147f990 */
-                nameoff >= 8 && nameoff < cmdsize) {            /* 0x147f9a0 / 0x147f9b4 */
-                size_t len = cmdsize - nameoff;                 /* 0x147f9c8 */
-                if (len > 0x200) len = 0x200;                   /* 0x147f9d4 */
-                char name[0x201];
-                memset(name, 0, sizeof(name));                  /* 0x147f9f8 (bzero) */
-                if (WCRReadAt(f, off + nameoff, name, len) &&   /* 0x147fa14 */
-                    WCRStrNStr(name, kWCRInjectToken.UTF8String, len)) {  /* 0x147fa30 */
-                    found = YES;                                /* 0x147fa40 */
-                }
-            }
-        }
-        off += cmdsize;                                         /* 0x147fa54~0x147fa64 */
-    }
-    fclose(f);                                                  /* 0x147fa80 */
-    return found;
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
+    DDAvatarPickCompletion cb = self.completion;
+    [picker dismissViewControllerAnimated:YES completion:^{
+        if (cb) cb(nil);
+    }];
 }
 
-/* 0x148056c —— 找"首选宿主"二进制：
- *   名字 ProtobufLite3 → ProtobufLite，目录 Frameworks → Contents/Frameworks，
- *   可执行名取 Info.plist["CFBundleExecutable"]，取不到就用 name 本身。 */
-static NSString *WCRPreferredHostBinaryPath(void) {
-    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];   /* 0x1480598 / 0x14805b8 */
-    if (bundlePath.length == 0) return nil;                     /* 0x1480600 */
-    NSFileManager *fm = [NSFileManager defaultManager];          /* 0x1480624 */
+@end
 
-    NSString *fallback = nil;                                    /* sp+0x220 */
-    NSArray *names = @[ kWCRProtobufLite3, kWCRProtobufLite ];   /* 0x1480648 / 0x1480654 */
-    NSArray *dirs  = @[ kWCRFrameworksDir, kWCRContentsFrameworksDir ]; /* 0x14806a8 / 0x14806b4 */
+#pragma mark - 自定义自己账号（只改自己）
 
-    for (NSString *name in names) {
-        for (NSString *dir in dirs) {
-            NSString *fw =
-                [[bundlePath stringByAppendingPathComponent:dir] /* 0x1480868 */
-                    stringByAppendingPathComponent:
-                        [name stringByAppendingPathExtension:kWCRFrameworkExt]]; /* 0x148088c */
-
-            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
-                [fw stringByAppendingPathComponent:kWCRInfoPlistName]];     /* 0x1480924 / 0x1480944 */
-            NSString *exe = nil;
-            if ([info isKindOfClass:[NSDictionary class]]) {                 /* 0x14809e0 */
-                id v = info[kWCRBundleExecutableKey];                        /* 0x1480a00 */
-                if ([v isKindOfClass:[NSString class]] &&                    /* 0x1480a60 */
-                    [(NSString *)v length] > 0) {                            /* 0x1480abc */
-                    exe = (NSString *)v;
-                }
-            }
-
-            NSString *bin = [fw stringByAppendingPathComponent:(exe ?: name)]; /* 0x1480ba4 */
-            if ([fm isReadableFileAtPath:bin]) {                             /* 0x1480bcc */
-                if (WCRMachOLinksWCRefine(bin)) return bin;                  /* 0x1480be8 */
-                if (!fallback) fallback = bin;                               /* 0x1480c28 */
-            }
-
-            /* 变体二：<bundlePath>/<dir>/<name>（不带 .framework） */
-            NSString *bin2 = [[bundlePath stringByAppendingPathComponent:dir] /* 0x1480c4c */
-                                stringByAppendingPathComponent:name];        /* 0x1480c70 */
-            if ([fm isReadableFileAtPath:bin2]) {                            /* 0x1480cac */
-                if (WCRMachOLinksWCRefine(bin2)) return bin2;
-                if (!fallback) fallback = bin2;
-            }
-        }
-    }
-    return fallback;
+static NSString *DDCustomWxid(void) {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (!cfg.wxidEnabled) return nil;
+    NSString *value = cfg.wxidValue;
+    if (value.length == 0) return nil;
+    return value;
 }
 
-/* 0x14804f8 —— memo：bss 0x253a6f0（已算过） / 0x253a6f1（结果） */
-static BOOL WCRPreferredHostLinked(void) {
-    static BOOL sComputed = NO;                                  /* bss 0x253a6f0 */
-    static BOOL sLinked   = NO;                                  /* bss 0x253a6f1 */
-    if (!sComputed) {                                            /* 0x148050c */
-        sComputed = YES;                                         /* 0x148051c */
-        NSString *p = WCRPreferredHostBinaryPath();              /* 0x1480520 */
-        BOOL r = WCRMachOLinksWCRefine(p);                       /* 0x1480530 */
-        sLinked = r;                                             /* 0x1480540 */
-    }
-    return sLinked & 1;                                          /* 0x1480558~0x148055c */
+#pragma mark - 数据源（微信"账号"统一拦截）
+
+%hook CBaseContact
+
+// CBaseContact.h:12 —— m_nsAliasName 即"账号"。
+// 用户：查自定义表，命中返回自定义值（空串=隐藏），未命中回原值。
+- (id)m_nsAliasName {
+    NSString *alias = DDFriendWxidForUser([self m_nsUsrName]);
+    if (alias) return alias;
+    return %orig;
 }
 
-#pragma mark - 组解析
+%end
 
-/* 0x1481ec0 —— 只在**主 App** 进程里被调用 */
-static NSString *WCRResolvedGroupID(void) {
-    if (WCRIsGroupRemapExtensionProcess()) return WCRMarkerGroupID();
+%hook CSetting
+// CSetting.h:58/301 —— 微信"我"页面、设置等读取的自己的 m_nsAliasName 数据源。
+// CSetting 独立继承 NSObject，不继承 CBaseContact，需单独 hook。
+- (id)m_nsAliasName {
+    NSString *custom = DDCustomWxid();
+    if (custom) return custom;
+    return %orig;
+}
+%end
 
-    NSArray<NSString *> *available = WCRApplicationGroupIDs();
-    if (available.count == 0) return nil;
+#pragma mark - 头像替换（显示侧）
 
-    NSString *picked = WCRPickedGroupID();
-    if (picked.length && [available containsObject:picked]) return picked;
-
-    NSString *marker = WCRMarkerGroupID();
-    if (marker.length && [available containsObject:marker]) return marker;
-
-    return nil;
+static NSHashTable *DDAvatarViews(void) {
+    static NSHashTable *t = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ t = [NSHashTable weakObjectsHashTable]; });
+    return t;
 }
 
-/* 0x8f5490 —— 主 App 与扩展的统一入口 */
-static NSString *WCRCurrentGroupID(void) {
-    if (WCRIsGroupRemapExtensionProcess()) {
-        return WCRRemapGroupID(nil);      /* 0x8f54a8: mov x0,#0 ; bl 0x8f3f40 */
+static void DDRefreshAvatarViewsForUser(NSString *usrName) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ DDRefreshAvatarViewsForUser(usrName); });
+        return;
     }
-    return WCRResolvedGroupID();          /* 0x8f54c0: bl 0x1481ec0 */
-}
-
-/* 0x8f4b9c —— 所有 hook 的统一开关 */
-static BOOL WCRFixActive(void) {
-    if (WCRIsGroupRemapExtensionProcess()) {
-        return WCRCurrentGroupID().length > 0;   /* 扩展：有解析出组就生效 */
-    }
-    return YES;                                  /* 主 App：无开关，默认生效 */
-}
-
-/* 0x8f54e4 —— 带缓存的可用组列表 */
-static NSArray<NSString *> *WCRCachedAvailableGroups(void) {
-    if (!gCachedAvailableGroups) {
-        gCachedAvailableGroups = [WCRApplicationGroupIDs() copy];
-    }
-    return gCachedAvailableGroups ?: @[];
-}
-
-/* 0x8f4cd0 —— 这个 groupID 该不该被重映射 */
-static BOOL WCRShouldRemapGroup(NSString *groupID) {
-    if (![groupID isKindOfClass:[NSString class]]) return NO;
-    if (groupID.length == 0) return NO;                                  /* 0x8f4d18 */
-    if ([WCRCachedAvailableGroups() containsObject:groupID]) return YES;  /* 0x8f4d9c */
-    return [groupID hasPrefix:kWCRTencentPrefix];                        /* 0x8f4dd8 */
-}
-
-#pragma mark - 目录保障（0x8f6af4）
-
-static void WCREnsureDirectory(NSString *path) {
-    if (![path isKindOfClass:[NSString class]] || path.length == 0) return;
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if ([fm fileExistsAtPath:path]) return;
-    [fm createDirectoryAtPath:path
-        withIntermediateDirectories:YES
-                         attributes:nil
-                              error:NULL];
-}
-
-#pragma mark - 核心：容器 URL 重映射（0x8f4e50）
-
-/* 首选 LSBundleProxy.groupContainerURLs[gid] —— 绕过 entitlement 校验 */
-static NSURL *WCRContainerURLViaLSBundleProxy(NSString *gid) {
-    Class proxyClass = NSClassFromString(kWCRLSBundleProxyClass);   /* 0x1f156fc */
-    if (!proxyClass) return nil;
-    SEL selProxy = NSSelectorFromString(kWCRLSBundleProxySel);      /* 0x1f159a8 */
-    if (![proxyClass respondsToSelector:selProxy]) return nil;
-
-    id proxy = ((id (*)(id, SEL))objc_msgSend)((id)proxyClass, selProxy);
-    if (!proxy) return nil;
-
-    SEL selURLs = NSSelectorFromString(kWCRGroupContainerURLs);
-    if (![proxy respondsToSelector:selURLs]) return nil;
-
-    id urls = ((id (*)(id, SEL))objc_msgSend)(proxy, selURLs);
-    if (![urls isKindOfClass:[NSDictionary class]]) return nil;     /* 0x238f828 = NSDictionary */
-
-    id u = [urls objectForKeyedSubscript:gid];
-    return [u isKindOfClass:[NSURL class]] ? (NSURL *)u : nil;
-}
-
-static NSURL *WCRUnmappedContainerURL(NSString *gid) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (gOrigContainerURL) {
-        NSURL *u = gOrigContainerURL(fm,
-            @selector(containerURLForSecurityApplicationGroupIdentifier:), gid);
-        return [u isKindOfClass:[NSURL class]] ? u : nil;
-    }
-    NSURL *u = [fm containerURLForSecurityApplicationGroupIdentifier:gid];
-    return [u isKindOfClass:[NSURL class]] ? u : nil;
-}
-
-/* 0x8f4e50 —— 带 memo（bss 0x2526a48 / 0x2526a50） */
-static NSURL *WCRRemappedContainerURL(void) {
-    NSString *gid = WCRCurrentGroupID();
-    if (gid.length == 0) {                       /* 0x8f4e9c */
-        gCachedContainerURL = nil;
-        gCachedContainerGroup = nil;
-        return nil;
-    }
-    if (gCachedContainerURL &&
-        [gCachedContainerGroup isEqualToString:gid]) {   /* 0x8f4ef0 */
-        return gCachedContainerURL;
-    }
-
-    NSURL *url = WCRContainerURLViaLSBundleProxy(gid);
-    if (![url isKindOfClass:[NSURL class]]) {            /* 0x8f51ac */
-        if (gOrigContainerURL) {                         /* 0x8f51b8 */
-            url = WCRUnmappedContainerURL(gid);
-        }
-    }
-    if (![url isKindOfClass:[NSURL class]]) {            /* 0x8f52d0 */
-        return nil;
-    }
-
-    gCachedContainerGroup = [gid copy];                  /* 0x8f530c */
-    gCachedContainerURL = url;                           /* 0x8f5328 */
-    return url;
-}
-
-#pragma mark - 核心：扩展进程反查主 App 选定的组（0x8f3f40）
-
-/*
- * 0x8f3f40 的完整逻辑：
- *   1. 非 group-remap 扩展进程              → nil
- *   2. bss 0x2526a58 缓存非空              → 直接返回
- *   3. MarkerGroupID() 非空                 → copy 进缓存后返回
- *   4. 原 IMP 为空                          → nil
- *   5. 组装候选：先放传入的 groupID，再追加所有可用组（去重、非空）
- *   6. 逐个候选：原 IMP 取容器 → <container>/Library/Preferences/<marker>
- *        → fileExistsAtPath → stringWithContentsOfURL(NSUTF8)
- *        → 去空白 → 必须在候选列表里 → 命中即 copy 进缓存并返回
- */
-static NSString *WCRRemapGroupID(NSString *groupID) {
-    if (!WCRIsGroupRemapExtensionProcess()) return nil;           /* 0x8f3f80 */
-    if (gCachedRemappedGroup.length > 0) return gCachedRemappedGroup; /* 0x8f3fd0 */
-
-    NSString *marker = WCRMarkerGroupID();                         /* 0x8f4008 */
-    if (marker.length > 0) {                                       /* 0x8f404c */
-        gCachedRemappedGroup = [marker copy];                      /* 0x8f4080 */
-        return gCachedRemappedGroup;
-    }
-    if (!gOrigContainerURL) return nil;                            /* 0x8f40d0 */
-
-    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
-    if (groupID.length > 0) [candidates addObject:groupID];        /* 0x8f4154 */
-    for (NSString *g in WCRApplicationGroupIDs()) {                /* 0x8f4188 */
-        if (g.length > 0 && ![candidates containsObject:g]) {
-            [candidates addObject:g];                              /* 0x8f42cc */
-        }
-    }
-
-    NSFileManager *fm = [NSFileManager defaultManager];            /* 0x8f4394 */
-    for (NSString *g in candidates) {
-        NSURL *u = WCRContainerURLViaLSBundleProxy(g);             /* 优先 LSBundleProxy，绕过 entitlement */
-        if (![u isKindOfClass:[NSURL class]]) {
-            if (!gOrigContainerURL) return nil;                   /* 0x8f40d0 */
-            u = gOrigContainerURL(fm,
-                @selector(containerURLForSecurityApplicationGroupIdentifier:), g);
-        }
-        if (![u isKindOfClass:[NSURL class]]) continue;            /* 0x8f4520 */
-
-        NSURL *dir = [u URLByAppendingPathComponent:kWCRPrefsSubPath isDirectory:YES];
-        NSURL *mu = [dir URLByAppendingPathComponent:kWCRMarkerFileName];
-        NSString *mp = mu.path;
-        if (mp.length == 0) continue;                              /* 0x8f4654 */
-        if (![fm fileExistsAtPath:mp]) continue;                   /* 0x8f4714 */
-
-        NSString *content = [NSString stringWithContentsOfURL:mu
-                                                     encoding:NSUTF8StringEncoding
-                                                        error:NULL];
-        NSString *trimmed = [content stringByTrimmingCharactersInSet:
-                                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (trimmed.length == 0) continue;                          /* 0x8f48b0 */
-        if (![candidates containsObject:trimmed]) continue;         /* 0x8f48e0 */
-
-        gCachedRemappedGroup = [trimmed copy];                      /* 0x8f4910 */
-        return gCachedRemappedGroup;
-    }
-    return nil;                                                     /* 0x8f4a70 */
-}
-
-#pragma mark - 探针日志（0x8f53b8，WCR 内已裁成空实现）
-
-static void WCRProbe(NSString *tag, id a, id b, id c) {
-    /* WCR 里这里原来会往 com.qimiao.WCRefine.sideload-share-fix.log 追加，
-     * 发布版本被 #if 0 掉了，只剩 retain/release。保持对齐：no-op。 */
-    (void)tag; (void)a; (void)b; (void)c; (void)kWCRProbeLogName;
-}
-
-#pragma mark - 被注入的 IMP（一一对应 WCR 的替换函数）
-
-/* ── 0x8f3af8 : -[NSFileManager containerURLForSecurityApplicationGroupIdentifier:] ── */
-static NSURL *WCRHook_ContainerURL(id self, SEL _cmd, NSString *groupIdentifier) {
-    /* 分支 A（0x8f3b40）：扩展进程 + 组是 NSString
-     * WCR 在这里调用 0x8f3f40 只为**预热 bss 0x2526a58 缓存**，
-     * 返回值被 retain 后丢弃（0x8f3bcc → 0x8f3bd0 未写回返回槽），
-     * 随后同样落到下面的公共路径。这里按原样保留该副作用。 */
-    if (WCRIsGroupRemapExtensionProcess() &&
-        [groupIdentifier isKindOfClass:[NSString class]]) {
-        (void)WCRRemapGroupID(groupIdentifier);
-    }
-
-    if (!WCRFixActive()) {                                        /* 0x8f3be4 */
-        return WCRUnmappedContainerURL(groupIdentifier);
-    }
-    if (![groupIdentifier isKindOfClass:[NSString class]]) {      /* 0x8f3c88 */
-        return WCRUnmappedContainerURL(groupIdentifier);
-    }
-    if (groupIdentifier.length == 0) {                            /* 0x8f3cb4 */
-        return WCRUnmappedContainerURL(groupIdentifier);
-    }
-    if (!WCRShouldRemapGroup(groupIdentifier)) {                  /* 0x8f3d10 */
-        return WCRUnmappedContainerURL(groupIdentifier);
-    }
-
-    NSURL *u = WCRRemappedContainerURL();                         /* 0x8f3d54 */
-    if (!u) {                                                     /* 0x8f3d74 */
-        return WCRUnmappedContainerURL(groupIdentifier);          /* 0x8f3e8c */
-    }
-
-    WCRProbe(@"container", groupIdentifier, WCRCurrentGroupID(), u.path); /* 0x8f3de4 */
-    return u;                                                     /* 0x8f3e24 */
-}
-
-/* ── 0x8f55cc : -[CKEntitlements initWithEntitlementsDict:] ── */
-static id WCRHook_CKEntitlementsInit(id self, SEL _cmd, NSDictionary *dict) {
-    /* 注意：这里原来写成 goto passthrough;，ARC 下 goto 不能跨过 __strong 变量的
-     * 初始化（clang: "jump bypasses initialization of __strong variable"），
-     * 全部改成早返回语义，二进制里的控制流完全等价。 */
-    NSDictionary *patched = dict;
-    if (WCRFixActive() &&                                         /* 0x8f5610 */
-        [dict isKindOfClass:[NSDictionary class]]) {
-        NSMutableDictionary *m = [dict mutableCopy];              /* 0x8f56d8 */
-        /* 自签包没有这些 iCloud entitlement，留着会让 CloudKit 走错误分支 */
-        [m removeObjectForKey:@"com.apple.developer.icloud-container-environment"]; /* 0x8f5710 */
-        [m removeObjectForKey:@"com.apple.developer.icloud-services"];              /* 0x8f5734 */
-        patched = [m copy];                                       /* 0x8f5748 */
-    }
-    if (gOrigCKEntitlementsInit) return gOrigCKEntitlementsInit(self, _cmd, patched);
-    return nil;
-}
-
-/* ── 0x8f5834 : -[CKContainer _initWithContainerIdentifier:] ── */
-static id WCRHook_CKInitWithID(id self, SEL _cmd, NSString *containerID) {
-    if (WCRFixActive() &&                                         /* 0x8f5878 */
-        [containerID isKindOfClass:[NSString class]]) {
-        /* WCR 走 0x8f6760：把 CloudKit 容器目录也挂到重映射后的 App Group 容器下 */
-        NSURL *u = WCRRemappedContainerURL();
-        if (u) {
-            NSString *dir = [u URLByAppendingPathComponent:containerID].path;
-            WCREnsureDirectory(dir);
-        }
-    }
-    if (gOrigCKInitWithID) return gOrigCKInitWithID(self, _cmd, containerID);
-    return nil;
-}
-
-/* ── 0x8f5af8 : -[CKContainer _setupWithContainerID:options:] ── */
-static id WCRHook_CKSetupWithID(id self, SEL _cmd, NSString *containerID, id options) {
-    if (WCRFixActive() &&                                         /* 0x8f5b48 */
-        [containerID isKindOfClass:[NSString class]]) {
-        NSURL *u = WCRRemappedContainerURL();
-        if (u) {
-            NSString *dir = [u URLByAppendingPathComponent:containerID].path;
-            WCREnsureDirectory(dir);
-        }
-    }
-    if (gOrigCKSetupWithID) return gOrigCKSetupWithID(self, _cmd, containerID, options);
-    return nil;
-}
-
-/* ── 0x8f5df4 : -[NSUserDefaults _initWithSuiteName:container:] ── */
-static id WCRHook_UserDefaultsSuiteInit(id self, SEL _cmd, NSString *suiteName, id container) {
-    BOOL remap = WCRFixActive() &&                                            /* 0x8f5e50 */
-                 [suiteName isKindOfClass:[NSString class]] &&                 /* 0x8f5f08 */
-                 [suiteName hasPrefix:kWCRGroupPrefix] &&                      /* 0x8f5f3c */
-                 WCRShouldRemapGroup(suiteName);                               /* 0x8f5f98 */
-    if (remap) {
-        NSURL *u = WCRRemappedContainerURL();                                  /* 0x8f5fe4 */
-        NSString *gid = u ? WCRCurrentGroupID() : nil;                          /* 0x8f60d0 */
-        if (u && gid.length > 0) {                                              /* 0x8f6004 */
-            NSURL *suiteURL = [u URLByAppendingPathComponent:gid];              /* 0x8f618c */
-            WCREnsureDirectory(suiteURL.path);                                  /* 0x8f61f0 (0x8f6af4) */
-            WCRProbe(@"suite", suiteName, gid, suiteURL.path);                  /* 0x8f625c */
-            if (gOrigUserDefaultsSuiteInit) {
-                return gOrigUserDefaultsSuiteInit(self, _cmd, gid, suiteURL);   /* 0x8f6280 */
-            }
-        }
-    }
-    if (gOrigUserDefaultsSuiteInit) {
-        return gOrigUserDefaultsSuiteInit(self, _cmd, suiteName, container);
-    }
-    return nil;
-}
-
-/* ── 0x8f6cf4 : +[WCAppExtensionDataUtil appGroupID] / +[WCExtDataUtil appGroupID] 的公共体 ── */
-static id WCRHook_AppGroupID(IMP orig, id self, SEL _cmd) {
-    if (!WCRFixActive()) {                                    /* 0x8f6d20 */
-        if (orig) {
-            id r = ((id (*)(id, SEL))orig)(self, _cmd);        /* 0x8f6d60 */
-            return r;
-        }
-        return nil;                                            /* 0x8f6d98 */
-    }
-    NSString *gid = WCRCurrentGroupID();                       /* 0x8f6dfc */
-    return gid.length ? gid : (orig ? ((id (*)(id, SEL))orig)(self, _cmd) : nil);
-}
-
-static id WCRHook_AppExtDataUtilGroupID(id self, SEL _cmd) {
-    return WCRHook_AppGroupID((IMP)gOrigAppExtDataUtilGroupID, self, _cmd);   /* 0x8f63b0 */
-}
-
-static id WCRHook_ExtDataUtilGroupID(id self, SEL _cmd) {
-    return WCRHook_AppGroupID((IMP)gOrigExtDataUtilGroupID, self, _cmd);      /* 0x8f644c */
-}
-
-/* ── 0x8f64e8 : -[MSEShareMainViewController doAuthenticateCheck] ── */
-static id WCRHook_DoAuthenticateCheck(id self, SEL _cmd) {
-    if (gOrigDoAuthenticateCheck) return gOrigDoAuthenticateCheck(self, _cmd);
-    return nil;
-}
-
-/* ── 0x8f6608 : -[MSEShareMainViewController onCheckAuthenticateDidFinish:] ── */
-static void WCRHook_AuthDidFinish(id self, SEL _cmd, id arg) {
-    if (gOrigAuthDidFinish) gOrigAuthDidFinish(self, _cmd, arg);
-}
-
-#pragma mark - 安装（0x8f3630 / 0x8f3698 / 0x8f3508）
-
-/* 0x8f3630 */
-static void WCRInstallFileManagerHook(void) {
-    if (gSwizzledFileManager) return;                       /* 0x8f363c */
-    Class cls = [NSFileManager class];                      /* classref 0x238f8f0 */
-    SEL sel = @selector(containerURLForSecurityApplicationGroupIdentifier:);
-    gSwizzledFileManager = WCRSwizzle(cls, sel,
-                                      (IMP)WCRHook_ContainerURL,
-                                      (IMP *)&gOrigContainerURL);   /* 0x8f3680 */
-}
-
-/* 0x8f3698 */
-static void WCRInstallOtherHooks(void) {
-    Class ckEnt = NSClassFromString(kWCRCKEntitlementsClass);
-    if (ckEnt) {                                                       /* 0x8f36b8 */
-        WCRSwizzle(ckEnt, NSSelectorFromString(kWCRCKEntitlementsInit),
-                   (IMP)WCRHook_CKEntitlementsInit, (IMP *)&gOrigCKEntitlementsInit);
-    }
-
-    Class ck = NSClassFromString(kWCRCKContainerClass);
-    if (ck) {                                                          /* 0x8f3708 */
-        WCRSwizzle(ck, NSSelectorFromString(kWCRCKInitWithID),
-                   (IMP)WCRHook_CKInitWithID, (IMP *)&gOrigCKInitWithID);
-        WCRSwizzle(ck, NSSelectorFromString(kWCRCKSetupWithID),
-                   (IMP)WCRHook_CKSetupWithID, (IMP *)&gOrigCKSetupWithID);
-    }
-
-    WCRInstallFileManagerHook();                                        /* 0x8f3774 */
-
-    Class ud = [NSUserDefaults class];                                  /* classref 0x238f8c8 */
-    WCRSwizzle(ud, NSSelectorFromString(kWCRUserDefaultsSuiteInit),
-               (IMP)WCRHook_UserDefaultsSuiteInit,
-               (IMP *)&gOrigUserDefaultsSuiteInit);                     /* 0x8f37bc */
-
-    Class m1 = NSClassFromString(kWCRAppExtDataUtilClass);              /* 0x8f37d0 */
-    if (m1) {
-        Class meta = objc_getMetaClass(kWCRAppExtDataUtilClass.UTF8String); /* 0x1f15840 */
-        WCRSwizzle(meta, NSSelectorFromString(kWCRAppGroupIDSel),
-                   (IMP)WCRHook_AppExtDataUtilGroupID,
-                   (IMP *)&gOrigAppExtDataUtilGroupID);                 /* 0x8f380c */
-    }
-
-    Class m2 = NSClassFromString(kWCRExtDataUtilClass);                 /* 0x8f3828 */
-    if (m2) {
-        Class meta = objc_getMetaClass(kWCRExtDataUtilClass.UTF8String);
-        WCRSwizzle(meta, NSSelectorFromString(kWCRAppGroupIDSel),
-                   (IMP)WCRHook_ExtDataUtilGroupID,
-                   (IMP *)&gOrigExtDataUtilGroupID);                    /* 0x8f3860 */
-    }
-
-    Class shareVC = NSClassFromString(kWCRShareMainVCClass);            /* 0x8f387c */
-    if (shareVC) {
-        WCRSwizzle(shareVC, NSSelectorFromString(kWCRDoAuthenticateCheck),
-                   (IMP)WCRHook_DoAuthenticateCheck,
-                   (IMP *)&gOrigDoAuthenticateCheck);                   /* 0x8f38b0 */
-        Method m = class_getInstanceMethod(shareVC,
-                       NSSelectorFromString(kWCRAuthDidFinish));        /* 0x1f15228 */
-        if (m && method_getNumberOfArguments(m) == 3) {                  /* 0x8f38e8 */
-            WCRSwizzle(shareVC, NSSelectorFromString(kWCRAuthDidFinish),
-                       (IMP)WCRHook_AuthDidFinish,
-                       (IMP *)&gOrigAuthDidFinish);                     /* 0x8f3924 */
-        }
+    for (MMHeadImageView *v in DDAvatarViews()) {
+        NSString *name = v.nsUsrName;
+        if (name.length == 0) continue;
+        if (usrName.length && ![name isEqualToString:usrName]) continue;
+        [v setHeadImageByName:name];
     }
 }
 
-/* 0x14823ec —— 总开关 */
-static BOOL WCRShouldInstall(void) {
-    if (WCRIsShareExtensionProcess()) return YES;             /* 0x1482108 分支 */
-    if (WCRIsNotificationServiceProcess()) return YES;        /* 0x148230c 分支 */
-
-    /* 纯本地运行：无开关，默认生效（原函数 0x148236c 云控点已删除）。
-     *
-     * 注意：原版 WCR 这里还有一行 `if (!WCRPreferredHostLinked()) return NO;`
-     * —— 那是给「WCRefine.dylib 被静态链接进重打包宿主（Mach-O 的 LC_LOAD_DYLIB
-     * 表里出现 "WCRefine"）」的场景用的。我们这是 Theos/Substrate 运行时注入的
-     * 独立 tweak，宿主微信二进制的 LC_LOAD_DYLIB 里不会有 "WCRefine" /
-     * "WCRSideloadFix"，于是 WCRMachOLinksWCRefine() 恒返回 NO，若保留该行会导致
-     * 主 App 分支 WCRShouldInstall() 返回 NO → WCRSideloadFixInstall 提前 return、
-     * 一个 marker 都不写 → 扩展进程 WCRCurrentGroupID() 恒为 nil →
-     * WCRFixActive() 在扩展里恒 NO → 通知详情 / 通知头像 / 修复分享 全部失效。
-     *
-     * 参考 zxPluginsInject.dylib（同款自签修复实现）：其 getAppGroupPathIfExists
-     * 完全不门控宿主链接，直接用 LSBundleProxy 无条件重定向。我们的独立版同理，
-     * 宿主链接检查对运行时注入无效，必须去掉，才能落到默认生效。 */
+static BOOL DDTryApplyCustomAvatar(MMHeadImageView *view, NSString *usrName) {
+    NSString *name = usrName.length ? usrName : view.nsUsrName;
+    UIImage *custom = DDAvatarImageForUser(name);
+    if (!custom) return NO;
+    [view updateHeadImage:custom];
     return YES;
 }
 
-/* 设置页「选择分组」：把用户选定的应用组固化下来并立刻生效（对应 WCR 原版
- * 0x1482888 WCRSideloadFixApplySelectedGroupID 的写入部分）。扩展进程（NSE /
- * 分享扩展）下次启动扫 marker 时才切换到新组，故选完需杀对应进程后重开微信。 */
-static void WCRSelectGroup(NSString *groupID) {
-    if (![groupID isKindOfClass:[NSString class]] || groupID.length == 0) return;
-    if (![WCRApplicationGroupIDs() containsObject:groupID]) return;   /* 只接受当前包声明过的组 */
+%hook MMHeadImageView
 
-    WCRSetPickedGroupID(groupID);          /* 写 sideloadShareFixAppGroupId（NSUserDefaults / WCRefineConfig） */
-    WCRWriteGroupMarker(groupID);          /* 写进所有可用容器，供扩展进程反向查组 */
-
-    /* 清缓存，让下一次容器访问按新组重新解析（0x8f3f40 / 0x8f4e50 的 memo） */
-    gCachedRemappedGroup  = nil;
-    gCachedAvailableGroups = nil;
-    gCachedContainerURL   = nil;
-    gCachedContainerGroup = nil;
+- (void)updateHeadImage:(id)image {
+    UIImage *custom = DDAvatarImageForUser([self nsUsrName]);
+    %orig(custom ?: image);
 }
 
-#pragma mark - 安装流程
-
-/* 0x8f3508 —— 完整安装流程 */
-static void WCRSideloadFixInstall(void) {
-    BOOL isNotif = WCRIsNotificationServiceProcess();          /* 0x8f3520 */
-    BOOL should  = WCRShouldInstall();                         /* 0x8f3528 */
-
-    if (isNotif) WCRInstallFileManagerHook();                  /* 0x8f353c */
-
-    if (!should) {                                             /* 0x8f3548 */
-        if (isNotif) WCRInstallOtherHooks();                   /* 0x8f355c */
-        return;
+- (void)updateUsrName:(id)usrName withHeadImgUrl:(id)headImgUrl {
+    %orig(usrName, headImgUrl);
+    UIImage *custom = DDAvatarImageForUser(usrName ?: [self nsUsrName]);
+    if (custom) {
+        [self updateHeadImage:custom];
     }
+}
 
-    if (WCRIsGroupRemapExtensionProcess()) {                   /* 0x8f3568 */
-        WCRInstallOtherHooks();                                /* 0x8f3614 */
-        return;
+- (void)ImageDidLoad:(id)image Url:(id)url {
+    %orig(image, url);
+    UIImage *custom = DDAvatarImageForUser([self nsUsrName]);
+    if (custom) {
+        [self updateHeadImage:custom];
     }
+}
 
-    /* 主 App：把当前选定的应用组写进所有可用容器的 marker 文件。
-     * 纯本地版默认生效，未选组时自动选第一个可用组；
-     * 可在微信「插件」页的「自签修复」设置界面手动切换分组（多开防串号）。 */
-    NSString *gid = WCRResolvedGroupID();                      /* 0x8f3574 */
-    if (gid.length == 0) {
-        NSArray<NSString *> *ids = WCRApplicationGroupIDs();   /* 自动选第一个 */
-        if (ids.count) {
-            WCRSetPickedGroupID(ids.firstObject);
-            gid = ids.firstObject;
+- (void)setHeadImageByName:(id)usrName {
+    %orig(usrName);
+    DDTryApplyCustomAvatar(self, usrName);
+}
+
+- (void)doUpdateHeadImg:(BOOL)force {
+    %orig(force);
+    DDTryApplyCustomAvatar(self, nil);
+}
+
+- (void)didMoveToWindow {
+    %orig;
+    if (!self.window) return;
+    [DDAvatarViews() addObject:self];
+    DDTryApplyCustomAvatar(self, nil);
+}
+
+%end
+
+#pragma mark - 头像替换 · 高清大图（点开资料页头像后）
+
+static UIView *DDFindImageScrollViewIn(UIView *root) {
+    if (!root) return nil;
+    Class cls = %c(ImageScrollView);
+    if (!cls) return nil;
+    for (UIView *v in root.subviews) {
+        if ([v isKindOfClass:cls]) return v;
+        UIView *found = DDFindImageScrollViewIn(v);
+        if (found) return found;
+    }
+    return nil;
+}
+
+%hook MMHDHeadImageView
+
+%new
+- (void)dd_applyCustomHDHead {
+    UIImage *custom = DDAvatarImageForUser([self.m_contact m_nsUsrName]);
+    if (!custom) return;
+    ImageScrollView *sv = (ImageScrollView *)DDFindImageScrollViewIn(self);
+    if (!sv) return;
+    [sv updateImage:custom];
+}
+
+- (void)updateHead {
+    %orig;
+    [self dd_applyCustomHDHead];
+}
+
+- (void)updateHDHead {
+    %orig;
+    [self dd_applyCustomHDHead];
+}
+
+%end
+
+#pragma mark - 聊天详情页"自定义头像 / 自定义账号"入口
+
+static NSString * const kDDProfileChangedNotification = @"DDProfileContentChanged";
+
+static const void *kDDInjectedCellMarker = &kDDInjectedCellMarker;
+
+static BOOL DDSectionHasInjectedCell(id section) {
+    @try {
+        unsigned long long n = [section getCellCount];
+        for (unsigned long long i = 0; i < n; i++) {
+            id c = [section getCellAt:i];
+            if (objc_getAssociatedObject(c, kDDInjectedCellMarker) != nil) return YES;
         }
-    }
-    if (gid.length > 0) WCRWriteGroupMarker(gid);              /* 0x8f35b8 */
-
-    WCRInstallOtherHooks();                                    /* 0x8f3614 */
+    } @catch (NSException *e) {}
+    return NO;
 }
 
-#pragma mark - 设置界面（参考 DD收款助手：父 cell 展开 + 子 cell 选择）
+static __weak AddContactToChatRoomViewController *s_profileVC = nil;
 
-/* 单 section、单父 cell「证书分组（应用组）」，点按展开成应用组列表，
- * 点子 cell 即选定该组。沿用 DD 收款助手的交互模式，但底层用原生 UITableView
- * —— 8.0.78 的 WCTableViewManager initWithFrame:style: 第二参是 CGSize（DD 那版
- * 微信 76 是 NSInteger/UITableViewStyle），照搬会 ABI 错位崩溃，故不依赖微信内部表格类。 */
-@interface WCRSideloadFixSettingsViewController : UIViewController <UITableViewDelegate, UITableViewDataSource>
-@property (nonatomic, strong) UITableView *tableView;
-@property (nonatomic) BOOL expanded;
+static AddContactToChatRoomViewController *DDProfileVCForTable(id tableViewInfo) {
+    AddContactToChatRoomViewController *vc = s_profileVC;
+    if (!vc || !tableViewInfo) return nil;
+    id tv = nil;
+    @try { tv = [vc valueForKey:@"m_tableViewInfo"]; } @catch (NSException *e) { tv = nil; }
+    if (tv != tableViewInfo) return nil;
+    return vc;
+}
+
+// 在微信重建表格的同一次 runloop 内将入口插入到位置 At:1（资料卡正下方），不产生额外帧。
+static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *vc, BOOL reloadNow) {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (!cfg.avatarEnabled && !cfg.friendWxidEnabled) return;
+    if (![vc m_contact]) return;
+    id tableViewInfo = [vc valueForKey:@"m_tableViewInfo"];
+    if (!tableViewInfo) return;
+    NSArray *sections = [tableViewInfo getAllSections];
+    if (sections.count == 0) return;
+    for (id s in sections) {
+        if (DDSectionHasInjectedCell(s)) return;
+    }
+
+    NSString *usrName = [[vc m_contact] m_nsUsrName];
+    id section = [%c(WCTableViewSectionManager) defaultSection];
+    id firstCell = nil;
+
+    if (cfg.avatarEnabled) {
+        BOOL hasCustom = DDAvatarImageForUser(usrName) != nil;
+        id cell = [%c(WCTableViewCellManager) switchCellForSel:@selector(ddAvatarSwitchChanged:)
+                target:vc
+                title:@"自定义头像"
+                on:hasCustom];
+        if (cell) { [section addCell:cell]; if (!firstCell) firstCell = cell; }
+    }
+    if (cfg.friendWxidEnabled) {
+        BOOL hasCustom = DDFriendWxidForUser(usrName) != nil;
+        id cell = [%c(WCTableViewCellManager) switchCellForSel:@selector(ddWxidSwitchChanged:)
+                target:vc
+                title:@"自定义账号"
+                on:hasCustom];
+        if (cell) { [section addCell:cell]; if (!firstCell) firstCell = cell; }
+    }
+    if (!firstCell) return;
+
+    // 只给第一行打标记：查重靠它，两行始终同进同退
+    objc_setAssociatedObject(firstCell, kDDInjectedCellMarker, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [tableViewInfo insertSection:section At:1];
+    if (reloadNow) [[tableViewInfo getTableView] reloadData];
+}
+
+%hook WCTableViewManager
+
+// 微信重建表格走 clearAllSection → addSection ×N；首个 addSection 回调时资料卡已加回，
+//   此刻同步插入到 At:1，与重建在同一 runloop 内完成，随后一次 reloadData 即带出该行。
+- (void)addSection:(id)a0 {
+    %orig;
+    if (!a0) return;
+    AddContactToChatRoomViewController *vc = DDProfileVCForTable(self);
+    if (!vc || ![vc m_contact]) return;
+    DDInjectProfileSectionIntoTable(vc, NO);
+}
+
+%end
+
+%hook AddContactToChatRoomViewController
+
+// s_profileVC 须在 %orig 之前赋值：微信在 super viewDidLoad 内部即完成表格装配，
+//   若晚于 %orig 赋值，装配期的 addSection 钩子会无法识别本表而跳过，需退到 viewWillAppear 才补插。
+- (void)viewDidLoad {
+    s_profileVC = self;
+    %orig;
+    s_profileVC = self;
+    [[NSNotificationCenter defaultCenter] addObserver:self
+            selector:@selector(reloadTableData)
+            name:kDDProfileChangedNotification
+            object:nil];
+    [self dd_injectProfileSection];   // 表格已装配完、页面尚未显示，首帧即带开关
+}
+
+// 转场前再确认一次：若微信在 %orig 内又重建表格，此处补插（已插入时由查重跳过）。
+- (void)viewWillAppear:(BOOL)animated {
+    s_profileVC = self;
+    %orig;
+    s_profileVC = self;
+    [self dd_injectProfileSection];
+}
+
+- (void)dealloc {
+    if (s_profileVC == self) s_profileVC = nil;
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:kDDProfileChangedNotification object:nil];
+    %orig;
+}
+
+%new
+- (void)dd_injectProfileSection {
+    DDInjectProfileSectionIntoTable(self, YES);
+}
+
+%new
+- (void)ddAvatarSwitchChanged:(UISwitch *)sender {
+    CBaseContact *contact = [self m_contact];
+    NSString *usrName = [contact m_nsUsrName];
+    if (usrName.length == 0) return;
+
+    if (DDAvatarImageForUser(usrName)) {
+        (void)DDAvatarRemoveForUser(usrName);
+        [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
+    } else {
+        __weak typeof(self) weakSelf = self;
+        __weak UISwitch *weakSw = sender;
+        [DDAvatarPicker presentFromViewController:self completion:^(UIImage *image) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if (!image) {
+                [weakSw setOn:NO animated:YES];
+                return;
+            }
+            if (!DDAvatarSaveImage(image, usrName)) {
+                [weakSw setOn:NO animated:YES];
+            } else {
+                [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
+            }
+        }];
+    }
+}
+
+// 与"自定义头像"对称：开 → 微信原生输入弹窗；关 → 清掉该用户的自定义。
+// 弹窗里留空直接确定 = 存空串，效果等同隐藏。
+%new
+- (void)ddWxidSwitchChanged:(UISwitch *)sender {
+    CBaseContact *contact = [self m_contact];
+    NSString *usrName = [contact m_nsUsrName];
+    if (usrName.length == 0) return;
+
+    if (DDFriendWxidForUser(usrName)) {
+        DDFriendWxidRemoveForUser(usrName);
+        [[NSNotificationCenter defaultCenter] postNotificationName:kDDFriendWxidChangedNotification object:nil];
+        return;
+    }
+
+    WCUIAlertView *alert = [[%c(WCUIAlertView) alloc] initWithTitle:@"账号修改" message:@"请输入账号如：520\n输入空格隐藏账号\n留空还原"];
+    if (!alert) {
+        [sender setOn:NO animated:YES];
+        return;
+    }
+    [alert showTextFieldWithMaxLen:32];
+    [alert setTextFieldDefaultText:[contact m_nsAliasName] ?: @""];
+
+    // 无参 block 配合 __block 强持有，回调末尾置 nil 打破循环；
+    //   getTextField 需在 show 之后才有，故直接 getTextFieldText 取文本。
+    __block WCUIAlertView *blockAlert = alert;
+    __weak UISwitch *weakSw = sender;
+
+    [alert addCancelBtnTitle:@"取消" handler:^{
+        [weakSw setOn:NO animated:YES];
+        blockAlert = nil;
+    }];
+    [alert addBtnTitle:@"确定" handler:^{
+        NSString *text = [blockAlert getTextFieldText] ?: @"";
+        if (text.length == 0) {
+            // 没有输入：关闭该用户自定义并回弹开关
+            DDFriendWxidRemoveForUser(usrName);
+            [weakSw setOn:NO animated:YES];
+        } else {
+            // 空格 / 文字：原样保存（空格=空白账号即隐藏）
+            DDFriendWxidSetForUser(text, usrName);
+        }
+        [[NSNotificationCenter defaultCenter] postNotificationName:kDDFriendWxidChangedNotification object:nil];
+        blockAlert = nil;
+    }];
+    [alert show];
+}
+
+%end
+
+#pragma mark - 隐藏聊天顶栏名字（单聊 / 群聊）
+
+static BOOL DDHideChatName(void) {
+    return [DDGlobalConfig shared].hideChatName;
+}
+
+%hook BaseMsgContentLogicController
+
+- (id)GetUsrTitle {
+    if (DDHideChatName()) return @"";
+    return %orig;
+}
+
+- (id)getSubTitle {
+    if (DDHideChatName()) return @"";
+    return %orig;
+}
+
+- (id)GetTitleTailImageView {
+    if (DDHideChatName()) return nil;
+    return %orig;
+}
+
+%end
+
+%hook RoomContentLogicController
+
+- (id)GetUsrTitle {
+    if (DDHideChatName()) return @"";
+    return %orig;
+}
+
+- (id)getSubTitle {
+    if (DDHideChatName()) return @"";
+    return %orig;
+}
+
+- (id)getDefaultTitleTailSubViews {
+    if (DDHideChatName()) return nil;
+    return %orig;
+}
+
+- (id)getMemeberCountLabel {
+    if (DDHideChatName()) return nil;
+    return %orig;
+}
+
+%end
+
+#pragma mark - 设置界面
+// 各功能开关、自定义值输入；表视图委托转发给微信原生 manager。
+
+
+@interface DDJokerSettingsViewController : UIViewController <UITableViewDelegate>
+@property (nonatomic, strong) WCTableViewManager *tableViewManager;
+@property (nonatomic, strong) UITextField *stepsField;
+@property (nonatomic, strong) UITextField *contactsField;
+@property (nonatomic, strong) UITextField *balanceField;
+@property (nonatomic, strong) UITextField *lingtongField;
+@property (nonatomic, strong) UITextField *wxidField;
 @end
 
-@implementation WCRSideloadFixSettingsViewController
+@implementation DDJokerSettingsViewController {
+    id<UITableViewDelegate> _originalDelegate;
+    UITextField *_wxidField;
+}
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"自签修复";
+    self.title = @"小丑助手设置";
 
-    /* 与 DD 收款助手一致的导航栏外观：去底部分割线 */
-    if (@available(iOS 13.0, *)) {
-        UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
-        [appearance configureWithDefaultBackground];
-        appearance.shadowColor = nil;
-        self.navigationItem.standardAppearance   = appearance;
-        self.navigationItem.scrollEdgeAppearance = appearance;
-        self.navigationItem.compactAppearance    = appearance;
-    }
+    UINavigationBarAppearance *appearance = [[UINavigationBarAppearance alloc] init];
+    [appearance configureWithDefaultBackground];
+    appearance.shadowColor = nil;
+    self.navigationItem.standardAppearance = appearance;
+    self.navigationItem.scrollEdgeAppearance = appearance;
+    self.navigationItem.compactAppearance = appearance;
 
-    self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds
-                                                  style:UITableViewStyleInsetGrouped];
-    self.tableView.autoresizingMask =
-        UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    self.tableView.delegate   = self;
-    self.tableView.dataSource = self;
-    self.tableView.tableFooterView = [[UIView alloc] initWithFrame:CGRectZero];
-    [self.view addSubview:self.tableView];
-    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    _tableViewManager = [(WCTableViewManager *)[%c(WCTableViewManager) alloc] initWithFrame:[[UIScreen mainScreen] bounds] style:UITableViewStyleInsetGrouped];
+    _tableViewManager.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _tableViewManager.tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentAutomatic;
+    [self.view addSubview:_tableViewManager.tableView];
+
+    _originalDelegate = _tableViewManager.delegate;
+    _tableViewManager.delegate = self;
+
+    [self buildTable];
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 1; }
+- (UIView *)inputRowWithField:(UITextField *)field action:(SEL)action placeholder:(NSString *)placeholder text:(NSString *)text {
+    UIView *container = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 220, 34)];
+    container.backgroundColor = [UIColor clearColor];
 
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return self.expanded ? (1 + [WCRApplicationGroupIDs() count]) : 1;
+    field.frame = CGRectMake(0, 0, 160, 34);
+    field.borderStyle = UITextBorderStyleNone;
+    field.placeholder = placeholder;
+    field.text = text;
+    field.textAlignment = NSTextAlignmentRight;
+    field.keyboardType = UIKeyboardTypeNumberPad;
+    field.backgroundColor = [UIColor systemGray5Color];
+    field.layer.cornerRadius = 6.0;
+    field.layer.masksToBounds = YES;
+    field.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 34)];
+    field.leftViewMode = UITextFieldViewModeAlways;
+    field.rightView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 34)];
+    field.rightViewMode = UITextFieldViewModeAlways;
+    [container addSubview:field];
+
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    btn.frame = CGRectMake(168, 0, 52, 34);
+    [btn setTitle:@"确认" forState:UIControlStateNormal];
+    [btn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
+    btn.backgroundColor = [UIColor systemGray5Color];
+    btn.layer.cornerRadius = 6.0;
+    btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
+    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    [container addSubview:btn];
+
+    return container;
 }
 
-- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    return @"即签名证书中的 application-groups。多开请选不同应用组，防止串号。";
+- (UIButton *)dd_actionButton:(NSString *)title action:(SEL)action x:(CGFloat)x {
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    btn.frame = CGRectMake(x, 0, 52, 34);
+    [btn setTitle:title forState:UIControlStateNormal];
+    [btn setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
+    btn.backgroundColor = [UIColor systemGray5Color];
+    btn.layer.cornerRadius = 6.0;
+    btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
+    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    return btn;
 }
 
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"WCRCell"];
-    if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1
-                                      reuseIdentifier:@"WCRCell"];
-    }
-    NSArray<NSString *> *groups = WCRApplicationGroupIDs();
-    NSString *picked = WCRPickedGroupID();
+- (void)buildTable {
+    [_tableViewManager clearAllSection];
 
-    if (indexPath.row == 0) {
-        cell.textLabel.text = @"证书分组（应用组）";
-        cell.detailTextLabel.text = picked.length ? picked : @"未选择";
-        cell.accessoryType = self.expanded ? UITableViewCellAccessoryNone
-                                           : UITableViewCellAccessoryDisclosureIndicator;
-    } else {
-        NSString *gid = groups[indexPath.row - 1];
-        cell.textLabel.text = gid;
-        cell.detailTextLabel.text = nil;
-        cell.accessoryType = [gid isEqualToString:picked]
-                             ? UITableViewCellAccessoryCheckmark
-                             : UITableViewCellAccessoryNone;
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    Class cellCls = %c(WCTableViewCellManager);
+
+    WCTableViewSectionManager *chatSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"聊天小丑"];
+    chatSection.footerTitle = @"开启后长按聊天消息，弹窗/菜单点击「小丑」修改";
+    [chatSection addCell:[cellCls switchCellForSel:@selector(textSwitchChanged:) target:self title:@"聊天文字修改" on:cfg.textEnabled]];
+    [chatSection addCell:[cellCls switchCellForSel:@selector(imageSwitchChanged:) target:self title:@"聊天图片修改" on:cfg.imageEnabled]];
+    [chatSection addCell:[cellCls switchCellForSel:@selector(timeSwitchChanged:) target:self title:@"聊天时间修改" on:cfg.timeEnabled]];
+    [chatSection addCell:[cellCls switchCellForSel:@selector(transferSwitchChanged:) target:self title:@"聊天转账修改" on:cfg.transferEnabled]];
+    UIButton *clearBtn = [self dd_actionButton:@"清理" action:@selector(clearChatCacheTapped:) x:0];
+    UIView *clearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
+    [clearRight addSubview:clearBtn];
+    [chatSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清空修改记录" rightView:clearRight]];
+    [_tableViewManager addSection:chatSection];
+
+    WCTableViewSectionManager *profileSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"资料小丑"];
+    profileSection.footerTitle = @"开启设置用户账号/头像后在「聊天详情」页逐人自定义";
+    [profileSection addCell:[cellCls switchCellForSel:@selector(balanceSwitchChanged:) target:self title:@"零钱余额修改" on:cfg.balanceEnabled]];
+    if (cfg.balanceEnabled) {
+        self.balanceField = [[UITextField alloc] init];
+        [self.balanceField addTarget:self action:@selector(balanceChanged:) forControlEvents:UIControlEventEditingChanged];
+        NSString *currentBalance = [cfg hasBalanceValue] ? cfg.balanceValue : @"";
+        UIView *balanceRight = [self inputRowWithField:self.balanceField
+                action:@selector(balanceConfirm:)
+                placeholder:@"例如：888.88"
+                text:currentBalance];
+        self.balanceField.keyboardType = UIKeyboardTypeDecimalPad;
+        WCTableViewCellManager *balanceSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳余额自定义" rightView:balanceRight];
+        balanceSubCell.userInfo = @"SubCell";
+        [profileSection addCell:balanceSubCell];
+
+        self.lingtongField = [[UITextField alloc] init];
+        [self.lingtongField addTarget:self action:@selector(lingtongChanged:) forControlEvents:UIControlEventEditingChanged];
+        NSString *currentLingtong = [cfg hasLingtongValue] ? cfg.lingtongValue : @"";
+        UIView *lingtongRight = [self inputRowWithField:self.lingtongField
+                action:@selector(lingtongConfirm:)
+                placeholder:@"例如：888.88"
+                text:currentLingtong];
+        self.lingtongField.keyboardType = UIKeyboardTypeDecimalPad;
+        WCTableViewCellManager *lingtongSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳零钱通自定义" rightView:lingtongRight];
+        lingtongSubCell.userInfo = @"SubCell";
+        [profileSection addCell:lingtongSubCell];
     }
-    return cell;
+
+    [profileSection addCell:[cellCls switchCellForSel:@selector(stepsSwitchChanged:) target:self title:@"运动步数修改" on:cfg.stepsEnabled]];
+    if (cfg.stepsEnabled) {
+        self.stepsField = [[UITextField alloc] init];
+        [self.stepsField addTarget:self action:@selector(stepsChanged:) forControlEvents:UIControlEventEditingChanged];
+        NSString *currentSteps = [cfg hasStepsValue] ? cfg.stepsValueString : @"";
+        UIView *rightView = [self inputRowWithField:self.stepsField
+                action:@selector(stepsConfirm:)
+                placeholder:@"例如：88888"
+                text:currentSteps];
+        WCTableViewCellManager *stepsSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳步数自定义" rightView:rightView];
+        stepsSubCell.userInfo = @"SubCell";
+        [profileSection addCell:stepsSubCell];
+    }
+
+    [profileSection addCell:[cellCls switchCellForSel:@selector(contactsSwitchChanged:) target:self title:@"好友数量修改" on:cfg.contactsEnabled]];
+    if (cfg.contactsEnabled) {
+        self.contactsField = [[UITextField alloc] init];
+        [self.contactsField addTarget:self action:@selector(contactsChanged:) forControlEvents:UIControlEventEditingChanged];
+        NSString *currentContacts = [cfg hasContactsValue] ? cfg.contactsValue : @"";
+        UIView *rightView = [self inputRowWithField:self.contactsField
+                action:@selector(contactsConfirm:)
+                placeholder:@"例如：520"
+                text:currentContacts];
+        WCTableViewCellManager *contactsSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳数量自定义" rightView:rightView];
+        contactsSubCell.userInfo = @"SubCell";
+        [profileSection addCell:contactsSubCell];
+    }
+
+    [profileSection addCell:[cellCls switchCellForSel:@selector(wxidSwitchChanged:) target:self title:@"设置自己账号" on:cfg.wxidEnabled]];
+    if (cfg.wxidEnabled) {
+        self.wxidField = [[UITextField alloc] init];
+        NSString *currentWxid = cfg.wxidValue.length ? cfg.wxidValue : @"";
+        UIView *rightView = [self inputRowWithField:self.wxidField
+                action:@selector(wxidConfirm:)
+                placeholder:@"例如：520"
+                text:currentWxid];
+        self.wxidField.keyboardType = UIKeyboardTypeASCIICapable;
+        WCTableViewCellManager *wxidSubCell = [cellCls normalCellForSel:nil target:nil title:@"↳账号自定义" rightView:rightView];
+        wxidSubCell.userInfo = @"SubCell";
+        [profileSection addCell:wxidSubCell];
+    }
+
+    [profileSection addCell:[cellCls switchCellForSel:@selector(friendWxidSwitch:) target:self title:@"设置用户账号" on:cfg.friendWxidEnabled]];
+
+    [profileSection addCell:[cellCls switchCellForSel:@selector(hideChatNameSwitch:) target:self title:@"隐藏顶栏名字" on:cfg.hideChatName]];
+
+    [profileSection addCell:[cellCls switchCellForSel:@selector(avatarSwitchChanged:) target:self title:@"设置用户头像" on:cfg.avatarEnabled]];
+    UIButton *avatarClearBtn = [self dd_actionButton:@"清理" action:@selector(clearAllAvatarTapped:) x:0];
+    UIView *avatarClearRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
+    [avatarClearRight addSubview:avatarClearBtn];
+    [profileSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清空全部头像" rightView:avatarClearRight]];
+
+    [_tableViewManager addSection:profileSection];
+
+    [_tableViewManager reloadTableView];
+}
+
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:willDisplayCell:forRowAtIndexPath:)]) {
+        [_originalDelegate tableView:tableView willDisplayCell:cell forRowAtIndexPath:indexPath];
+    }
+    WCTableViewCellManager *cellInfo = [self.tableViewManager cellInfoAtIndexPath:indexPath];
+    if ([cellInfo.userInfo isEqualToString:@"SubCell"]) {
+        cell.indentationLevel = 1;
+        cell.indentationWidth = 16.0;
+    }
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:didSelectRowAtIndexPath:)]) {
+        [_originalDelegate tableView:tableView didSelectRowAtIndexPath:indexPath];
+    }
+}
 
-    if (indexPath.row == 0) {
-        self.expanded = !self.expanded;
-        [tableView reloadSections:[NSIndexSet indexSetWithIndex:0]
-                 withRowAnimation:UITableViewRowAnimationAutomatic];
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(tableView:heightForRowAtIndexPath:)]) {
+        return [_originalDelegate tableView:tableView heightForRowAtIndexPath:indexPath];
+    }
+    return UITableViewAutomaticDimension;
+}
+
+- (void)textSwitchChanged:(UISwitch *)sender {
+    [DDGlobalConfig shared].textEnabled = sender.isOn;
+    JokerInvalidateAllLayout();
+    [self buildTable];
+}
+
+- (void)imageSwitchChanged:(UISwitch *)sender {
+    [DDGlobalConfig shared].imageEnabled = sender.isOn;
+    JokerInvalidateAllLayout();
+    [self buildTable];
+}
+
+- (void)timeSwitchChanged:(UISwitch *)sender {
+    [DDGlobalConfig shared].timeEnabled = sender.isOn;
+    JokerInvalidateAllLayout();
+    [self buildTable];
+}
+
+- (void)transferSwitchChanged:(UISwitch *)sender {
+    [DDGlobalConfig shared].transferEnabled = sender.isOn;
+
+    JokerInvalidateAllLayout();
+    [self buildTable];
+}
+
+- (void)clearChatCacheTapped:(id)sender {
+    DDJokerClearAllMessageCache();
+    JokerInvalidateAllLayout();
+    [self buildTable];
+    [self dd_showDoneToast:@"记录已清理"];
+}
+
+- (void)dd_showDoneToast:(NSString *)text {
+    if (!text.length) return;
+
+    WeToast *toast = [%c(WeToast) toast];
+    if (toast) [toast showDoneToastWithText:text];
+}
+
+- (void)balanceSwitchChanged:(UISwitch *)sender {
+    [DDGlobalConfig shared].balanceEnabled = sender.isOn;
+    [self buildTable];
+}
+
+- (void)stepsSwitchChanged:(UISwitch *)sender {
+    [DDGlobalConfig shared].stepsEnabled = sender.isOn;
+    [self buildTable];
+}
+
+- (void)contactsSwitchChanged:(UISwitch *)sender {
+    [DDGlobalConfig shared].contactsEnabled = sender.isOn;
+    [self buildTable];
+}
+
+- (void)friendWxidSwitch:(UISwitch *)sender {
+    [DDGlobalConfig shared].friendWxidEnabled = sender.isOn;
+}
+
+- (void)wxidSwitchChanged:(id)sender {
+    UISwitch *sw = (UISwitch *)sender;
+    [DDGlobalConfig shared].wxidEnabled = sw.on;
+    [self buildTable];
+}
+
+- (void)wxidConfirm:(id)sender {
+    // 原样保存：空=不覆盖，空格=空白账号（隐藏），其他=自定义值
+    [DDGlobalConfig shared].wxidValue = self.wxidField.text ?: @"";
+    [self.wxidField resignFirstResponder];
+    [self buildTable];
+}
+
+- (void)avatarSwitchChanged:(id)sender {
+    UISwitch *sw = (UISwitch *)sender;
+    [DDGlobalConfig shared].avatarEnabled = sw.on;
+    if (!sw.on) DDRefreshAvatarViewsForUser(nil);
+    [self buildTable];
+}
+
+- (void)hideChatNameSwitch:(id)sender {
+    UISwitch *sw = (UISwitch *)sender;
+    [DDGlobalConfig shared].hideChatName = sw.on;
+}
+
+- (void)clearAllAvatarTapped:(id)sender {
+    (void)DDAvatarRemoveAll();
+    [self dd_showDoneToast:@"头像已清理"];
+}
+
+- (void)stepsConfirm:(id)sender {
+    NSString *input = self.stepsField.text;
+    [self saveStepsInput:input];
+    [self buildTable];
+}
+
+- (void)contactsConfirm:(id)sender {
+    NSString *input = self.contactsField.text;
+    [self saveContactsInput:input];
+    [self buildTable];
+}
+
+- (void)balanceConfirm:(id)sender {
+    NSString *input = self.balanceField.text;
+    [self saveBalanceInput:input];
+    [self buildTable];
+}
+
+- (void)lingtongConfirm:(id)sender {
+    NSString *input = self.lingtongField.text;
+    [self saveLingtongInput:input];
+    [self buildTable];
+}
+
+- (void)balanceChanged:(id)sender {
+    [self saveBalanceInput:self.balanceField.text];
+}
+
+- (void)lingtongChanged:(id)sender {
+    [self saveLingtongInput:self.lingtongField.text];
+}
+
+- (void)stepsChanged:(id)sender {
+    [self saveStepsInput:self.stepsField.text];
+}
+
+- (void)contactsChanged:(id)sender {
+    [self saveContactsInput:self.contactsField.text];
+}
+
+- (void)saveStepsInput:(NSString *)input {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) {
+        cfg.stepsValueString = nil;
+    } else {
+        NSInteger val = [trimmed integerValue];
+        if (val < 0) val = 0;
+        if (val > 100000) val = 100000;
+        cfg.stepsValueString = [NSString stringWithFormat:@"%ld", (long)val];
+    }
+}
+
+- (void)saveContactsInput:(NSString *)input {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) {
+        cfg.contactsValue = nil;
+    } else {
+        NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+        if ([trimmed rangeOfCharacterFromSet:nonDigits].location == NSNotFound) {
+            cfg.contactsValue = trimmed;
+        }
+    }
+}
+
+- (void)saveBalanceInput:(NSString *)input {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) {
+        cfg.balanceValue = nil;
         return;
     }
+    NSMutableString *filtered = [NSMutableString string];
+    BOOL hasDot = NO;
+    for (NSUInteger i = 0; i < trimmed.length; i++) {
+        unichar c = [trimmed characterAtIndex:i];
+        if (c >= '0' && c <= '9') {
+            [filtered appendFormat:@"%C", c];
+        } else if (c == '.' && !hasDot) {
+            [filtered appendFormat:@"%C", c];
+            hasDot = YES;
+        }
+    }
+    cfg.balanceValue = filtered.length ? filtered : nil;
+}
 
-    NSString *gid = [WCRApplicationGroupIDs() objectAtIndex:indexPath.row - 1];
-    WCRSelectGroup(gid);                  /* 写 picked + marker + 清缓存，立刻生效 */
-    self.expanded = NO;
-    [tableView reloadSections:[NSIndexSet indexSetWithIndex:0]
-             withRowAnimation:UITableViewRowAnimationAutomatic];
+- (void)saveLingtongInput:(NSString *)input {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) {
+        cfg.lingtongValue = nil;
+        return;
+    }
+    NSMutableString *filtered = [NSMutableString string];
+    BOOL hasDot = NO;
+    for (NSUInteger i = 0; i < trimmed.length; i++) {
+        unichar c = [trimmed characterAtIndex:i];
+        if (c >= '0' && c <= '9') {
+            [filtered appendFormat:@"%C", c];
+        } else if (c == '.' && !hasDot) {
+            [filtered appendFormat:@"%C", c];
+            hasDot = YES;
+        }
+    }
+    cfg.lingtongValue = filtered.length ? filtered : nil;
 }
 
 @end
 
-#pragma mark - 构造
+#pragma mark - 配置管理（实现）
+// DDGlobalConfig 单例：属性 setter 同步 NSUserDefaults。
+
+
+@implementation DDGlobalConfig
+
++ (instancetype)shared {
+    static DDGlobalConfig *config = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ config = [DDGlobalConfig new]; });
+    return config;
+}
+
+- (instancetype)init {
+    if ((self = [super init])) {
+        NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+        _textEnabled = [def boolForKey:kDDFeatureTextEnabled];
+        _imageEnabled = [def boolForKey:kDDFeatureImageEnabled];
+        _timeEnabled = [def boolForKey:kDDFeatureTimeEnabled];
+        _transferEnabled = [def boolForKey:kDDFeatureTransferEnabled];
+        _balanceEnabled = [def boolForKey:kDDFeatureBalanceEnabled];
+        _stepsEnabled = [def boolForKey:kDDFeatureStepsEnabled];
+        _contactsEnabled = [def boolForKey:kDDFeatureContactsEnabled];
+        _friendWxidEnabled = [def boolForKey:kDDFeatureFriendWxidEnabled];
+        _wxidEnabled = [def boolForKey:kDDFeatureWxidEnabled];
+        _wxidValue = [def stringForKey:kDDFeatureWxidValue] ?: @"";
+        _avatarEnabled = [def boolForKey:kDDFeatureAvatarEnabled];
+        _hideChatName = [def boolForKey:kDDFeatureHideChatName];
+
+        _stepsValueString = [def stringForKey:kDDStepsValueStringKey];
+        _contactsValue = [def stringForKey:kDDContactsCountValueKey];
+        _balanceValue = [def stringForKey:kDDBalanceValueKey];
+        _lingtongValue = [def stringForKey:kDDLingtongValueKey];
+    }
+    return self;
+}
+
+- (void)setTextEnabled:(BOOL)enabled {
+    _textEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureTextEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setTransferEnabled:(BOOL)enabled {
+    _transferEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureTransferEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setImageEnabled:(BOOL)enabled {
+    _imageEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureImageEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setTimeEnabled:(BOOL)enabled {
+    _timeEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureTimeEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setBalanceEnabled:(BOOL)enabled {
+    _balanceEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureBalanceEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setStepsEnabled:(BOOL)enabled {
+    _stepsEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureStepsEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setContactsEnabled:(BOOL)enabled {
+    _contactsEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kDDFeatureContactsEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setWxidEnabled:(BOOL)wxidEnabled {
+    _wxidEnabled = wxidEnabled;
+    [[NSUserDefaults standardUserDefaults] setBool:wxidEnabled forKey:kDDFeatureWxidEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setWxidValue:(NSString *)wxidValue {
+    _wxidValue = [wxidValue copy];
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    if (_wxidValue.length) {
+        [def setObject:_wxidValue forKey:kDDFeatureWxidValue];
+    } else {
+        [def removeObjectForKey:kDDFeatureWxidValue];
+    }
+    [def synchronize];
+}
+
+- (void)setAvatarEnabled:(BOOL)avatarEnabled {
+    _avatarEnabled = avatarEnabled;
+    [[NSUserDefaults standardUserDefaults] setBool:avatarEnabled forKey:kDDFeatureAvatarEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)setHideChatName:(BOOL)hideChatName {
+    _hideChatName = hideChatName;
+    [[NSUserDefaults standardUserDefaults] setBool:hideChatName forKey:kDDFeatureHideChatName];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+
+- (void)setStepsValueString:(NSString *)stepsValueString {
+    _stepsValueString = [stepsValueString copy];
+    [self saveSteps];
+}
+
+- (void)setContactsValue:(NSString *)contactsValue {
+    _contactsValue = [contactsValue copy];
+    [self saveContacts];
+}
+
+- (void)setBalanceValue:(NSString *)balanceValue {
+    _balanceValue = [balanceValue copy];
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    if (_balanceValue.length) {
+        [def setObject:_balanceValue forKey:kDDBalanceValueKey];
+    } else {
+        [def removeObjectForKey:kDDBalanceValueKey];
+    }
+    [def synchronize];
+}
+
+- (void)setLingtongValue:(NSString *)lingtongValue {
+    _lingtongValue = [lingtongValue copy];
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    if (_lingtongValue.length) {
+        [def setObject:_lingtongValue forKey:kDDLingtongValueKey];
+    } else {
+        [def removeObjectForKey:kDDLingtongValueKey];
+    }
+    [def synchronize];
+}
+
+- (NSInteger)stepsIntegerValue {
+    if (![self hasStepsValue]) return 0;
+    return [_stepsValueString integerValue];
+}
+
+- (BOOL)hasStepsValue {
+    return _stepsValueString.length > 0;
+}
+
+- (BOOL)hasContactsValue {
+    return _contactsValue.length > 0;
+}
+
+- (BOOL)hasBalanceValue {
+    return _balanceValue.length > 0;
+}
+
+- (BOOL)hasLingtongValue {
+    return _lingtongValue.length > 0;
+}
+
+- (void)saveSteps {
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    if (_stepsValueString.length) {
+        [def setObject:_stepsValueString forKey:kDDStepsValueStringKey];
+    } else {
+        [def removeObjectForKey:kDDStepsValueStringKey];
+    }
+    [def synchronize];
+}
+
+- (void)saveContacts {
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    if (_contactsValue.length) {
+        [def setObject:_contactsValue forKey:kDDContactsCountValueKey];
+    } else {
+        [def removeObjectForKey:kDDContactsCountValueKey];
+    }
+    [def synchronize];
+}
+
+@end
+
+#pragma mark - 插件注册
+// %ctor 把设置页注册到微信插件入口。
+
 
 %ctor {
     @autoreleasepool {
-        /* WCR 在 0x8f3508 里同样是"先判定进程/开关，再装 hook"，
-         * 所有 hook 在主 App 与扩展进程里都会装（由 WCRFixActive 运行期决定生效）。
-         * 纯本地版默认生效，这里只按 WCR 顺序执行安装。 */
-        WCRSideloadFixInstall();
-
-        /* 插件入口：照搬 DD收款助手 的 WCPluginsMgr 注册方式（DD 第599-604行同款写法）。
-         * 用 objc_getClass 取 id 变量再发消息，可正常链接编译；用户在微信「插件」页
-         * 点「自签修复」即进入上面的 WCRSideloadFixSettingsViewController 设置界面。 */
-        id mgr = objc_getClass("WCPluginsMgr");
-        if (mgr && [mgr respondsToSelector:@selector(sharedInstance)]) {
-            [[mgr sharedInstance] registerControllerWithTitle:@"自签修复"
-                                                     version:@"1.0.0"
-                                                  controller:@"WCRSideloadFixSettingsViewController"];
-        }
+        WCPluginsMgr *mgr = [%c(WCPluginsMgr) sharedInstance];
+        [mgr registerControllerWithTitle:@"DD小丑助手"
+                version:@"1.0.0"
+                controller:@"DDJokerSettingsViewController"];
     }
 }
+
