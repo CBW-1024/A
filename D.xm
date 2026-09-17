@@ -1440,8 +1440,7 @@ static double DDTimeStampFromString(NSString *s) {
 %end
 
 #pragma mark - 好友数量改写
-// 只改 ContactsDataLogic 的数量 getter，影响通讯录页顶部那个「N个朋友」计数
-// （m_countLabel，ContactsViewController.h:6）；导航栏标题保持微信原样，不追加数量。
+// 改 ContactsDataLogic 的数量 getter，影响通讯录页顶部那个「N个朋友」计数
 
 
 %hook ContactsDataLogic
@@ -1457,8 +1456,6 @@ static double DDTimeStampFromString(NSString *s) {
 %hook ContactsViewController
 // 「N个朋友」的数据源是 m_uiNormalContact（ContactsDataLogic.h:35），已被 hook。
 // 但文本是布局阶段才按数据生成的：updateCount 只更新了数据，还得再触发一次布局，
-// m_countLabel（:6）才会按新数据重画。旧版靠 self.title = @"通讯录(x)" 顺带触发了这件事，
-// 标题一删就没人触发，表现是"必须杀进程重开"。
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
     [self updateCount];
@@ -1815,8 +1812,6 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
 
 #pragma mark - 用户账号自定义（按用户名，聊天详情页逐人设置）
 // 改完必须发 kDDProfileChangedNotification（与头像共用）：资料页不会自己重绘，
-// 弹窗收起也不触发刷新，不发就只有杀进程重开才能看到变化。
-// 该通知在 AddContactToChatRoomViewController -viewDidLoad 注册，走 reloadTableData。
 
 static NSString * const kDDFriendWxidMapKey = @"DDFriendWxidMap";
 
@@ -2059,40 +2054,14 @@ static NSString *DDCustomWxid(void) {
 
 #pragma mark - 数据源（微信"账号"统一拦截）
 
-// 原始账号底稿（纯内存，不落盘）：m_nsAliasName 是可写 property（CBaseContact.h:12），
-// 微信有可能把我们返回的自定义值写回 ivar，之后 %orig 拿到的就不是原始账号了，
-// 表现为关掉开关也还原不了。首见即记、之后不再更新，无自定义时一律返回底稿。
-static NSMutableDictionary *DDOriginalAliasMap(void) {
-    static NSMutableDictionary *map = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ map = [NSMutableDictionary dictionary]; });
-    return map;
-}
-
 %hook CBaseContact
 
 // CBaseContact.h:12 —— m_nsAliasName 即"账号"。
 // 用户：查自定义表，命中返回自定义值（空串=隐藏），未命中回原值。
 - (id)m_nsAliasName {
-    NSString *usrName = [self m_nsUsrName];
-    NSString *alias = DDFriendWxidForUser(usrName);
+    NSString *alias = DDFriendWxidForUser([self m_nsUsrName]);
     if (alias) return alias;
-    NSString *orig = %orig;
-    if (usrName.length && orig.length && !DDOriginalAliasMap()[usrName]) {
-        DDOriginalAliasMap()[usrName] = orig;
-    }
-    return DDOriginalAliasMap()[usrName] ?: orig;
-}
-
-// 堵住回写：m_nsAliasName 是可写 property，微信保存联系人时会把上面返回的自定义值
-// 写回 ivar 进而落库，结果是原始账号被覆盖、重启后仍是修改值，还会串到别的联系人。
-// 凡是写进来的值等于当前自定义值，一律丢弃，保住 ivar 里的原始账号。
-- (void)setM_nsAliasName:(id)alias {
-    NSString *custom = DDFriendWxidForUser([self m_nsUsrName]);
-    if (custom.length && [alias isKindOfClass:[NSString class]] && [alias isEqualToString:custom]) {
-        return;
-    }
-    %orig(alias);
+    return %orig;
 }
 
 %end
