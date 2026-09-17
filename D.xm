@@ -284,6 +284,7 @@
 @end
 @interface ContactsViewController : MMTabBarBaseViewController
 - (void)updateCount;
+- (void)dd_forceCountLabel;
 @end
 
 @interface WCPayBalanceDetailViewController : WCPayBaseViewController
@@ -1461,6 +1462,28 @@ static double DDTimeStampFromString(NSString *s) {
     // updateCount 见 ContactsViewController.h:50，微信刷新计数绑在联系人数据变化上，
     // 改插件配置不会触发，所以每次进页面手动补一次。
     [self updateCount];
+}
+// 微信的 updateCount 读的不是 m_uiNormalContact（ContactsDataLogic 另有 getContactCount
+// 与 m_uiContactCount），所以光 hook 那个 getter 只在页面首次建 label 时生效，改完数字
+// 切回来不会变。这里在微信自己刷完之后再覆盖一次 m_countLabel（ContactsViewController.h:6），
+// 直接兜住显示结果，不依赖它内部读哪个数据源。
+- (void)updateCount {
+    %orig;
+    [self dd_forceCountLabel];
+}
+%new
+- (void)dd_forceCountLabel {
+    DDGlobalConfig *cfg = [DDGlobalConfig shared];
+    if (!cfg.contactsEnabled || ![cfg hasContactsValue]) return;
+    NSInteger v = [cfg.contactsValue integerValue];
+    if (v <= 0) return;
+    Ivar iv = class_getInstanceVariable([self class], "m_countLabel");
+    if (!iv) return;
+    id obj = object_getIvar(self, iv);
+    if (![obj isKindOfClass:[UILabel class]]) return;
+    NSString *want = [NSString stringWithFormat:@"%ld个朋友", (long)v];
+    UILabel *lb = (UILabel *)obj;
+    if (![lb.text isEqualToString:want]) lb.text = want;
 }
 %end
 
