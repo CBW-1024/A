@@ -681,6 +681,7 @@ static void DDJokerClearAllMessageCache(void) {
     DDJokerCacheClear(kDDJokerTextCacheKey);
     DDJokerCacheClear(kDDJokerAmountCacheKey);
     DDJokerCacheClear(kDDJokerTimeCacheKey);
+    DDJokerCacheClear(kDDJokerTextOriginalKey);
 
     [fm removeItemAtPath:DDJokerImagesDir() error:nil];
     DDTransferDetailLeave();
