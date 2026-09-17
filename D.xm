@@ -117,6 +117,8 @@
 - (void)ddWxidSwitchChanged:(UISwitch *)sender;        // 自定义用户账号
 - (void)ddAvatarSwitchChanged:(UISwitch *)sender;      // 自定义用户头像
 - (void)dd_injectProfileSection;                       // 聊天详情页插入头像 + 账号开关
+- (void)onModifyContact:(id)contact;                   // IContactMgrExt，与 MMHeadImageView.h:65 同款
+- (void)ddRefreshProfile;                              // 账号改完补一次刷新
 @end
 
 @interface CContact : CBaseContact
@@ -2339,6 +2341,18 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
     }
 }
 
+%new
+// reloadTableData 只重绘表格、不会重新去读 m_nsAliasName，所以关掉开关界面仍是旧值。
+// 补一次微信自己的联系人变更回调（IContactMgrExt，与 MMHeadImageView.h:65 同款），
+// 资料页才会重新取账号——离开页面再进、或输入空之所以能还原，都是因为走了这条路径。
+- (void)ddRefreshProfile {
+    [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
+    CBaseContact *contact = [self m_contact];
+    if (contact && [self respondsToSelector:@selector(onModifyContact:)]) {
+        [self onModifyContact:contact];
+    }
+}
+
 // 与"自定义头像"对称：开 → 微信原生输入弹窗；关 → 清掉该用户的自定义。
 // 弹窗里留空直接确定 = 存空串，效果等同隐藏。
 %new
@@ -2349,7 +2363,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 
     if (DDFriendWxidForUser(usrName)) {
         DDFriendWxidRemoveForUser(usrName);
-        [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
+        [self ddRefreshProfile];
         return;
     }
 
@@ -2380,7 +2394,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
             // 空格 / 文字：原样保存（空格=空白账号即隐藏）
             DDFriendWxidSetForUser(text, usrName);
         }
-        [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
+        [self ddRefreshProfile];
         blockAlert = nil;
     }];
     [alert show];
