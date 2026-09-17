@@ -532,6 +532,9 @@ static NSString *DDJokerCachedText(CMessageWrap *msg) {
     return [v isKindOfClass:[NSString class]] && [v length] ? v : nil;
 }
 
+// 前向声明：原文写入函数定义在本文件稍后，改写时需要先补记原文。
+static void DDJokerSetOriginalText(CMessageWrap *msg, NSString *text);
+
 // 原文只在真正改写时记录一次：此刻 m_nsContent 还没被改写过，存下来的才是真原文。
 // 留空还原不删这条记录，保证再次改写 / 还原始终能回到最初原文。
 static void DDJokerSetCachedText(CMessageWrap *msg, NSString *text) {
