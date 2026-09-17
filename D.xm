@@ -1398,7 +1398,8 @@ static double DDTimeStampFromString(NSString *s) {
 %end
 
 #pragma mark - 好友数量改写
-// hook ContactsDataLogic 数量 getter 与通讯录页标题。
+// 只改 ContactsDataLogic 的数量 getter，影响通讯录页顶部那个「N个朋友」计数
+// （m_countLabel，ContactsViewController.h:6）；导航栏标题保持微信原样，不追加数量。
 
 
 %hook ContactsDataLogic
@@ -1415,12 +1416,10 @@ static double DDTimeStampFromString(NSString *s) {
 %hook ContactsViewController
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (cfg.contactsEnabled && [cfg hasContactsValue]) {
-        self.title = [NSString stringWithFormat:@"通讯录(%@)", cfg.contactsValue];
-    }
-
-    if ([self respondsToSelector:@selector(updateCount)]) [self updateCount];
+    // 只重刷「N个朋友」计数；标题不碰，微信自己是什么就显示什么。
+    // updateCount 见 ContactsViewController.h:50，微信刷新计数绑在联系人数据变化上，
+    // 改插件配置不会触发，所以每次进页面手动补一次。
+    [self updateCount];
 }
 %end
 
