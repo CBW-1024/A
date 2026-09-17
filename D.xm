@@ -13,6 +13,42 @@
 // 本插件 hook 的微信原生类与方法签名，均锚定微信8.0.78头文件 dump。
 
 
+// 父类前向声明：Clang 不允许用 @class 当父类，必须写完整 @interface，
+// 这里按最新 dump 补出真实继承链，供下面的 @interface 使用。
+@interface MMObject : NSObject
+@end
+
+@interface MMUIViewController : UIViewController
+@end
+
+@interface MMUIView : UIView
+@end
+
+@interface MMUIScrollView : UIScrollView
+@end
+
+@interface BaseChatViewModel : NSObject
+@end
+
+@interface BaseChatCellView : UIView
+@end
+
+@interface MMUILabel : UILabel
+@end
+
+@interface MMCPLabel : MMUILabel
+@end
+
+@interface MMTabBarBaseViewController : MMUIViewController
+@end
+
+@interface MMWindowViewController : MMUIViewController
+@end
+
+@interface WCBizBaseViewController : MMUIViewController
+@end
+
+
 @interface WCUIAlertView : NSObject
 - (id)initWithTitle:(id)a0 message:(id)a1;
 - (void)showTextFieldWithMaxLen:(unsigned int)a0;
@@ -24,7 +60,7 @@
 - (void)show;
 @end
 
-@interface WeToast : NSObject
+@interface WeToast : MMWindowViewController
 + (id)toast;
 - (void)showDoneToastWithText:(id)a0;
 - (void)showErrorToastWithText:(id)a0;
@@ -76,7 +112,7 @@
 - (id)m_nsAliasName;
 @end
 
-@interface AddContactToChatRoomViewController : UIViewController
+@interface AddContactToChatRoomViewController : MMUIViewController
 @property (retain, nonatomic) CBaseContact *m_contact;
 - (void)ddWxidSwitchChanged:(UISwitch *)sender;        // 自定义用户账号
 - (void)ddAvatarSwitchChanged:(UISwitch *)sender;      // 自定义用户头像
@@ -86,7 +122,7 @@
 @interface CContact : CBaseContact
 @end
 
-@interface MMHeadImageView : UIView
+@interface MMHeadImageView : MMUIView
 @property (readonly, nonatomic) NSString *nsUsrName;
 - (void)setHeadImageByName:(id)usrName;
 - (void)doUpdateHeadImg:(BOOL)force;
@@ -96,18 +132,18 @@
 - (void)didMoveToWindow;
 @end
 
-@interface ImageScrollView : UIView
+@interface ImageScrollView : MMUIScrollView
 - (void)updateImage:(id)image;
 @end
 
-@interface MMHDHeadImageView : UIView
+@interface MMHDHeadImageView : MMUIView
 @property (retain, nonatomic) CBaseContact *m_contact;
 - (void)updateHead;
 - (void)updateHDHead;
 - (void)dd_applyCustomHDHead;
 @end
 
-@interface BaseMsgContentLogicController : NSObject
+@interface BaseMsgContentLogicController : MMObject
 - (id)GetUsrTitle;
 - (id)getSubTitle;
 - (id)GetTitleTailImageView;
@@ -120,7 +156,7 @@
 - (id)getMemeberCountLabel;
 @end
 
-@interface CMessageWrap : NSObject
+@interface CMessageWrap : MMObject
 @property (nonatomic, assign) unsigned int m_uiMesLocalID;
 @property (nonatomic, retain) NSString *m_nsContent;
 @property (nonatomic, retain) NSString *m_nsFromUsr;
@@ -131,7 +167,7 @@
 - (NSString *)GetDisplayContent;
 @end
 
-@interface BaseMessageViewModel : NSObject
+@interface BaseMessageViewModel : BaseChatViewModel
 @property (nonatomic, retain) CMessageWrap *messageWrap;
 - (void)resetLayoutCache;
 @end
@@ -139,7 +175,12 @@
 @interface CommonMessageViewModel : BaseMessageViewModel
 @end
 
-@interface BaseMessageCellView : UIView
+// 依赖 CommonMessageViewModel（上面已声明），须在其后
+@interface WCPayBaseMessageViewModel : CommonMessageViewModel
+@end
+
+
+@interface BaseMessageCellView : BaseChatCellView
 - (void)layoutContentView;
 - (void)layoutInternal;
 - (void)prepareForReuse;
@@ -151,7 +192,7 @@
 - (void)setViewModel:(id)vm;
 @end
 
-@interface BaseMsgContentViewController : UIViewController
+@interface BaseMsgContentViewController : MMUIViewController
 - (void)clearNodeLayoutCache;
 - (void)reloadNodeWithMessageWrap:(CMessageWrap *)msgWrap;
 - (void)reloadVisibleNodeWithCellView:(UIView *)cellView;
@@ -166,7 +207,7 @@
 // RichTextView：JokerApplyTextToRichView 以 id 接收并调用，类名在代码里不出现，
 //   但方法确在调用（编译期需要声明，删了会 "no known instance method"）。
 //   签名锚定 WeChat/RichTextView.h:131/132/146/223。
-@interface RichTextView : UIView
+@interface RichTextView : MMCPLabel
 - (id)getContent;
 - (void)setContent:(id)content;
 - (void)calculateAndUpdateFrame;
@@ -181,7 +222,7 @@
 
 @end
 
-@interface WCPayTransferMessageViewModel : NSObject
+@interface WCPayTransferMessageViewModel : WCPayBaseMessageViewModel
 - (CMessageWrap *)messageWrap;
 - (NSString *)titleText;
 - (NSString *)descText;
@@ -200,7 +241,7 @@
 @property (retain, nonatomic) CMessageWrap *m_oSelectedMessageWrap;
 @end
 
-@interface WCPayBaseViewController : UIViewController
+@interface WCPayBaseViewController : WCBizBaseViewController
 - (WCPayControlData *)data;
 @end
 
@@ -212,12 +253,12 @@
 - (void)OnDownloadImageOk:(id)a0;
 @end
 
-@interface ChatTimeViewModel : BaseMessageViewModel
+@interface ChatTimeViewModel : BaseChatViewModel
 - (NSString *)timeText;
 - (void)updateLayouts;
 @end
 
-@interface ChatTimeCellView : UIView
+@interface ChatTimeCellView : BaseChatCellView
 - (id)initWithViewModel:(id)vm;
 - (void)setViewModel:(id)vm;
 - (void)layoutInternal;
@@ -233,19 +274,19 @@
 - (instancetype)initWithTitle:(NSString *)title svgName:(NSString *)svgName target:(id)target action:(SEL)action;
 @end
 
-@interface WCDeviceStepObject : NSObject
+@interface WCDeviceStepObject : MMObject
 - (unsigned int)m7StepCount;
 - (unsigned int)hkStepCount;
 @end
 
-@interface ContactsDataLogic : NSObject
+@interface ContactsDataLogic : MMObject
 - (unsigned int)m_uiNormalContact;
 @end
-@interface ContactsViewController : UIViewController
+@interface ContactsViewController : MMTabBarBaseViewController
 - (void)updateCount;
 @end
 
-@interface WCPayBalanceDetailViewController : UIViewController
+@interface WCPayBalanceDetailViewController : WCPayBaseViewController
 - (id)balanceTitleLabel;
 - (void)updateBalanceTitleLabel;
 - (void)refreshViewWithData:(id)arg;
