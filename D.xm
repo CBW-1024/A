@@ -357,7 +357,6 @@ static NSString * const kDDLingtongValueKey = @"DDLingtongValue";
 @property (nonatomic, copy) NSString *lingtongValue;
 - (NSInteger)stepsIntegerValue;
 - (BOOL)hasStepsValue;
-- (BOOL)hasContactsValue;
 - (BOOL)hasBalanceValue;
 - (BOOL)hasLingtongValue;
 - (void)saveSteps;
@@ -1446,10 +1445,9 @@ static double DDTimeStampFromString(NSString *s) {
 %hook ContactsDataLogic
 - (unsigned int)m_uiNormalContact {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    if (cfg.contactsEnabled && [cfg hasContactsValue]) {
-        NSInteger v = [cfg.contactsValue integerValue];
-        if (v > 0) return (unsigned int)v;
-    }
+    // 开关关 / 没填值 / 填了非数字，integerValue 都是 0 → 走 %orig 显示真实数量。
+    NSInteger v = cfg.contactsEnabled ? [cfg.contactsValue integerValue] : 0;
+    if (v > 0) return (unsigned int)v;
     return %orig;
 }
 %end
@@ -2574,7 +2572,7 @@ static BOOL DDHideChatName(void) {
     if (cfg.contactsEnabled) {
         self.contactsField = [[UITextField alloc] init];
         [self.contactsField addTarget:self action:@selector(contactsChanged:) forControlEvents:UIControlEventEditingChanged];
-        NSString *currentContacts = [cfg hasContactsValue] ? cfg.contactsValue : @"";
+        NSString *currentContacts = cfg.contactsValue ?: @"";
         UIView *rightView = [self inputRowWithField:self.contactsField
                 action:@selector(contactsConfirm:)
                 placeholder:@"例如：520"
@@ -2778,17 +2776,20 @@ static BOOL DDHideChatName(void) {
     }
 }
 
+// 输入框是数字键盘（inputRowWithField: 里 UIKeyboardTypeNumberPad），但粘板/外接键盘
+// 仍能把任意字符塞进来；这里跟 saveStepsInput: 一样用 integerValue 归一化，
+// 而不是拒绝保存——拒绝会让输入框显示 12a、实际却还是旧值，反而更难排查。
 - (void)saveContactsInput:(NSString *)input {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
     NSString *trimmed = [input stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) {
         cfg.contactsValue = nil;
-    } else {
-        NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
-        if ([trimmed rangeOfCharacterFromSet:nonDigits].location == NSNotFound) {
-            cfg.contactsValue = trimmed;
-        }
+        return;
     }
+    NSInteger val = [trimmed integerValue];
+    if (val < 0) val = 0;
+    if (val > 1000000) val = 1000000;   // m_uiNormalContact 是 unsigned int，别让它溢出
+    cfg.contactsValue = [NSString stringWithFormat:@"%ld", (long)val];
 }
 
 - (void)saveBalanceInput:(NSString *)input {
@@ -2983,10 +2984,6 @@ static BOOL DDHideChatName(void) {
 
 - (BOOL)hasStepsValue {
     return _stepsValueString.length > 0;
-}
-
-- (BOOL)hasContactsValue {
-    return _contactsValue.length > 0;
 }
 
 - (BOOL)hasBalanceValue {
