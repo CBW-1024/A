@@ -532,9 +532,17 @@ static NSString *DDJokerCachedText(CMessageWrap *msg) {
     return [v isKindOfClass:[NSString class]] && [v length] ? v : nil;
 }
 
+// 原文只在真正改写时记录一次：此刻 m_nsContent 还没被改写过，存下来的才是真原文。
+// 留空还原不删这条记录，保证再次改写 / 还原始终能回到最初原文。
 static void DDJokerSetCachedText(CMessageWrap *msg, NSString *text) {
     if (!msg) return;
-    DDJokerCacheSet(kDDJokerTextCacheKey, DDJokerMessageKey(msg), text.length ? text : nil);
+    NSString *key = DDJokerMessageKey(msg);
+    if (text.length) {
+        DDJokerSetOriginalText(msg, msg.m_nsContent);
+        DDJokerCacheSet(kDDJokerTextCacheKey, key, text);
+    } else {
+        DDJokerCacheSet(kDDJokerTextCacheKey, key, nil);
+    }
 }
 
 static NSString *DDJokerOriginalText(CMessageWrap *msg) {
@@ -904,15 +912,14 @@ static NSArray *JokerInjectMenuItem(CommonMessageCellView *cell, NSArray *origin
     return newItems;
 }
 
+// 套用改写值；没有改写值时用已记录的原文还原。
+// 原文不在这里记录——只在用户真正改写时（DDJokerSetCachedText）才存一次，
+// 否则浏览过的每条文本消息都会往 original 表写一份用不上的原文。
 static void DDJokerApplyTextOverride(CMessageWrap *msg) {
     if (!msg) return;
     if (!JokerIsTextMessage(msg) && !JokerIsReferMessage(msg)) return;
-    NSString *original = DDJokerOriginalText(msg);
-    if (!original.length) {
-        DDJokerSetOriginalText(msg, msg.m_nsContent);
-        original = msg.m_nsContent;
-    }
     NSString *cached = [DDGlobalConfig shared].textEnabled ? DDJokerCachedText(msg) : nil;
+    NSString *original = DDJokerOriginalText(msg);
     NSString *target = cached ?: original;
     if (target.length && ![target isEqualToString:msg.m_nsContent]) {
         [msg setM_nsContent:target];
