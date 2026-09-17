@@ -130,6 +130,8 @@
 - (void)updateHeadImage:(id)image;
 - (void)ImageDidLoad:(id)image Url:(id)url;
 - (void)didMoveToWindow;
+- (double)preferCornerSize;
+- (void)setHeadImageViewCornerRadius:(double)radius;
 @end
 
 @interface ImageScrollView : MMUIScrollView
@@ -2105,7 +2107,16 @@ static BOOL DDTryApplyCustomAvatar(MMHeadImageView *view, NSString *usrName) {
 
 - (void)updateHeadImage:(id)image {
     UIImage *custom = DDAvatarImageForUser([self nsUsrName]);
-    %orig(custom ?: image);
+    if (!custom) {
+        %orig(image);
+        return;
+    }
+    %orig(custom);
+    // 自定义头像绕开了微信自己的图片加工链路——圆角是在图片加载回调里做的，
+    // 直接把原图塞给 updateHeadImage: 会顶掉那张加工过的圆角图，
+    // 表现为聊天界面头像是直角（其他界面走本地缓存同步路径，不受影响）。
+    // 这里按 MMHeadImageView 自己的圆角约定补回来（MMHeadImageView.h:43/64）。
+    [self setHeadImageViewCornerRadius:[self preferCornerSize]];
 }
 
 - (void)updateUsrName:(id)usrName withHeadImgUrl:(id)headImgUrl {
