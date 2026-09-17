@@ -1814,25 +1814,33 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
 
 
 #pragma mark - 用户账号自定义（按用户名，聊天详情页逐人设置）
+// 账号变更后统一发 kDDProfileChangedNotification（与头像共用）：
+//   AddContactToChatRoomViewController 在 viewDidLoad 里监听它并 reloadTableData，
+//   不发（或发一个没人监听的通知）资料页就不会重绘，删完数据界面仍显示旧值。
 
-static NSString * const kDDFriendWxidChangedNotification = @"DDFriendWxidChanged";
+static NSString * const kDDFriendWxidMapKey = @"DDFriendWxidMap";
 
-static NSString *DDFriendWxidStorePath(void) {
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    NSString *doc = paths.firstObject;
-    if (doc.length == 0) doc = @"/var/mobile/Documents";
-    return [doc stringByAppendingPathComponent:@"DDFriendWxid.plist"];
-}
-
+// 这张表存 NSUserDefaults，不手写 plist：writeToFile 一旦没落盘就会出现
+// "内存删干净了、磁盘还留着"，表现为不重启能还原、重启后自定义值复活。
+// 与文件里其余配置统一走 synchronize；表空时直接 removeObjectForKey，不留空壳。
 static NSMutableDictionary *DDFriendWxidMap(void) {
     static NSMutableDictionary *map = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSDictionary *disk = [NSDictionary dictionaryWithContentsOfFile:DDFriendWxidStorePath()];
-        map = [disk mutableCopy];
-        if (!map) map = [NSMutableDictionary dictionary];
+        NSDictionary *saved = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kDDFriendWxidMapKey];
+        map = saved ? [saved mutableCopy] : [NSMutableDictionary dictionary];
     });
     return map;
+}
+
+static void DDFriendWxidPersist(void) {
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    if (DDFriendWxidMap().count) {
+        [def setObject:DDFriendWxidMap() forKey:kDDFriendWxidMapKey];
+    } else {
+        [def removeObjectForKey:kDDFriendWxidMapKey];
+    }
+    [def synchronize];
 }
 
 static NSString *DDFriendWxidForUser(NSString *usrName) {
@@ -1845,13 +1853,13 @@ static NSString *DDFriendWxidForUser(NSString *usrName) {
 static void DDFriendWxidSetForUser(NSString *value, NSString *usrName) {
     if (usrName.length == 0) return;
     DDFriendWxidMap()[usrName] = value ?: @"";
-    [DDFriendWxidMap() writeToFile:DDFriendWxidStorePath() atomically:YES];
+    DDFriendWxidPersist();
 }
 
 static void DDFriendWxidRemoveForUser(NSString *usrName) {
     if (usrName.length == 0) return;
     [DDFriendWxidMap() removeObjectForKey:usrName];
-    [DDFriendWxidMap() writeToFile:DDFriendWxidStorePath() atomically:YES];
+    DDFriendWxidPersist();
 }
 
 #pragma mark - 头像文件管理
@@ -2346,7 +2354,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 
     if (DDFriendWxidForUser(usrName)) {
         DDFriendWxidRemoveForUser(usrName);
-        [[NSNotificationCenter defaultCenter] postNotificationName:kDDFriendWxidChangedNotification object:nil];
+        [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
         return;
     }
 
@@ -2377,7 +2385,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
             // 空格 / 文字：原样保存（空格=空白账号即隐藏）
             DDFriendWxidSetForUser(text, usrName);
         }
-        [[NSNotificationCenter defaultCenter] postNotificationName:kDDFriendWxidChangedNotification object:nil];
+        [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
         blockAlert = nil;
     }];
     [alert show];
