@@ -284,7 +284,6 @@
 @end
 @interface ContactsViewController : MMTabBarBaseViewController
 - (void)updateCount;
-- (void)dd_forceCountLabel;
 @end
 
 @interface WCPayBalanceDetailViewController : WCPayBaseViewController
@@ -1456,24 +1455,14 @@ static double DDTimeStampFromString(NSString *s) {
 %end
 
 %hook ContactsViewController
-// m_countLabel（ContactsViewController.h:6）才是「N个朋友」的显示出口。
-// 微信的 updateCount 读的不是 m_uiNormalContact（ContactsDataLogic 另有 getContactCount
-// 与 m_uiContactCount），光 hook 那个 getter 只在页面首次建 label 时生效，改完数字切回来
-// 不会变。所以让微信自己刷完之后，再直接把 label 文本覆盖成改后的值。
+// 「N个朋友」的数据源是 m_uiNormalContact（ContactsDataLogic.h:35），已被 hook。
+// 但文本是布局阶段才按数据生成的：updateCount 只更新了数据，还得再触发一次布局，
+// m_countLabel（:6）才会按新数据重画。旧版靠 self.title = @"通讯录(x)" 顺带触发了这件事，
+// 标题一删就没人触发，表现是"必须杀进程重开"。
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
     [self updateCount];
-    [self dd_forceCountLabel];
-}
-%new
-- (void)dd_forceCountLabel {
-    DDGlobalConfig *cfg = [DDGlobalConfig shared];
-    // 开关关 / 没填值 / 填了非数字，integerValue 都是 0，一律不改写（显示微信真实数量）。
-    NSInteger v = cfg.contactsEnabled ? [cfg.contactsValue integerValue] : 0;
-    if (v <= 0) return;
-    Ivar iv = class_getInstanceVariable([self class], "m_countLabel");
-    id lb = iv ? object_getIvar(self, iv) : nil;   // 拿不到就是 nil，发消息无操作
-    [(UILabel *)lb setText:[NSString stringWithFormat:@"%ld个朋友", (long)v]];
+    [self.view setNeedsLayout];
 }
 %end
 
