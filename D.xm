@@ -117,8 +117,6 @@
 - (void)ddWxidSwitchChanged:(UISwitch *)sender;        // 自定义用户账号
 - (void)ddAvatarSwitchChanged:(UISwitch *)sender;      // 自定义用户头像
 - (void)dd_injectProfileSection;                       // 聊天详情页插入头像 + 账号开关
-- (void)onModifyContact:(id)contact;                   // IContactMgrExt，与 MMHeadImageView.h:65 同款
-- (void)ddRefreshProfileForContact:(CBaseContact *)contact;
 @end
 
 @interface CContact : CBaseContact
@@ -2229,23 +2227,6 @@ static AddContactToChatRoomViewController *DDProfileVCForTable(id tableViewInfo)
     return vc;
 }
 
-// 开关 cell 的 on: 是建 cell 时传进去的固定值（DDInjectProfileSectionIntoTable 里的 hasCustom），
-// reload 表格不会更新它：关掉开关后 cell 还是按旧值显示，看着像"没关掉"。
-// 所以状态要变时必须移除旧 section 再重新注入——WCTableViewManager.h:30 removeSectionAt:。
-static void DDRemoveInjectedProfileSection(AddContactToChatRoomViewController *vc) {
-    if (!vc) return;
-    id tableViewInfo = nil;
-    @try { tableViewInfo = [vc valueForKey:@"m_tableViewInfo"]; } @catch (NSException *e) { return; }
-    if (!tableViewInfo) return;
-    NSArray *sections = [tableViewInfo getAllSections];
-    for (NSUInteger i = 0; i < sections.count; i++) {
-        if (DDSectionHasInjectedCell(sections[i])) {
-            [tableViewInfo removeSectionAt:i];
-            return;
-        }
-    }
-}
-
 // 在微信重建表格的同一次 runloop 内将入口插入到位置 At:1（资料卡正下方），不产生额外帧。
 static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *vc, BOOL reloadNow) {
     DDGlobalConfig *cfg = [DDGlobalConfig shared];
@@ -2336,22 +2317,6 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 }
 
 %new
-// 账号改完光 reloadTableData 不够：它只重绘表格，账号那行的文本是取数阶段
-// 从 m_nsAliasName 拿的，不触发联系人变更回调就不会重新取值，
-// 表现为"关了开关仍显示旧账号，要重启才变"。
-// 资料页实现了 IContactMgrExt，微信自己就是靠 onModifyContact: 通知各监听者重取数据。
-- (void)ddRefreshProfileForContact:(CBaseContact *)contact {
-    // 微信改完联系人是走 IContactMgrExt 回调让各监听者重取数据的；
-    // 只 reload 表格不会重新取 m_nsAliasName，账号那行就还是旧值。
-    if (contact && [self respondsToSelector:@selector(onModifyContact:)]) {
-        [self onModifyContact:contact];
-    }
-    // 开关状态同理，得重建注入区才会跟着数据变。
-    DDRemoveInjectedProfileSection(self);
-    [self dd_injectProfileSection];
-}
-
-%new
 - (void)ddAvatarSwitchChanged:(UISwitch *)sender {
     CBaseContact *contact = [self m_contact];
     NSString *usrName = [contact m_nsUsrName];
@@ -2389,7 +2354,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 
     if (DDFriendWxidForUser(usrName)) {
         DDFriendWxidRemoveForUser(usrName);
-        [self ddRefreshProfileForContact:contact];
+        [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
         return;
     }
 
@@ -2420,7 +2385,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
             // 空格 / 文字：原样保存（空格=空白账号即隐藏）
             DDFriendWxidSetForUser(text, usrName);
         }
-        [self ddRefreshProfileForContact:contact];
+        [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
         blockAlert = nil;
     }];
     [alert show];
