@@ -2110,6 +2110,20 @@ static NSString *DDCustomWxid(void) {
     return %orig;
 }
 
+// 根因修复：reloadContactAssist 读取 m_nsAliasName（上面 hook 替身出自定义值）后，
+// 微信会把该值经 setM_nsAliasName: 回写进联系人对象，污染内存里的 CContact。
+// 于是关闭删掉 map 后，%orig 仍是被污染的自定义值（"第二次打开才还原"的真正原因）。
+// 这里拦截"回写值 == 当前自定义值"这一次写，保住联系人对象原本的真实值；
+// 关闭后 m_nsAliasName 走 %orig 立即回到真实账号，无需重进。
+- (void)setM_nsAliasName:(id)v {
+    NSString *custom = DDFriendWxidForUser([self m_nsUsrName]);
+    if (custom && [v isKindOfClass:[NSString class]] && [v isEqualToString:custom]) {
+        DDLog(@"[aliasSet] 拦截回写 usr=%@ val=%@（防止污染内存联系人）", [self m_nsUsrName], v);
+        return;
+    }
+    %orig(v);
+}
+
 %end
 
 %hook CSetting
