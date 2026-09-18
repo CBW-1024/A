@@ -121,6 +121,11 @@
 - (void)ddRefreshProfile;                              // 账号改完补一次刷新
 @end
 
+@interface ContactInfoViewController : MMUIViewController
+@property (retain, nonatomic) CContact *m_contact;       // ContactInfoViewController.h 同名属性（CContact : CBaseContact）
+- (void)ddSyncAliasLabel;
+@end
+
 @interface CContact : CBaseContact
 @end
 
@@ -2199,6 +2204,57 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 #pragma mark - 聊天详情页"自定义头像 / 自定义账号"入口
 
 static NSString * const kDDProfileChangedNotification = @"DDProfileContentChanged";
+
+#pragma mark - 账号显示页监听（点头像进的 ContactInfoViewController）
+
+// 实测截图：账号行是 MMCPLabel（MMUILabel → UILabel），tag 固定 90224；
+// 层级 self.view → … → MMCPLabel 全在 self.view 子树内，viewWithTag: 即可命中。
+static NSInteger const kDDContactAliasLabelTag = 90224;
+
+%hook ContactInfoViewController
+
+// 与开关页对称：开关页改完发 kDDProfileChangedNotification，账号页监听后在自身对齐一次；
+// viewWillAppear 兜底——首次进页面（含"重启后第一次"）直接按当前 m_nsAliasName 对齐。
+- (void)viewDidLoad {
+    %orig;
+    [[NSNotificationCenter defaultCenter] addObserver:self
+            selector:@selector(ddSyncAliasLabel)
+            name:kDDProfileChangedNotification
+            object:nil];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    [self ddSyncAliasLabel];
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:kDDProfileChangedNotification object:nil];
+    %orig;
+}
+
+%new
+- (void)ddSyncAliasLabel {
+    CBaseContact *contact = [self m_contact];
+    if ([contact m_nsUsrName].length == 0) return;
+    // m_nsAliasName 走我们的 hook：有自定义返回自定义、删掉返回真值，永远等于"此刻应显示的值"。
+    NSString *target = [contact m_nsAliasName] ?: @"";
+    UILabel *lb = (UILabel *)[self.view viewWithTag:kDDContactAliasLabelTag];
+    if (![lb isKindOfClass:[UILabel class]]) return;
+    NSString *cur = lb.attributedText.length ? lb.attributedText.string : lb.text;
+    if ([cur isEqualToString:target]) return;
+    // 保留样式只换字符：有 attributedText 时复用其属性渲染新串（灰色小字不被冲掉）。
+    if (lb.attributedText.length) {
+        NSMutableAttributedString *attr = [lb.attributedText mutableCopy];
+        [attr replaceCharactersInRange:NSMakeRange(0, attr.length) withString:target];
+        lb.attributedText = attr;
+    } else {
+        lb.text = target;
+    }
+}
+
+%end
+
 
 static const void *kDDInjectedCellMarker = &kDDInjectedCellMarker;
 
