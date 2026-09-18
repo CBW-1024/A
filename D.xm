@@ -385,6 +385,36 @@ static BOOL DDStringHas(const char *haystack, const char *needle) {
     return (h && n) ? ([h rangeOfString:n].location != NSNotFound) : NO;
 }
 
+#pragma mark - 调试日志（无需越狱：文件存于 App 沙盒，设置页可导出/清空）
+
+// 非越狱机器访问不了文件系统，故日志落盘到 App 沙盒 Library/Caches/DDJoker/dd.log，
+// 在设置页用系统分享单把文件发出去（微信 / 备忘录 / 隔空投送均可）。
+static NSString *DDJokerLogPath(void) {
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
+    NSString *dir = [paths.firstObject stringByAppendingPathComponent:@"Caches/DDJoker"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    return [dir stringByAppendingPathComponent:@"dd.log"];
+}
+
+static void DDLog(NSString *fmt, ...) {
+    if (!fmt) return;
+    va_list ap; va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"MM-dd HH:mm:ss.SSS";
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], msg];
+    NSString *path = DDJokerLogPath();
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+    else    { [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
+}
+
+static void DDLogClear(void) {
+    [@"" writeToFile:DDJokerLogPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
 #pragma mark - 聊天消息改写（文字 / 图片 / 转账）
 // 长按消息弹出"小丑"菜单：文字改内容与引用标题、图片替换为相册所选图、转账改金额。
 // 改写值按消息会话唯一键缓存到 plist，刷新走 cell/viewModel 重绘。
@@ -2070,7 +2100,7 @@ static NSString *DDCustomWxid(void) {
 // 用户：查自定义表，命中返回自定义值（空串=隐藏），未命中回原值。
 - (id)m_nsAliasName {
     NSString *alias = DDFriendWxidForUser([self m_nsUsrName]);
-    if (alias) return alias;
+    if (alias) { DDLog(@"[alias] usr=%@ -> %@", [self m_nsUsrName], alias); return alias; }
     return %orig;
 }
 
@@ -2218,6 +2248,7 @@ static NSString * const kDDProfileChangedNotification = @"DDProfileContentChange
 
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
+    DDLog(@"[ContactInfo] viewWillAppear -> reloadContactAssist/reloadData/reloadView usr=%@", [[self m_contact] m_nsUsrName]);
     [self reloadContactAssist];
     [self reloadData];
     [self reloadView];
@@ -2372,6 +2403,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 // 补一次微信自己的联系人变更回调（IContactMgrExt，与 MMHeadImageView.h:65 同款），
 // 资料页才会重新取账号——离开页面再进、或输入空之所以能还原，都是因为走了这条路径。
 - (void)ddRefreshProfile {
+    DDLog(@"[ddRefreshProfile] 发通知 + onModifyContact");
     [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
     CBaseContact *contact = [self m_contact];
     if (contact && [self respondsToSelector:@selector(onModifyContact:)]) {
@@ -2388,6 +2420,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
     if (usrName.length == 0) return;
 
     if (DDFriendWxidForUser(usrName)) {
+        DDLog(@"[wxid] 关闭：删自定义 usr=%@", usrName);
         DDFriendWxidRemoveForUser(usrName);
         [self ddRefreshProfile];
         return;
@@ -2414,10 +2447,12 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
         NSString *text = [blockAlert getTextFieldText] ?: @"";
         if (text.length == 0) {
             // 没有输入：关闭该用户自定义并回弹开关
+            DDLog(@"[wxid] 确定留空：删自定义 usr=%@", usrName);
             DDFriendWxidRemoveForUser(usrName);
             [weakSw setOn:NO animated:YES];
         } else {
             // 空格 / 文字：原样保存（空格=空白账号即隐藏）
+            DDLog(@"[wxid] 确定保存：usr=%@ val=%@", usrName, text);
             DDFriendWxidSetForUser(text, usrName);
         }
         [self ddRefreshProfile];
@@ -2662,6 +2697,19 @@ static BOOL DDHideChatName(void) {
 
     [_tableViewManager addSection:profileSection];
 
+    // 调试小丑：非越狱时把日志文件用系统分享发出来排错；清空只清日志不影响配置
+    WCTableViewSectionManager *logSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"调试小丑"];
+    logSection.footerTitle = @"无越狱可导出日志到微信 / 备忘录排错；清空只清日志，不影响功能配置";
+    UIButton *exportBtn = [self dd_actionButton:@"导出" action:@selector(dd_exportLogTapped:) x:0];
+    UIView *exportRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
+    [exportRight addSubview:exportBtn];
+    [logSection addCell:[cellCls normalCellForSel:nil target:nil title:@"导出日志" rightView:exportRight]];
+    UIButton *clearLogBtn = [self dd_actionButton:@"清空" action:@selector(dd_clearLogTapped:) x:0];
+    UIView *clearLogRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
+    [clearLogRight addSubview:clearLogBtn];
+    [logSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清空日志" rightView:clearLogRight]];
+    [_tableViewManager addSection:logSection];
+
     [_tableViewManager reloadTableView];
 }
 
@@ -2726,6 +2774,30 @@ static BOOL DDHideChatName(void) {
 
     WeToast *toast = [%c(WeToast) toast];
     if (toast) [toast showDoneToastWithText:text];
+}
+
+- (void)dd_exportLogTapped:(id)sender {
+    NSString *path = DDJokerLogPath();
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (data.length == 0) {
+        [self dd_showDoneToast:@"日志为空"];
+        return;
+    }
+    // 系统分享单：把日志文件发出去（微信 / 备忘录 / 隔空投送 / 存储到文件均可），
+    // 非越狱也能拿到。iPad 需指定 popover 锚点，否则 present 会崩。
+    NSURL *url = [NSURL fileURLWithPath:path];
+    UIActivityViewController *avc =
+        [[%c(UIActivityViewController) alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    avc.popoverPresentationController.sourceView = self.view;
+    avc.popoverPresentationController.sourceRect =
+        CGRectMake(self.view.bounds.size.width / 2.0, self.view.bounds.size.height - 40, 1, 1);
+    avc.popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionDown;
+    [self presentViewController:avc animated:YES completion:nil];
+}
+
+- (void)dd_clearLogTapped:(id)sender {
+    DDLogClear();
+    [self dd_showDoneToast:@"日志已清空"];
 }
 
 - (void)balanceSwitchChanged:(UISwitch *)sender {
