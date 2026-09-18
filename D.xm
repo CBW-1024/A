@@ -2272,10 +2272,6 @@ static NSString * const kDDProfileChangedNotification = @"DDProfileContentChange
 // m_oContactInfoAssist / m_userNameLabel 都是 ivar（ContactInfoViewController.h:5 /
 // CBaseContactInfoAssist.h:10），没有对应 getter 方法，必须用 object_getIvar 直接读；
 // 直接发消息会 unrecognized selector 崩溃（即"点击进去就闪退"）。
-static id DDContactInfoAssistOf(id vc) {
-    Ivar iv = class_getInstanceVariable(object_getClass(vc), "m_oContactInfoAssist");
-    return iv ? object_getIvar(vc, iv) : nil;
-}
 static UILabel *DDUserNameLabelOf(id assist) {
     if (!assist) return nil;
     Ivar iv = class_getInstanceVariable(object_getClass(assist), "m_userNameLabel");
