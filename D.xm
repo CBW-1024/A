@@ -123,7 +123,6 @@
 
 @interface ContactInfoViewController : MMUIViewController
 @property (retain, nonatomic) CContact *m_contact;       // ContactInfoViewController.h 同名属性（CContact : CBaseContact）
-- (void)ddSyncAliasLabel;
 @end
 
 @interface CContact : CBaseContact
@@ -2213,28 +2212,13 @@ static NSInteger const kDDContactAliasLabelTag = 90224;
 
 %hook ContactInfoViewController
 
-// 与开关页对称：开关页改完发 kDDProfileChangedNotification，账号页监听后在自身对齐一次；
-// viewWillAppear 兜底——首次进页面（含"重启后第一次"）直接按当前 m_nsAliasName 对齐。
-- (void)viewDidLoad {
-    %orig;
-    [[NSNotificationCenter defaultCenter] addObserver:self
-            selector:@selector(ddSyncAliasLabel)
-            name:kDDProfileChangedNotification
-            object:nil];
-}
-
+// 只留一个对齐点：每次进页面（含重启后第一次）按当前 m_nsAliasName 对齐账号行。
+// 不挂通知——开关页发的 kDDProfileChangedNotification 在账号页创建之前就响了，收不到；
+// 进页面自己对齐，首进与重进都覆盖，足够。
+// 实测截图：账号行是 MMCPLabel（MMUILabel → UILabel），tag 固定 90224，
+// 层级 self.view → … → MMCPLabel 全在 self.view 子树内，viewWithTag: 即可命中。
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
-    [self ddSyncAliasLabel];
-}
-
-- (void)dealloc {
-    [[NSNotificationCenter defaultCenter] removeObserver:self name:kDDProfileChangedNotification object:nil];
-    %orig;
-}
-
-%new
-- (void)ddSyncAliasLabel {
     CBaseContact *contact = [self m_contact];
     if ([contact m_nsUsrName].length == 0) return;
     // m_nsAliasName 走我们的 hook：有自定义返回自定义、删掉返回真值，永远等于"此刻应显示的值"。
