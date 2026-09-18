@@ -122,6 +122,7 @@
 @end
 
 @class CContact;
+@class CBaseContactInfoAssist;
 @interface ContactInfoViewController : MMUIViewController
 // ContactInfoViewController.h:32 —— 当前联系人（CContact）
 @property (retain, nonatomic) CContact *m_contact;
@@ -132,9 +133,17 @@
 - (void)reloadView;
 // 统一刷新入口（viewWillAppear 与 kDDProfileChangedNotification 共用）
 - (void)ddProfileChangedRefresh;
+// ContactInfoViewController.h:5 —— 账号值真正承载在 assist 的 userName label 上
+- (id)m_oContactInfoAssist;
 @end
 
 @interface CContact : CBaseContact
+@end
+
+// CBaseContactInfoAssist.h:10 —— 账号行 label（m_userNameLabel），reloadContactAssist 后
+// 该 label 未必重读 m_nsAliasName（会沿用旧值），故关闭后直接对齐它。
+@interface CBaseContactInfoAssist : NSObject
+- (UILabel *)m_userNameLabel;
 @end
 
 @interface MMHeadImageView : MMUIView
@@ -2280,9 +2289,15 @@ static NSString * const kDDProfileChangedNotification = @"DDProfileContentChange
     [self reloadContactAssist];
     [self reloadData];
     [self reloadView];
-    // 刷新后"实际显示值"：删自定义后应为原始 wxid（据此在日志里定性是否真的还原）
+    // reloadContactAssist 后 m_userNameLabel 未必重读 m_nsAliasName（沿用旧值），
+    // 直接把账号行 label 对齐成当前 m_nsAliasName，确保关闭后立即显示原始值。
     NSString *shown = [[self m_contact] m_nsAliasName];
-    DDLog(@"[ContactInfo] 刷新后账号显示值 usr=%@ -> %@", usr, shown);
+    id assist = [self m_oContactInfoAssist];
+    if (assist) {
+        UILabel *lbl = [assist m_userNameLabel];
+        if (lbl && shown) [lbl setText:shown];
+    }
+    DDLog(@"[ContactInfo] 刷新后账号显示值(回读map=%@) usr=%@ -> %@", DDFriendWxidForUser(usr), usr, shown);
 }
 
 %end
@@ -2434,12 +2449,8 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 // 补一次微信自己的联系人变更回调（IContactMgrExt，与 MMHeadImageView.h:65 同款），
 // 资料页才会重新取账号——离开页面再进、或输入空之所以能还原，都是因为走了这条路径。
 - (void)ddRefreshProfile {
-    DDLog(@"[ddRefreshProfile] 发通知 + onModifyContact");
+    DDLog(@"[ddRefreshProfile] 发通知（去掉 onModifyContact：它异步换 m_contact，会引起关闭回退竞态）");
     [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
-    CBaseContact *contact = [self m_contact];
-    if (contact && [self respondsToSelector:@selector(onModifyContact:)]) {
-        [self onModifyContact:contact];
-    }
 }
 
 // 与"自定义头像"对称：开 → 微信原生输入弹窗；关 → 清掉该用户的自定义。
@@ -2453,6 +2464,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
     if (DDFriendWxidForUser(usrName)) {
         DDLog(@"[wxid] 关闭：删自定义 usr=%@", usrName);
         DDFriendWxidRemoveForUser(usrName);
+        DDLog(@"[wxid] 删后回读 DDFriendWxidForUser=%@", DDFriendWxidForUser(usrName));
         [self ddRefreshProfile];
         return;
     }
