@@ -121,6 +121,7 @@
 - (void)ddRefreshProfile;                              // 账号改完补一次刷新
 @end
 
+@class CContact;
 @interface ContactInfoViewController : MMUIViewController
 // ContactInfoViewController.h:32 —— 当前联系人（CContact）
 @property (retain, nonatomic) CContact *m_contact;
