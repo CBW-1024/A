@@ -126,10 +126,6 @@
 // 点头像进的资料页，账号文本渲染在这个 VC 里，与开关页不是同一个。
 @interface ContactInfoViewController : MMUIViewController
 @property (retain, nonatomic) CContact *m_contact;
-// ContactInfoViewController.h —— 唯一保留的对齐锚点：表格重绘回调。
-// 不再调 onModifyContact: / reloadData / reloadView：那几个有业务副作用（联系人同步、重建视图），
-// 而我们要的只是"微信重绘之后把文本对齐一次"，onTableViewReload 一个点就够。
-- (void)onTableViewReload;
 - (void)ddSyncAliasLabel;
 @end
 
@@ -1011,12 +1007,9 @@ static void DDApplyAliasTextInView(UIView *root, NSString *target);
     DDApplyAliasTextInView(self.view, [contact m_nsAliasName] ?: @"");
 }
 
-// 两个对齐点，都是只读视图树改 label 文本，不碰微信任何业务流程：
-//  ① viewDidAppear —— 账号 label 挂在固定视图链上（实测层级图证实），此时已建好；
-//  ② onTableViewReload —— 微信每次表格重绘后（含服务器数据回填那次）再对齐一次。
-// 事件驱动，不需要延迟兜底；label 全在 self.view 子树内，不需要 window 兜底。
+// 唯一对齐点：UIKit 保证每次进页面都调用，比 onTableViewReload 那种微信内部回调可靠。
+// 动作只有"读一遍视图树、把 tag 90224 的 label 文本对齐"，不碰微信任何业务流程。
 - (void)viewDidAppear:(BOOL)animated { %orig; [self ddSyncAliasLabel]; }
-- (void)onTableViewReload { %orig; [self ddSyncAliasLabel]; }
 
 %end
 
