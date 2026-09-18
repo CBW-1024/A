@@ -2283,6 +2283,28 @@ static UILabel *DDUserNameLabelOf(id assist) {
     return [v isKindOfClass:[UILabel class]] ? (UILabel *)v : nil;
 }
 
+// 强制账号行 label 显示"自定义值 / 真实值"。
+// 关键：微信用联系人真实 m_nsAliasName（ivar）填充 m_userNameLabel（MMCPLabel，走 attributedText），
+// 并不经由我们 hook 的 getter；单纯改 getter 或改 ivar 都保证不了可见账号行。
+// 这里在微信每次重建账号行（getUserNameCol / reloadView）后直接覆盖它的文本，且保留原 attributedText
+// 属性只换文字，持久生效、不依赖重进页面。
+static void DDEnforceUserNameLabel(id assist) {
+    if (!assist) return;
+    id contact = [assist m_contact];
+    if (!contact) return;
+    NSString *custom = DDFriendWxidForUser([contact m_nsUsrName]);
+    NSString *val = custom ?: [contact m_nsAliasName];
+    UILabel *lbl = DDUserNameLabelOf(assist);
+    if (!lbl || !val) return;
+    NSAttributedString *cur = [lbl attributedText];
+    if (cur && [cur length] > 0) {
+        NSDictionary *attrs = [cur attributesAtIndex:0 effectiveRange:nil];
+        [lbl setAttributedText:[[NSAttributedString alloc] initWithString:val attributes:attrs]];
+    } else {
+        [lbl setText:val];
+    }
+}
+
 %hook ContactInfoViewController
 
 - (void)viewDidLoad {
@@ -2310,16 +2332,36 @@ static UILabel *DDUserNameLabelOf(id assist) {
     [self reloadContactAssist];
     [self reloadData];
     [self reloadView];
-    // reloadContactAssist 后 m_userNameLabel 未必重读 m_nsAliasName（沿用旧值），
-    // 直接把账号行 label 对齐成当前 m_nsAliasName，确保关闭后立即显示原始值。
+    // 账号行 label 的强制对齐改到 CBaseContactInfoAssist 的 getUserNameCol / reloadView 里做
+    // （微信用联系人真实 m_nsAliasName 填充该 label，不经由我们的 getter），
+    // 这里只在关闭后回读一次"实际显示值"用于排错。
     NSString *shown = [[self m_contact] m_nsAliasName];
-    UILabel *lbl = DDUserNameLabelOf(DDContactInfoAssistOf(self));
-    if (lbl && shown) [lbl setText:shown];
     DDLog(@"[ContactInfo] 刷新后账号显示值(回读map=%@) usr=%@ -> %@", DDFriendWxidForUser(usr), usr, shown);
 }
 
 %end
 
+// 账号行 label（m_userNameLabel，CBaseContactInfoAssist.h:10）由 getUserNameCol 按联系人
+// 真实 m_nsAliasName（ivar）填充，并不经由我们 hook 的 getter；所以单纯改 getter / 改 ivar 都
+// 保证不了"可见账号行显示自定义值"。这里在 getUserNameCol / reloadView 后强制把该 label 对齐成
+// "自定义值 / 真实值"，每次重建都生效（持久、不依赖重进页面）。
+@interface CBaseContactInfoAssist : NSObject
+- (id)getUserNameCol;
+- (void)reloadView;
+- (id)m_contact;
+@end
+
+%hook CBaseContactInfoAssist
+- (id)getUserNameCol {
+    id col = %orig;
+    DDEnforceUserNameLabel(self);
+    return col;
+}
+- (void)reloadView {
+    %orig;
+    DDEnforceUserNameLabel(self);
+}
+%end
 
 static const void *kDDInjectedCellMarker = &kDDInjectedCellMarker;
 
