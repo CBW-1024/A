@@ -122,6 +122,8 @@
 @end
 
 @interface ContactInfoViewController : MMUIViewController
+// ContactInfoViewController.h:32 —— 当前联系人（CContact）
+@property (retain, nonatomic) CContact *m_contact;
 // ContactInfoViewController.h:90 —— 重建 m_oContactInfoAssist（账号值的真正来源）
 - (void)reloadContactAssist;
 // ContactInfoViewController.h:80/:83 —— 重建表格数据源 / 重绘
