@@ -2204,37 +2204,47 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 
 static NSString * const kDDProfileChangedNotification = @"DDProfileContentChanged";
 
-#pragma mark - 账号显示页监听（点头像进的 ContactInfoViewController）
+#pragma mark - 账号显示页：拦截账号行写入（绕开时序的最底层）
 
-// 实测截图：账号行是 MMCPLabel（MMUILabel → UILabel），tag 固定 90224；
-// 层级 self.view → … → MMCPLabel 全在 self.view 子树内，viewWithTag: 即可命中。
+// 实测截图：账号行是 MMCPLabel（MMUILabel → UILabel），tag 固定 90224。
+// 之前所有"事后对齐"都失败——关闭开关只刷了开关页（ddRefreshProfile 的通知/onModifyContact
+// 都在开关页），账号页收不到；账号页自己的 viewWillAppear/onTableViewReload 也慢半拍：
+// 微信在表格装配时（viewDidLoad→reloadData）就把账号行按"缓存值"写好，事后改文本会被它盖回。
+// 改在最底层：账号页存活期间记一个正确值，MMCPLabel 写文本那一刻强制纠偏，谁也绕不过。
 static NSInteger const kDDContactAliasLabelTag = 90224;
+static NSString *gDDAliasOverride = nil;   // 仅账号页存活期间非空，离开即清空，不影响别处
 
 %hook ContactInfoViewController
 
-// 只留一个对齐点：每次进页面（含重启后第一次）按当前 m_nsAliasName 对齐账号行。
-// 不挂通知——开关页发的 kDDProfileChangedNotification 在账号页创建之前就响了，收不到；
-// 进页面自己对齐，首进与重进都覆盖，足够。
-// 实测截图：账号行是 MMCPLabel（MMUILabel → UILabel），tag 固定 90224，
-// 层级 self.view → … → MMCPLabel 全在 self.view 子树内，viewWithTag: 即可命中。
-- (void)viewWillAppear:(BOOL)animated {
+// viewDidLoad 内表格装配前先记好正确值，%orig 装配过程中 MMCPLabel 被写时即被纠偏。
+- (void)viewDidLoad {
     %orig;
     CBaseContact *contact = [self m_contact];
-    if ([contact m_nsUsrName].length == 0) return;
-    // m_nsAliasName 走我们的 hook：有自定义返回自定义、删掉返回真值，永远等于"此刻应显示的值"。
-    NSString *target = [contact m_nsAliasName] ?: @"";
-    UILabel *lb = (UILabel *)[self.view viewWithTag:kDDContactAliasLabelTag];
-    if (![lb isKindOfClass:[UILabel class]]) return;
-    NSString *cur = lb.attributedText.length ? lb.attributedText.string : lb.text;
-    if ([cur isEqualToString:target]) return;
-    // 保留样式只换字符：有 attributedText 时复用其属性渲染新串（灰色小字不被冲掉）。
-    if (lb.attributedText.length) {
-        NSMutableAttributedString *attr = [lb.attributedText mutableCopy];
-        [attr replaceCharactersInRange:NSMakeRange(0, attr.length) withString:target];
-        lb.attributedText = attr;
-    } else {
-        lb.text = target;
-    }
+    gDDAliasOverride = ([contact m_nsUsrName].length && [contact m_nsAliasName])
+                       ? [contact m_nsAliasName] : nil;
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    gDDAliasOverride = nil;   // 离开清空，账号行之外的 MMCPLabel 不受影响
+    %orig;
+}
+
+%end
+
+%hook MMCPLabel
+
+- (void)setText:(NSString *)text {
+    if (self.tag == kDDContactAliasLabelTag && gDDAliasOverride) %orig(gDDAliasOverride);
+    else %orig;
+}
+
+- (void)setAttributedText:(NSAttributedString *)attr {
+    if (self.tag == kDDContactAliasLabelTag && gDDAliasOverride && attr.length) {
+        // replaceCharactersInRange 复用原串属性渲染新串：换字不换样式（灰色小字）
+        NSMutableAttributedString *m = [attr mutableCopy];
+        [m replaceCharactersInRange:NSMakeRange(0, m.length) withString:gDDAliasOverride];
+        %orig(m);
+    } else %orig;
 }
 
 %end
