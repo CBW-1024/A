@@ -117,8 +117,20 @@
 - (void)ddWxidSwitchChanged:(UISwitch *)sender;        // 自定义用户账号
 - (void)ddAvatarSwitchChanged:(UISwitch *)sender;      // 自定义用户头像
 - (void)dd_injectProfileSection;                       // 聊天详情页插入头像 + 账号开关
-- (void)onModifyContact:(id)contact;                   // IContactMgrExt，与 MMHeadImageView.h:65 同款
 - (void)ddRefreshProfile;                              // 账号改完补一次刷新
+@end
+
+@class CContact;
+@interface ContactInfoViewController : MMUIViewController
+// ContactInfoViewController.h:32 —— 当前联系人（CContact）
+@property (retain, nonatomic) CContact *m_contact;
+// ContactInfoViewController.h:90 —— 重建 m_oContactInfoAssist（账号值的真正来源）
+- (void)reloadContactAssist;
+// ContactInfoViewController.h:80/:83 —— 重建表格数据源 / 重绘
+- (void)reloadData;
+- (void)reloadView;
+// 统一刷新入口（viewWillAppear 与 kDDProfileChangedNotification 共用）
+- (void)ddProfileChangedRefresh;
 @end
 
 @interface CContact : CBaseContact
@@ -1859,6 +1871,39 @@ static void DDFriendWxidRemoveForUser(NSString *usrName) {
     DDFriendWxidPersist();
 }
 
+// 原始真值表：保存自定义值时一并记下该联系人当时的真实 alias（那一刻 getter 返回 %orig 真值）。
+// 关闭时把真值写回 ivar——因为自定义值已覆盖内存联系人，真值只在此处留存，否则需重进才能从 DB 拉回。
+static NSString * const kDDFriendWxidOrigMapKey = @"DDFriendWxidOrigMap";
+static NSMutableDictionary *DDFriendWxidOrigMap(void) {
+    static NSMutableDictionary *map = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSDictionary *saved = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kDDFriendWxidOrigMapKey];
+        map = saved ? [saved mutableCopy] : [NSMutableDictionary dictionary];
+    });
+    return map;
+}
+static NSString *DDFriendWxidOrigForUser(NSString *usrName) {
+    if (usrName.length == 0) return nil;
+    NSString *v = DDFriendWxidOrigMap()[usrName];
+    return [v isKindOfClass:[NSString class]] ? v : nil;
+}
+static void DDFriendWxidSetOrigForUser(NSString *value, NSString *usrName) {
+    if (usrName.length == 0) return;
+    DDFriendWxidOrigMap()[usrName] = value ?: @"";
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    [def setObject:DDFriendWxidOrigMap() forKey:kDDFriendWxidOrigMapKey];
+    [def synchronize];
+}
+static void DDFriendWxidRemoveOrigForUser(NSString *usrName) {
+    if (usrName.length == 0) return;
+    [DDFriendWxidOrigMap() removeObjectForKey:usrName];
+    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
+    if (DDFriendWxidOrigMap().count) [def setObject:DDFriendWxidOrigMap() forKey:kDDFriendWxidOrigMapKey];
+    else [def removeObjectForKey:kDDFriendWxidOrigMapKey];
+    [def synchronize];
+}
+
 #pragma mark - 头像文件管理
 
 static void DDRefreshAvatarViewsForUser(NSString *usrName);
@@ -2062,8 +2107,22 @@ static NSString *DDCustomWxid(void) {
 // 用户：查自定义表，命中返回自定义值（空串=隐藏），未命中回原值。
 - (id)m_nsAliasName {
     NSString *alias = DDFriendWxidForUser([self m_nsUsrName]);
-    if (alias) return alias;
+    if (alias) { return alias; }
     return %orig;
+}
+
+// 让"可见账号行"显示自定义值：微信每次重建资料页都会把联系人 alias 经 setM_nsAliasName: 写进
+// 联系人 ivar，而账号行 label 读的就是这个 ivar。
+// - 自定义存在：强制把 ivar 写成自定义值 → 账号行立即显示自定义值。
+// - 自定义已删（关闭）：让微信写的真值正常落库 → 账号行立即还原，无需重进。
+// （关闭时由 ddWxidSwitchChanged: 把保存时记录的原真值写回该 ivar，避免内存联系人被污染后无法即时还原）
+- (void)setM_nsAliasName:(id)v {
+    NSString *custom = DDFriendWxidForUser([self m_nsUsrName]);
+    if (custom) {
+        %orig(custom);
+        return;
+    }
+    %orig(v);
 }
 
 %end
@@ -2199,6 +2258,42 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 #pragma mark - 聊天详情页"自定义头像 / 自定义账号"入口
 
 static NSString * const kDDProfileChangedNotification = @"DDProfileContentChanged";
+
+#pragma mark - 账号显示页：进页面重建数据源
+
+// 展示页自刷新：监听 kDDProfileChangedNotification（关开关时由 ddRefreshProfile 发出）。
+// 关开关后展示页可能在导航栈里活着、viewWillAppear 不会触发，故靠通知立即重建账号行。
+// reloadContactAssist 重建 assist 时经 setM_nsAliasName: 重取账号（自定义/真值由 setter 决定）；
+// 关闭时的"真值写回"在 ddWxidSwitchChanged: 里完成（reload 前已把 ivar 还原，故 reload 读到真值）。
+
+%hook ContactInfoViewController
+
+- (void)viewDidLoad {
+    %orig;
+    [[NSNotificationCenter defaultCenter] addObserver:self
+            selector:@selector(ddProfileChangedRefresh)
+            name:kDDProfileChangedNotification
+            object:nil];
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:kDDProfileChangedNotification object:nil];
+    %orig;
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    [self ddProfileChangedRefresh];
+}
+
+%new
+- (void)ddProfileChangedRefresh {
+    [self reloadContactAssist];
+    [self reloadData];
+    [self reloadView];
+}
+
+%end
 
 static const void *kDDInjectedCellMarker = &kDDInjectedCellMarker;
 
@@ -2342,15 +2437,10 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 }
 
 %new
-// reloadTableData 只重绘表格、不会重新去读 m_nsAliasName，所以关掉开关界面仍是旧值。
-// 补一次微信自己的联系人变更回调（IContactMgrExt，与 MMHeadImageView.h:65 同款），
-// 资料页才会重新取账号——离开页面再进、或输入空之所以能还原，都是因为走了这条路径。
+// 发 kDDProfileChangedNotification：展示页（ContactInfoViewController）已监听该通知，
+// 收到后立即 reloadContactAssist 重建账号行并经由 setM_nsAliasName: 重取账号，无需重进页面。
 - (void)ddRefreshProfile {
     [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
-    CBaseContact *contact = [self m_contact];
-    if (contact && [self respondsToSelector:@selector(onModifyContact:)]) {
-        [self onModifyContact:contact];
-    }
 }
 
 // 与"自定义头像"对称：开 → 微信原生输入弹窗；关 → 清掉该用户的自定义。
@@ -2363,6 +2453,11 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 
     if (DDFriendWxidForUser(usrName)) {
         DDFriendWxidRemoveForUser(usrName);
+        // 关闭后把内存联系人 alias ivar 还原为保存时记录的原真值：账号行读的就是这个 ivar，
+        // 立即还原、无需重进（真值已不在内存里，故用保存时记下的原值写回）。
+        NSString *origAlias = DDFriendWxidOrigForUser(usrName);
+        DDFriendWxidRemoveOrigForUser(usrName);
+        if (origAlias) [contact setM_nsAliasName:origAlias];
         [self ddRefreshProfile];
         return;
     }
@@ -2389,9 +2484,13 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
         if (text.length == 0) {
             // 没有输入：关闭该用户自定义并回弹开关
             DDFriendWxidRemoveForUser(usrName);
+            DDFriendWxidRemoveOrigForUser(usrName);
             [weakSw setOn:NO animated:YES];
         } else {
             // 空格 / 文字：原样保存（空格=空白账号即隐藏）
+            // 保存前先记录原始真值，关闭时写回 ivar，避免内存联系人被自定义值污染后无法即时还原
+            NSString *origAlias = [contact m_nsAliasName];   // 此刻 custom 尚未写入 → %orig 即真值
+            if (origAlias) DDFriendWxidSetOrigForUser(origAlias, usrName);
             DDFriendWxidSetForUser(text, usrName);
         }
         [self ddRefreshProfile];
