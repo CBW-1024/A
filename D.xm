@@ -117,6 +117,7 @@
 - (void)ddWxidSwitchChanged:(UISwitch *)sender;        // 自定义用户账号
 - (void)ddAvatarSwitchChanged:(UISwitch *)sender;      // 自定义用户头像
 - (void)dd_injectProfileSection;                       // 聊天详情页插入头像 + 账号开关
+- (void)onModifyContact:(id)contact;                   // IContactMgrExt，与 MMHeadImageView.h:65 同款
 - (void)ddRefreshProfile;                              // 账号改完补一次刷新
 @end
 
@@ -2341,12 +2342,15 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 }
 
 %new
-// 实测只有真正"离开页面再回来"才会重取账号：reloadTableData 只重绘表格、不重新读
-// m_nsAliasName；IContactMgrExt 的 onModifyContact: 资料页头文件里也没列出，respondsToSelector
-// 会跳过；单独调 viewWillAppear: 也不生效（微信有转场态判断）。所以成对模拟一次进出。
+// reloadTableData 只重绘表格、不会重新去读 m_nsAliasName，所以关掉开关界面仍是旧值。
+// 补一次微信自己的联系人变更回调（IContactMgrExt，与 MMHeadImageView.h:65 同款），
+// 资料页才会重新取账号——离开页面再进、或输入空之所以能还原，都是因为走了这条路径。
 - (void)ddRefreshProfile {
-    [self viewWillDisappear:NO];
-    [self viewWillAppear:NO];
+    [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
+    CBaseContact *contact = [self m_contact];
+    if (contact && [self respondsToSelector:@selector(onModifyContact:)]) {
+        [self onModifyContact:contact];
+    }
 }
 
 // 与"自定义头像"对称：开 → 微信原生输入弹窗；关 → 清掉该用户的自定义。
