@@ -120,7 +120,9 @@
 - (void)ddRefreshProfile;                              // 账号改完补一次刷新
 @end
 
-@class CContact;
+@interface CContact : CBaseContact
+@end
+
 @interface ContactInfoViewController : MMUIViewController
 // ContactInfoViewController.h:32 —— 当前联系人（CContact）
 @property (retain, nonatomic) CContact *m_contact;
@@ -131,9 +133,6 @@
 - (void)reloadView;
 // 统一刷新入口（viewWillAppear 与 kDDProfileChangedNotification 共用）
 - (void)ddProfileChangedRefresh;
-@end
-
-@interface CContact : CBaseContact
 @end
 
 @interface MMHeadImageView : MMUIView
@@ -1825,13 +1824,10 @@ static void DDBalancePatchTitleLabel(id vc, unsigned long long fen) {
 
 
 #pragma mark - 用户账号自定义（按用户名，聊天详情页逐人设置）
-// 改完必须发 kDDProfileChangedNotification（与头像共用）：资料页不会自己重绘，
 
 static NSString * const kDDFriendWxidMapKey = @"DDFriendWxidMap";
 
-// 这张表存 NSUserDefaults，不手写 plist：writeToFile 一旦没落盘就会出现
-// "内存删干净了、磁盘还留着"，表现为不重启能还原、重启后自定义值复活。
-// 与文件里其余配置统一走 synchronize；表空时直接 removeObjectForKey，不留空壳。
+// 自定义账号表：存 NSUserDefaults，与全局配置统一走 synchronize；空表时移除 key 不留空壳。
 static NSMutableDictionary *DDFriendWxidMap(void) {
     static NSMutableDictionary *map = nil;
     static dispatch_once_t once;
@@ -1871,8 +1867,7 @@ static void DDFriendWxidRemoveForUser(NSString *usrName) {
     DDFriendWxidPersist();
 }
 
-// 原始真值表：保存自定义值时一并记下该联系人当时的真实 alias（那一刻 getter 返回 %orig 真值）。
-// 关闭时把真值写回 ivar——因为自定义值已覆盖内存联系人，真值只在此处留存，否则需重进才能从 DB 拉回。
+// 原始真值表：保存时记下真实 alias，关闭时写回 ivar 即时还原（自定义值已覆盖内存联系人，真值只在此留存）。
 static NSString * const kDDFriendWxidOrigMapKey = @"DDFriendWxidOrigMap";
 static NSMutableDictionary *DDFriendWxidOrigMap(void) {
     static NSMutableDictionary *map = nil;
@@ -2111,11 +2106,8 @@ static NSString *DDCustomWxid(void) {
     return %orig;
 }
 
-// 让"可见账号行"显示自定义值：微信每次重建资料页都会把联系人 alias 经 setM_nsAliasName: 写进
-// 联系人 ivar，而账号行 label 读的就是这个 ivar。
-// - 自定义存在：强制把 ivar 写成自定义值 → 账号行立即显示自定义值。
-// - 自定义已删（关闭）：让微信写的真值正常落库 → 账号行立即还原，无需重进。
-// （关闭时由 ddWxidSwitchChanged: 把保存时记录的原真值写回该 ivar，避免内存联系人被污染后无法即时还原）
+// 账号行显示的是联系人 m_nsAliasName 的 ivar（微信重建资料页时经此 setter 写入）。
+// 自定义存在 → 强制写入自定义值；关闭 → 让真值正常写入，配合 ddWxidSwitchChanged: 写回原值即时还原。
 - (void)setM_nsAliasName:(id)v {
     NSString *custom = DDFriendWxidForUser([self m_nsUsrName]);
     if (custom) {
@@ -2261,10 +2253,7 @@ static NSString * const kDDProfileChangedNotification = @"DDProfileContentChange
 
 #pragma mark - 账号显示页：进页面重建数据源
 
-// 展示页自刷新：监听 kDDProfileChangedNotification（关开关时由 ddRefreshProfile 发出）。
-// 关开关后展示页可能在导航栈里活着、viewWillAppear 不会触发，故靠通知立即重建账号行。
-// reloadContactAssist 重建 assist 时经 setM_nsAliasName: 重取账号（自定义/真值由 setter 决定）；
-// 关闭时的"真值写回"在 ddWxidSwitchChanged: 里完成（reload 前已把 ivar 还原，故 reload 读到真值）。
+// 监听 kDDProfileChangedNotification 自刷新：关开关后展示页可能仍在导航栈，靠通知即时重建账号行。
 
 %hook ContactInfoViewController
 
@@ -2437,8 +2426,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 }
 
 %new
-// 发 kDDProfileChangedNotification：展示页（ContactInfoViewController）已监听该通知，
-// 收到后立即 reloadContactAssist 重建账号行并经由 setM_nsAliasName: 重取账号，无需重进页面。
+// 发通知触发展示页账号行自刷新。
 - (void)ddRefreshProfile {
     [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
 }
@@ -2453,8 +2441,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 
     if (DDFriendWxidForUser(usrName)) {
         DDFriendWxidRemoveForUser(usrName);
-        // 关闭后把内存联系人 alias ivar 还原为保存时记录的原真值：账号行读的就是这个 ivar，
-        // 立即还原、无需重进（真值已不在内存里，故用保存时记下的原值写回）。
+        // 关闭后把 alias ivar 还原为记录的原真值，账号行立即还原
         NSString *origAlias = DDFriendWxidOrigForUser(usrName);
         DDFriendWxidRemoveOrigForUser(usrName);
         if (origAlias) [contact setM_nsAliasName:origAlias];
@@ -2488,8 +2475,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
             [weakSw setOn:NO animated:YES];
         } else {
             // 空格 / 文字：原样保存（空格=空白账号即隐藏）
-            // 保存前先记录原始真值，关闭时写回 ivar，避免内存联系人被自定义值污染后无法即时还原
-            NSString *origAlias = [contact m_nsAliasName];   // 此刻 custom 尚未写入 → %orig 即真值
+            NSString *origAlias = [contact m_nsAliasName];   // 此刻 custom 尚未写入 → 取到的即真实 alias
             if (origAlias) DDFriendWxidSetOrigForUser(origAlias, usrName);
             DDFriendWxidSetForUser(text, usrName);
         }
