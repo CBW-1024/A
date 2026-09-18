@@ -122,7 +122,9 @@
 @end
 
 @interface ContactInfoViewController : MMUIViewController
-// ContactInfoViewController.h:80/:83 —— 微信自己的重建数据源 / 重绘入口
+// ContactInfoViewController.h:90 —— 重建 m_oContactInfoAssist（账号值的真正来源）
+- (void)reloadContactAssist;
+// ContactInfoViewController.h:80/:83 —— 重建表格数据源 / 重绘
 - (void)reloadData;
 - (void)reloadView;
 @end
@@ -2206,16 +2208,17 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 
 static NSString * const kDDProfileChangedNotification = @"DDProfileContentChanged";
 
-#pragma mark - 账号显示页：进页面直接重读数据重绘
+#pragma mark - 账号显示页：进页面重建数据源
 
-// ContactInfoViewController.h:80 - (void)reloadData;  :83 - (void)reloadView;
-// 账号页自己就有重建数据源/重绘的入口，不必事后改 label 文本（要记正确值、按 tag 90224
-// 拦 MMCPLabel 写入，代码多且绑内部细节）。每次进页面让它按当前 m_nsAliasName
-// （走我们的 hook，关掉自定义后即真值）重新装配一次，账号行自然就是正确值。
+// 关键：账号行的值不在表格数据源里，而在 m_oContactInfoAssist（ContactInfoViewController.h:4）
+// —— 它是 viewDidLoad 时按当时的 m_contact 构建后缓存的；reloadData 只重建表格数据源、
+// 不重建 assist，所以账号值一直是旧的（这就是"reloadData 无效"的原因）。
+// 必须调 reloadContactAssist（ContactInfoViewController.h:90）重建 assist，才会重取账号。
 %hook ContactInfoViewController
 
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
+    [self reloadContactAssist];
     [self reloadData];
     [self reloadView];
 }
