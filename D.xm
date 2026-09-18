@@ -122,7 +122,9 @@
 @end
 
 @interface ContactInfoViewController : MMUIViewController
-@property (retain, nonatomic) CContact *m_contact;       // ContactInfoViewController.h 同名属性（CContact : CBaseContact）
+// ContactInfoViewController.h:80/:83 —— 微信自己的重建数据源 / 重绘入口
+- (void)reloadData;
+- (void)reloadView;
 @end
 
 @interface CContact : CBaseContact
@@ -2204,47 +2206,18 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 
 static NSString * const kDDProfileChangedNotification = @"DDProfileContentChanged";
 
-#pragma mark - 账号显示页：拦截账号行写入（绕开时序的最底层）
+#pragma mark - 账号显示页：进页面直接重读数据重绘
 
-// 实测截图：账号行是 MMCPLabel（MMUILabel → UILabel），tag 固定 90224。
-// 之前所有"事后对齐"都失败——关闭开关只刷了开关页（ddRefreshProfile 的通知/onModifyContact
-// 都在开关页），账号页收不到；账号页自己的 viewWillAppear/onTableViewReload 也慢半拍：
-// 微信在表格装配时（viewDidLoad→reloadData）就把账号行按"缓存值"写好，事后改文本会被它盖回。
-// 改在最底层：账号页存活期间记一个正确值，MMCPLabel 写文本那一刻强制纠偏，谁也绕不过。
-static NSInteger const kDDContactAliasLabelTag = 90224;
-static NSString *gDDAliasOverride = nil;   // 仅账号页存活期间非空，离开即清空，不影响别处
-
+// ContactInfoViewController.h:80 - (void)reloadData;  :83 - (void)reloadView;
+// 账号页自己就有重建数据源/重绘的入口，不必事后改 label 文本（要记正确值、按 tag 90224
+// 拦 MMCPLabel 写入，代码多且绑内部细节）。每次进页面让它按当前 m_nsAliasName
+// （走我们的 hook，关掉自定义后即真值）重新装配一次，账号行自然就是正确值。
 %hook ContactInfoViewController
 
-// viewDidLoad 内表格装配前先记好正确值，%orig 装配过程中 MMCPLabel 被写时即被纠偏。
-- (void)viewDidLoad {
+- (void)viewWillAppear:(BOOL)animated {
     %orig;
-    CBaseContact *contact = [self m_contact];
-    gDDAliasOverride = ([contact m_nsUsrName].length && [contact m_nsAliasName])
-                       ? [contact m_nsAliasName] : nil;
-}
-
-- (void)viewWillDisappear:(BOOL)animated {
-    gDDAliasOverride = nil;   // 离开清空，账号行之外的 MMCPLabel 不受影响
-    %orig;
-}
-
-%end
-
-%hook MMCPLabel
-
-- (void)setText:(NSString *)text {
-    if (self.tag == kDDContactAliasLabelTag && gDDAliasOverride) %orig(gDDAliasOverride);
-    else %orig;
-}
-
-- (void)setAttributedText:(NSAttributedString *)attr {
-    if (self.tag == kDDContactAliasLabelTag && gDDAliasOverride && attr.length) {
-        // replaceCharactersInRange 复用原串属性渲染新串：换字不换样式（灰色小字）
-        NSMutableAttributedString *m = [attr mutableCopy];
-        [m replaceCharactersInRange:NSMakeRange(0, m.length) withString:gDDAliasOverride];
-        %orig(m);
-    } else %orig;
+    [self reloadData];
+    [self reloadView];
 }
 
 %end
