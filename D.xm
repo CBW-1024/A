@@ -130,6 +130,8 @@
 // ContactInfoViewController.h:80/:83 —— 重建表格数据源 / 重绘
 - (void)reloadData;
 - (void)reloadView;
+// 统一刷新入口（viewWillAppear 与 kDDProfileChangedNotification 共用）
+- (void)ddProfileChangedRefresh;
 @end
 
 @interface CContact : CBaseContact
@@ -2247,14 +2249,40 @@ static NSString * const kDDProfileChangedNotification = @"DDProfileContentChange
 // —— 它是 viewDidLoad 时按当时的 m_contact 构建后缓存的；reloadData 只重建表格数据源、
 // 不重建 assist，所以账号值一直是旧的（这就是"reloadData 无效"的原因）。
 // 必须调 reloadContactAssist（ContactInfoViewController.h:90）重建 assist，才会重取账号。
+//
+// 关闭开关（ddWxidSwitchChanged:）只发 kDDProfileChangedNotification，而该通知此前只被开关页
+// 自己监听（刷新它自身的表格）。展示页若在导航栈里活着、没有离开再进入，viewWillAppear 不会触发，
+// 于是仍显示旧值——这就是"需重进一次才还原"。这里让展示页自己也监听该通知，关闭时立即自刷新。
 %hook ContactInfoViewController
+
+- (void)viewDidLoad {
+    %orig;
+    [[NSNotificationCenter defaultCenter] addObserver:self
+            selector:@selector(ddProfileChangedRefresh)
+            name:kDDProfileChangedNotification
+            object:nil];
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:kDDProfileChangedNotification object:nil];
+    %orig;
+}
 
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
-    DDLog(@"[ContactInfo] viewWillAppear -> reloadContactAssist/reloadData/reloadView usr=%@", [[self m_contact] m_nsUsrName]);
+    [self ddProfileChangedRefresh];
+}
+
+%new
+- (void)ddProfileChangedRefresh {
+    NSString *usr = [[self m_contact] m_nsUsrName];
+    DDLog(@"[ContactInfo] 刷新 reloadContactAssist/reloadData/reloadView usr=%@", usr);
     [self reloadContactAssist];
     [self reloadData];
     [self reloadView];
+    // 刷新后"实际显示值"：删自定义后应为原始 wxid（据此在日志里定性是否真的还原）
+    NSString *shown = [[self m_contact] m_nsAliasName];
+    DDLog(@"[ContactInfo] 刷新后账号显示值 usr=%@ -> %@", usr, shown);
 }
 
 %end
