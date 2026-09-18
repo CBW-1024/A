@@ -2341,11 +2341,12 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 }
 
 %new
-// 实测只有离开页面再回来才刷新——真正生效的是 viewWillAppear 里微信自己的取数流程：
-// reloadTableData 只重绘表格、不重新读 m_nsAliasName；IContactMgrExt 的 onModifyContact:
-// 在资料页头文件里也没列出，respondsToSelector 会直接跳过。所以走同一条路径即可。
+// 实测只有真正"离开页面再回来"才会重取账号：reloadTableData 只重绘表格、不重新读
+// m_nsAliasName；IContactMgrExt 的 onModifyContact: 资料页头文件里也没列出，respondsToSelector
+// 会跳过；单独调 viewWillAppear: 也不生效（微信有转场态判断）。所以成对模拟一次进出。
 - (void)ddRefreshProfile {
-    [self viewWillAppear:YES];
+    [self viewWillDisappear:NO];
+    [self viewWillAppear:NO];
 }
 
 // 与"自定义头像"对称：开 → 微信原生输入弹窗；关 → 清掉该用户的自定义。
