@@ -1002,14 +1002,21 @@ static void DDApplyAliasTextInView(UIView *root, NSString *target);
 - (void)ddSyncAliasLabel {
     CBaseContact *contact = [self m_contact];        // ContactInfoViewController.h:32
     if ([contact m_nsUsrName].length == 0) return;
-    // m_nsAliasName 走的是我们的 hook：有自定义值时是自定义值，删掉后就是真值，
-    // 所以它永远等于"此刻应当显示的值"，拿它当对齐目标即可。
     DDApplyAliasTextInView(self.view, [contact m_nsAliasName] ?: @"");
 }
 
-// 唯一对齐点：UIKit 保证每次进页面都调用，比 onTableViewReload 那种微信内部回调可靠。
-// 动作只有"读一遍视图树、把 tag 90224 的 label 文本对齐"，不碰微信任何业务流程。
-- (void)viewDidAppear:(BOOL)animated { %orig; [self ddSyncAliasLabel]; }
+// 进入页面即取一次"此刻应当显示的账号"：m_nsAliasName 走我们的 hook，删掉自定义后就是真值。
+// 把它放进全局 gDDAliasOverride，MMCPLabel 的 setter 会据此强制纠偏（时机无关）。
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    gDDAliasOverride = [[self m_contact] m_nsAliasName];
+    [self ddSyncAliasLabel];   // 先把 viewDidLoad 里可能写下的旧值纠一遍
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    %orig;
+    gDDAliasOverride = nil;    // 离开清空，不误伤其它页面的同名标签
+}
 
 %end
 
@@ -2371,6 +2378,33 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 // 刷新这条路走不通：账号文本不在开关页（AddContactToChatRoomViewController）里，
 // 它在点头像 push 出来的 ContactInfoViewController 里 —— 在开关页刷新碰不到它，
 // 这就是"要第二次查看才变"的真正原因。改成主动对齐文本（同头像那套思路）。
+// 账号页进入期间记录"应当显示的账号文本"（viewWillAppear 写入、viewWillDisappear 清空）。
+// 仅当账号页存在时非空，其它页面不受影响。setter 拦截据此强制纠偏。
+static NSString *gDDAliasOverride = nil;
+
+#pragma mark - 账号行写入拦截（绕开时序的最底层）
+// 前面所有"事后对齐"都失败：微信在 viewDidAppear 之后（updateContactFromServer 回填）又改写文本，
+// 我们无论何时对齐都被盖掉。改在最底层——MMCPLabel 写文本那一刻纠正，谁也绕不过。
+%hook MMCPLabel
+
+- (void)setText:(NSString *)text {
+    if (self.tag == kDDContactAliasLabelTag && gDDAliasOverride) %orig(gDDAliasOverride);
+    else %orig;
+}
+
+- (void)setAttributedText:(NSAttributedString *)attr {
+    if (self.tag == kDDContactAliasLabelTag && gDDAliasOverride && attr.length) {
+        // replaceCharactersInRange 用原串首字符属性渲染新串：换字不换样式（灰色小字）
+        NSMutableAttributedString *m = [attr mutableCopy];
+        [m replaceCharactersInRange:NSMakeRange(0, m.length) withString:gDDAliasOverride];
+        %orig(m);
+    } else {
+        %orig;
+    }
+}
+
+%end
+
 // 实测截图：账号行是 MMCPLabel（MMUILabel → UILabel），tag 固定 90224，
 // text 与 attributedText 同时有值，只改 text 会被 attributedText 盖回去。
 static NSInteger const kDDContactAliasLabelTag = 90224;
