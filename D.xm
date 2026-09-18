@@ -117,10 +117,20 @@
 - (void)ddWxidSwitchChanged:(UISwitch *)sender;        // 自定义用户账号
 - (void)ddAvatarSwitchChanged:(UISwitch *)sender;      // 自定义用户头像
 - (void)dd_injectProfileSection;                       // 聊天详情页插入头像 + 账号开关
-- (void)ddRefreshProfile;                              // 账号改完补一次刷新
 @end
 
 @interface CContact : CBaseContact
+@end
+
+// ContactInfoViewController.h:32 —— @property (retain, nonatomic) CContact *m_contact;
+// 点头像进的资料页，账号文本渲染在这个 VC 里，与开关页不是同一个。
+@interface ContactInfoViewController : MMUIViewController
+@property (retain, nonatomic) CContact *m_contact;
+// ContactInfoViewController.h —— 唯一保留的对齐锚点：表格重绘回调。
+// 不再调 onModifyContact: / reloadData / reloadView：那几个有业务副作用（联系人同步、重建视图），
+// 而我们要的只是"微信重绘之后把文本对齐一次"，onTableViewReload 一个点就够。
+- (void)onTableViewReload;
+- (void)ddSyncAliasLabel;
 @end
 
 @interface MMHeadImageView : MMUIView
@@ -984,6 +994,43 @@ static void DDJokerApplyTextOverride(CMessageWrap *msg) {
     NSString *cached = DDJokerCachedText(msg);
     return cached ?: origin;
 }
+%end
+
+#pragma mark - 账号显示页同步（点头像进的 ContactInfoViewController）
+// 实现在文件后段（"账号显示"一节），此处先声明，避免隐式声明告警
+static BOOL DDApplyAliasTextInView(UIView *root, NSString *target);
+static void DDApplyAliasTextInAllWindows(NSString *target);
+
+%hook ContactInfoViewController
+
+%new
+- (void)ddSyncAliasLabel {
+    CBaseContact *contact = [self m_contact];        // ContactInfoViewController.h:32
+    if ([contact m_nsUsrName].length == 0) return;
+    // m_nsAliasName 走的是我们的 hook：有自定义值时是自定义值，删掉后就是真值，
+    // 所以它永远等于"此刻应当显示的值"，拿它当对齐目标即可。
+    NSString *target = [contact m_nsAliasName] ?: @"";
+    if (!DDApplyAliasTextInView(self.view, target)) DDApplyAliasTextInAllWindows(target);
+}
+
+// 只留两个零副作用的对齐点：
+//  ① viewDidAppear —— 页面已上屏，账号 label 一定建好了，此时对齐一次；
+//  ② onTableViewReload —— 微信任何一次表格重绘之后（含服务器数据回来那次）再对齐一次。
+// 不再 hook viewWillAppear / reloadData / reloadView，也不再调 onModifyContact:。
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    [self ddSyncAliasLabel];
+    // 重启后第一次进资料页，微信会 updateContactFromServer 拉联系人，回填后重绘一次，
+    // 这一下会把刚对齐的文本盖回旧值（不重启时没有这次回填，所以一直正常）。
+    // 补一发延迟的压在它后面 —— 只是读一遍视图树改个文本，无副作用。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self ddSyncAliasLabel];
+    });
+}
+
+- (void)onTableViewReload { %orig; [self ddSyncAliasLabel]; }
+
 %end
 
 static BOOL gJokerNeedsResetLayout = NO;
@@ -2341,12 +2388,49 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 }
 
 %new
-// 实测只有真正"离开页面再回来"才会重取账号：reloadTableData 只重绘表格、不重新读
-// m_nsAliasName；IContactMgrExt 的 onModifyContact: 资料页头文件里也没列出，respondsToSelector
-// 会跳过；单独调 viewWillAppear: 也不生效（微信有转场态判断）。所以成对模拟一次进出。
-- (void)ddRefreshProfile {
-    [self viewWillDisappear:NO];
-    [self viewWillAppear:NO];
+// 刷新这条路走不通：账号文本不在开关页（AddContactToChatRoomViewController）里，
+// 它在点头像 push 出来的 ContactInfoViewController 里 —— 在开关页刷新碰不到它，
+// 这就是"要第二次查看才变"的真正原因。改成主动对齐文本（同头像那套思路）。
+// 实测截图：账号行是 MMCPLabel（MMUILabel → UILabel），tag 固定 90224，
+// text 与 attributedText 同时有值，只改 text 会被 attributedText 盖回去。
+static NSInteger const kDDContactAliasLabelTag = 90224;
+
+static void DDApplyAliasLabelText(UILabel *lb, NSString *text) {
+    if (lb.attributedText.length) {
+        // replaceCharactersInRange 会用原串首字符的属性渲染新串：换字不换样式（灰色小字）
+        NSMutableAttributedString *attr = [lb.attributedText mutableCopy];
+        [attr replaceCharactersInRange:NSMakeRange(0, attr.length) withString:(text ?: @"")];
+        lb.attributedText = attr;
+    } else {
+        lb.text = text ?: @"";
+    }
+}
+
+// 返回是否至少命中一个 tag 为 90224 的 label —— 没命中说明它不在这棵子树里，
+// 调用方据此退到 window 全树再找（微信资料页有 frontTableViewBackGroundView 等独立容器）。
+static BOOL DDApplyAliasTextInView(UIView *root, NSString *target) {
+    if (!root) return NO;
+    BOOL hit = NO;
+    if ([root isKindOfClass:[UILabel class]] && root.tag == kDDContactAliasLabelTag) {
+        UILabel *lb = (UILabel *)root;
+        NSString *cur = lb.attributedText.length ? lb.attributedText.string : lb.text;
+        if (![cur isEqualToString:target]) DDApplyAliasLabelText(lb, target);
+        hit = YES;
+    }
+    for (UIView *sub in root.subviews) {
+        if (DDApplyAliasTextInView(sub, target)) hit = YES;
+    }
+    return hit;
+}
+
+// 兜底：self.view 里找不到账号 label 时，遍历当前所有 window 找（同一 tag）。
+static void DDApplyAliasTextInAllWindows(NSString *target) {
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+            if (DDApplyAliasTextInView(w, target)) return;
+        }
+    }
 }
 
 // 与"自定义头像"对称：开 → 微信原生输入弹窗；关 → 清掉该用户的自定义。
@@ -2359,7 +2443,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 
     if (DDFriendWxidForUser(usrName)) {
         DDFriendWxidRemoveForUser(usrName);
-        [self ddRefreshProfile];
+        DDApplyAliasTextInView(self.view, [contact m_nsAliasName] ?: @"");
         return;
     }
 
@@ -2390,7 +2474,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
             // 空格 / 文字：原样保存（空格=空白账号即隐藏）
             DDFriendWxidSetForUser(text, usrName);
         }
-        [self ddRefreshProfile];
+        DDApplyAliasTextInView(self.view, [contact m_nsAliasName] ?: @"");
         blockAlert = nil;
     }];
     [alert show];
