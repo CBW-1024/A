@@ -133,17 +133,9 @@
 - (void)reloadView;
 // 统一刷新入口（viewWillAppear 与 kDDProfileChangedNotification 共用）
 - (void)ddProfileChangedRefresh;
-// ContactInfoViewController.h:5 —— 账号值真正承载在 assist 的 userName label 上
-- (id)m_oContactInfoAssist;
 @end
 
 @interface CContact : CBaseContact
-@end
-
-// CBaseContactInfoAssist.h:10 —— 账号行 label（m_userNameLabel），reloadContactAssist 后
-// 该 label 未必重读 m_nsAliasName（会沿用旧值），故关闭后直接对齐它。
-@interface CBaseContactInfoAssist : NSObject
-- (UILabel *)m_userNameLabel;
 @end
 
 @interface MMHeadImageView : MMUIView
@@ -2262,6 +2254,21 @@ static NSString * const kDDProfileChangedNotification = @"DDProfileContentChange
 // 关闭开关（ddWxidSwitchChanged:）只发 kDDProfileChangedNotification，而该通知此前只被开关页
 // 自己监听（刷新它自身的表格）。展示页若在导航栈里活着、没有离开再进入，viewWillAppear 不会触发，
 // 于是仍显示旧值——这就是"需重进一次才还原"。这里让展示页自己也监听该通知，关闭时立即自刷新。
+
+// m_oContactInfoAssist / m_userNameLabel 都是 ivar（ContactInfoViewController.h:5 /
+// CBaseContactInfoAssist.h:10），没有对应 getter 方法，必须用 object_getIvar 直接读；
+// 直接发消息会 unrecognized selector 崩溃（即"点击进去就闪退"）。
+static id DDContactInfoAssistOf(id vc) {
+    Ivar iv = class_getInstanceVariable(object_getClass(vc), "m_oContactInfoAssist");
+    return iv ? object_getIvar(vc, iv) : nil;
+}
+static UILabel *DDUserNameLabelOf(id assist) {
+    if (!assist) return nil;
+    Ivar iv = class_getInstanceVariable(object_getClass(assist), "m_userNameLabel");
+    id v = iv ? object_getIvar(assist, iv) : nil;
+    return [v isKindOfClass:[UILabel class]] ? (UILabel *)v : nil;
+}
+
 %hook ContactInfoViewController
 
 - (void)viewDidLoad {
@@ -2292,11 +2299,8 @@ static NSString * const kDDProfileChangedNotification = @"DDProfileContentChange
     // reloadContactAssist 后 m_userNameLabel 未必重读 m_nsAliasName（沿用旧值），
     // 直接把账号行 label 对齐成当前 m_nsAliasName，确保关闭后立即显示原始值。
     NSString *shown = [[self m_contact] m_nsAliasName];
-    id assist = [self m_oContactInfoAssist];
-    if (assist) {
-        UILabel *lbl = [assist m_userNameLabel];
-        if (lbl && shown) [lbl setText:shown];
-    }
+    UILabel *lbl = DDUserNameLabelOf(DDContactInfoAssistOf(self));
+    if (lbl && shown) [lbl setText:shown];
     DDLog(@"[ContactInfo] 刷新后账号显示值(回读map=%@) usr=%@ -> %@", DDFriendWxidForUser(usr), usr, shown);
 }
 
