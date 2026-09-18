@@ -121,19 +121,6 @@
 - (void)ddRefreshProfile;                              // 账号改完补一次刷新
 @end
 
-@class CContact;
-@interface ContactInfoViewController : MMUIViewController
-// ContactInfoViewController.h:32 —— 当前联系人（CContact）
-@property (retain, nonatomic) CContact *m_contact;
-// ContactInfoViewController.h:90 —— 重建 m_oContactInfoAssist（账号值的真正来源）
-- (void)reloadContactAssist;
-// ContactInfoViewController.h:80/:83 —— 重建表格数据源 / 重绘
-- (void)reloadData;
-- (void)reloadView;
-// 统一刷新入口（viewWillAppear 与 kDDProfileChangedNotification 共用）
-- (void)ddProfileChangedRefresh;
-@end
-
 @interface CContact : CBaseContact
 @end
 
@@ -388,36 +375,6 @@ static BOOL DDStringHas(const char *haystack, const char *needle) {
     NSString *h = [[NSString stringWithUTF8String:haystack] lowercaseString];
     NSString *n = [[NSString stringWithUTF8String:needle] lowercaseString];
     return (h && n) ? ([h rangeOfString:n].location != NSNotFound) : NO;
-}
-
-#pragma mark - 调试日志（无需越狱：文件存于 App 沙盒，设置页可导出/清空）
-
-// 非越狱机器访问不了文件系统，故日志落盘到 App 沙盒 Library/Caches/DDJoker/dd.log，
-// 在设置页用系统分享单把文件发出去（微信 / 备忘录 / 隔空投送均可）。
-static NSString *DDJokerLogPath(void) {
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
-    NSString *dir = [paths.firstObject stringByAppendingPathComponent:@"Caches/DDJoker"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                              withIntermediateDirectories:YES attributes:nil error:nil];
-    return [dir stringByAppendingPathComponent:@"dd.log"];
-}
-
-static void DDLog(NSString *fmt, ...) {
-    if (!fmt) return;
-    va_list ap; va_start(ap, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    NSDateFormatter *df = [[NSDateFormatter alloc] init];
-    df.dateFormat = @"MM-dd HH:mm:ss.SSS";
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], msg];
-    NSString *path = DDJokerLogPath();
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
-    else    { [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
-}
-
-static void DDLogClear(void) {
-    [@"" writeToFile:DDJokerLogPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
 #pragma mark - 聊天消息改写（文字 / 图片 / 转账）
@@ -1902,39 +1859,6 @@ static void DDFriendWxidRemoveForUser(NSString *usrName) {
     DDFriendWxidPersist();
 }
 
-// 原始真值表：保存自定义值时一并记下该联系人当时的真实 alias（那一刻 getter 返回 %orig 真值）。
-// 关闭时把真值写回 ivar——因为自定义值已覆盖内存联系人，真值只在此处留存，否则需重进才能从 DB 拉回。
-static NSString * const kDDFriendWxidOrigMapKey = @"DDFriendWxidOrigMap";
-static NSMutableDictionary *DDFriendWxidOrigMap(void) {
-    static NSMutableDictionary *map = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSDictionary *saved = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kDDFriendWxidOrigMapKey];
-        map = saved ? [saved mutableCopy] : [NSMutableDictionary dictionary];
-    });
-    return map;
-}
-static NSString *DDFriendWxidOrigForUser(NSString *usrName) {
-    if (usrName.length == 0) return nil;
-    NSString *v = DDFriendWxidOrigMap()[usrName];
-    return [v isKindOfClass:[NSString class]] ? v : nil;
-}
-static void DDFriendWxidSetOrigForUser(NSString *value, NSString *usrName) {
-    if (usrName.length == 0) return;
-    DDFriendWxidOrigMap()[usrName] = value ?: @"";
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    [def setObject:DDFriendWxidOrigMap() forKey:kDDFriendWxidOrigMapKey];
-    [def synchronize];
-}
-static void DDFriendWxidRemoveOrigForUser(NSString *usrName) {
-    if (usrName.length == 0) return;
-    [DDFriendWxidOrigMap() removeObjectForKey:usrName];
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    if (DDFriendWxidOrigMap().count) [def setObject:DDFriendWxidOrigMap() forKey:kDDFriendWxidOrigMapKey];
-    else [def removeObjectForKey:kDDFriendWxidOrigMapKey];
-    [def synchronize];
-}
-
 #pragma mark - 头像文件管理
 
 static void DDRefreshAvatarViewsForUser(NSString *usrName);
@@ -2138,23 +2062,8 @@ static NSString *DDCustomWxid(void) {
 // 用户：查自定义表，命中返回自定义值（空串=隐藏），未命中回原值。
 - (id)m_nsAliasName {
     NSString *alias = DDFriendWxidForUser([self m_nsUsrName]);
-    if (alias) { DDLog(@"[alias] usr=%@ -> %@", [self m_nsUsrName], alias); return alias; }
+    if (alias) return alias;
     return %orig;
-}
-
-// 让"可见账号行"显示自定义值：微信每次重建资料页都会把联系人 alias 经 setM_nsAliasName: 写进
-// 联系人 ivar，而账号行 label 读的就是这个 ivar。
-// - 自定义存在：强制把 ivar 写成自定义值 → 账号行立即显示自定义值。
-// - 自定义已删（关闭）：让微信写的真值正常落库 → 账号行立即还原，无需重进。
-// （关闭时由 ddWxidSwitchChanged: 把保存时记录的原真值写回该 ivar，避免内存联系人被污染后无法即时还原）
-- (void)setM_nsAliasName:(id)v {
-    NSString *custom = DDFriendWxidForUser([self m_nsUsrName]);
-    if (custom) {
-        DDLog(@"[aliasSet] 强制写自定义 usr=%@ val=%@", [self m_nsUsrName], custom);
-        %orig(custom);
-        return;
-    }
-    %orig(v);
 }
 
 %end
@@ -2290,52 +2199,6 @@ static UIView *DDFindImageScrollViewIn(UIView *root) {
 #pragma mark - 聊天详情页"自定义头像 / 自定义账号"入口
 
 static NSString * const kDDProfileChangedNotification = @"DDProfileContentChanged";
-
-#pragma mark - 账号显示页：进页面重建数据源
-
-// 关键：账号行的值不在表格数据源里，而在 m_oContactInfoAssist（ContactInfoViewController.h:4）
-// —— 它是 viewDidLoad 时按当时的 m_contact 构建后缓存的；reloadData 只重建表格数据源、
-// 不重建 assist，所以账号值一直是旧的（这就是"reloadData 无效"的原因）。
-// 必须调 reloadContactAssist（ContactInfoViewController.h:90）重建 assist，才会重取账号。
-//
-// 关闭开关（ddWxidSwitchChanged:）只发 kDDProfileChangedNotification，而该通知此前只被开关页
-// 自己监听（刷新它自身的表格）。展示页若在导航栈里活着、没有离开再进入，viewWillAppear 不会触发，
-// 于是仍显示旧值——这就是"需重进一次才还原"。这里让展示页自己也监听该通知，关闭时立即自刷新。
-
-%hook ContactInfoViewController
-
-- (void)viewDidLoad {
-    %orig;
-    [[NSNotificationCenter defaultCenter] addObserver:self
-            selector:@selector(ddProfileChangedRefresh)
-            name:kDDProfileChangedNotification
-            object:nil];
-}
-
-- (void)dealloc {
-    [[NSNotificationCenter defaultCenter] removeObserver:self name:kDDProfileChangedNotification object:nil];
-    %orig;
-}
-
-- (void)viewWillAppear:(BOOL)animated {
-    %orig;
-    [self ddProfileChangedRefresh];
-}
-
-%new
-- (void)ddProfileChangedRefresh {
-    NSString *usr = [[self m_contact] m_nsUsrName];
-    DDLog(@"[ContactInfo] 刷新 reloadContactAssist/reloadData/reloadView usr=%@", usr);
-    [self reloadContactAssist];
-    [self reloadData];
-    [self reloadView];
-    // 账号行 label 读的是联系人 m_nsAliasName 的 ivar，已由 setM_nsAliasName: hook 在自定义存在时
-    // 强制写成自定义值、关闭时由 ddWxidSwitchChanged: 写回原真值；这里回读一次"实际显示值"用于排错。
-    NSString *shown = [[self m_contact] m_nsAliasName];
-    DDLog(@"[ContactInfo] 刷新后账号显示值(回读map=%@) usr=%@ -> %@", DDFriendWxidForUser(usr), usr, shown);
-}
-
-%end
 
 static const void *kDDInjectedCellMarker = &kDDInjectedCellMarker;
 
@@ -2483,8 +2346,11 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
 // 补一次微信自己的联系人变更回调（IContactMgrExt，与 MMHeadImageView.h:65 同款），
 // 资料页才会重新取账号——离开页面再进、或输入空之所以能还原，都是因为走了这条路径。
 - (void)ddRefreshProfile {
-    DDLog(@"[ddRefreshProfile] 发通知（去掉 onModifyContact：它异步换 m_contact，会引起关闭回退竞态）");
     [[NSNotificationCenter defaultCenter] postNotificationName:kDDProfileChangedNotification object:nil];
+    CBaseContact *contact = [self m_contact];
+    if (contact && [self respondsToSelector:@selector(onModifyContact:)]) {
+        [self onModifyContact:contact];
+    }
 }
 
 // 与"自定义头像"对称：开 → 微信原生输入弹窗；关 → 清掉该用户的自定义。
@@ -2496,14 +2362,7 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
     if (usrName.length == 0) return;
 
     if (DDFriendWxidForUser(usrName)) {
-        DDLog(@"[wxid] 关闭：删自定义 usr=%@", usrName);
         DDFriendWxidRemoveForUser(usrName);
-        // 关闭后把内存联系人 alias ivar 还原为保存时记录的原真值：账号行读的就是这个 ivar，
-        // 立即还原、无需重进（真值已不在内存里，故用保存时记下的原值写回）。
-        NSString *origAlias = DDFriendWxidOrigForUser(usrName);
-        DDFriendWxidRemoveOrigForUser(usrName);
-        if (origAlias) [contact setM_nsAliasName:origAlias];
-        DDLog(@"[wxid] 删后回读 DDFriendWxidForUser=%@", DDFriendWxidForUser(usrName));
         [self ddRefreshProfile];
         return;
     }
@@ -2529,16 +2388,10 @@ static void DDInjectProfileSectionIntoTable(AddContactToChatRoomViewController *
         NSString *text = [blockAlert getTextFieldText] ?: @"";
         if (text.length == 0) {
             // 没有输入：关闭该用户自定义并回弹开关
-            DDLog(@"[wxid] 确定留空：删自定义 usr=%@", usrName);
             DDFriendWxidRemoveForUser(usrName);
-            DDFriendWxidRemoveOrigForUser(usrName);
             [weakSw setOn:NO animated:YES];
         } else {
             // 空格 / 文字：原样保存（空格=空白账号即隐藏）
-            // 保存前先记录原始真值，关闭时写回 ivar，避免内存联系人被自定义值污染后无法即时还原
-            NSString *origAlias = [contact m_nsAliasName];   // 此刻 custom 尚未写入 → %orig 即真值
-            if (origAlias) DDFriendWxidSetOrigForUser(origAlias, usrName);
-            DDLog(@"[wxid] 确定保存：usr=%@ val=%@", usrName, text);
             DDFriendWxidSetForUser(text, usrName);
         }
         [self ddRefreshProfile];
@@ -2783,19 +2636,6 @@ static BOOL DDHideChatName(void) {
 
     [_tableViewManager addSection:profileSection];
 
-    // 调试小丑：非越狱时把日志文件用系统分享发出来排错；清空只清日志不影响配置
-    WCTableViewSectionManager *logSection = [%c(WCTableViewSectionManager) sectionWithHeader:@"调试小丑"];
-    logSection.footerTitle = @"无越狱可导出日志到微信 / 备忘录排错；清空只清日志，不影响功能配置";
-    UIButton *exportBtn = [self dd_actionButton:@"导出" action:@selector(dd_exportLogTapped:) x:0];
-    UIView *exportRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
-    [exportRight addSubview:exportBtn];
-    [logSection addCell:[cellCls normalCellForSel:nil target:nil title:@"导出日志" rightView:exportRight]];
-    UIButton *clearLogBtn = [self dd_actionButton:@"清空" action:@selector(dd_clearLogTapped:) x:0];
-    UIView *clearLogRight = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 52, 34)];
-    [clearLogRight addSubview:clearLogBtn];
-    [logSection addCell:[cellCls normalCellForSel:nil target:nil title:@"清空日志" rightView:clearLogRight]];
-    [_tableViewManager addSection:logSection];
-
     [_tableViewManager reloadTableView];
 }
 
@@ -2860,30 +2700,6 @@ static BOOL DDHideChatName(void) {
 
     WeToast *toast = [%c(WeToast) toast];
     if (toast) [toast showDoneToastWithText:text];
-}
-
-- (void)dd_exportLogTapped:(id)sender {
-    NSString *path = DDJokerLogPath();
-    NSData *data = [NSData dataWithContentsOfFile:path];
-    if (data.length == 0) {
-        [self dd_showDoneToast:@"日志为空"];
-        return;
-    }
-    // 系统分享单：把日志文件发出去（微信 / 备忘录 / 隔空投送 / 存储到文件均可），
-    // 非越狱也能拿到。iPad 需指定 popover 锚点，否则 present 会崩。
-    NSURL *url = [NSURL fileURLWithPath:path];
-    UIActivityViewController *avc =
-        [[%c(UIActivityViewController) alloc] initWithActivityItems:@[url] applicationActivities:nil];
-    avc.popoverPresentationController.sourceView = self.view;
-    avc.popoverPresentationController.sourceRect =
-        CGRectMake(self.view.bounds.size.width / 2.0, self.view.bounds.size.height - 40, 1, 1);
-    avc.popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionDown;
-    [self presentViewController:avc animated:YES completion:nil];
-}
-
-- (void)dd_clearLogTapped:(id)sender {
-    DDLogClear();
-    [self dd_showDoneToast:@"日志已清空"];
 }
 
 - (void)balanceSwitchChanged:(UISwitch *)sender {
