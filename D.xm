@@ -2101,6 +2101,7 @@ static NSString *DDCustomWxid(void) {
 // CBaseContact.h:12 —— m_nsAliasName 即"账号"。
 // 用户：查自定义表，命中返回自定义值（空串=隐藏），未命中回原值。
 - (id)m_nsAliasName {
+    if (![DDGlobalConfig shared].friendWxidEnabled) return %orig;
     NSString *alias = DDFriendWxidForUser([self m_nsUsrName]);
     if (alias) { return alias; }
     return %orig;
@@ -2109,6 +2110,7 @@ static NSString *DDCustomWxid(void) {
 // 账号行显示的是联系人 m_nsAliasName 的 ivar（微信重建资料页时经此 setter 写入）。
 // 自定义存在 → 强制写入自定义值；关闭 → 让真值正常写入，配合 ddWxidSwitchChanged: 写回原值即时还原。
 - (void)setM_nsAliasName:(id)v {
+    if (![DDGlobalConfig shared].friendWxidEnabled) { %orig(v); return; }
     NSString *custom = DDFriendWxidForUser([self m_nsUsrName]);
     if (custom) {
         %orig(custom);
